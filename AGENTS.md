@@ -21,6 +21,35 @@
   branch instead of creating a child branch. Never fold it directly into
   `main`.
 
+## Creating and publishing the branch
+
+The mechanics matter as much as the intent: the default way of starting a branch
+from `main` silently aims every later push at `main`.
+
+- Create the branch **without tracking**, so its upstream is never a shared
+  branch:
+
+      git fetch origin main
+      git switch -c <branch> --no-track origin/main
+
+  Omitting `--no-track` makes git set the new branch's upstream to `origin/main`,
+  because `branch.autoSetupMerge` defaults to `true` and a remote-tracking ref is
+  treated as a branch to *track*, not merely a commit to start at. With a global
+  `push.default=upstream` — a common setting — every push from that branch then
+  goes to `main` no matter which branch name the command names.
+
+- Check the destination before the first push to a shared remote:
+
+      git rev-parse --abbrev-ref '@{upstream}'   # must not be a shared branch
+      git push --dry-run origin HEAD             # prints the real destination
+
+- Publish with an explicit destination:
+
+      git push -u origin refs/heads/<branch>:refs/heads/<branch>
+
+This repository sets `push.default=current` locally so a branch name cannot
+resolve to a shared branch. Leave it in place.
+
 ## Completing and integrating work
 
 - Test and review changes on their owning branch.
