@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod controller;
 mod error;
+mod uplink;
 
 /// Generated protobuf/tonic code for `loadr.coordination.v1`.
 pub mod pb {
@@ -25,7 +26,15 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 
 /// Coordination protocol version. Registration with a different version is
 /// rejected by the controller.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Version 2 added control-command acknowledgements (`Control.command_id`,
+/// `ControlAck`). Version 3 added acknowledged uplink delivery
+/// (`AgentMessage.seq`, `Register.incarnation`, `UplinkAck`). The new fields are
+/// wire-compatible, so nothing but this check stops an agent that expects
+/// acknowledgements from connecting to a controller that never sends them —
+/// where it would fill its replay window and silently stop shipping metrics.
+/// Hence the hard rejection.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub use agent::{
     Agent, AgentConfig, AgentTls, DataSourceFactory, ProtocolFactory, RunnerDeps, ScriptFactory,

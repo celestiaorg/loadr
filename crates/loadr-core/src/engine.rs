@@ -854,6 +854,7 @@ async fn tick(
 /// End-of-run: final threshold evaluation, final snapshot (with a trailing
 /// timeline point for the residual window so short runs still produce a
 /// timeline), and final delta flush.
+#[allow(clippy::too_many_arguments)]
 async fn finalize(
     agg: &mut Aggregator,
     outputs: &mut [Box<dyn Output>],

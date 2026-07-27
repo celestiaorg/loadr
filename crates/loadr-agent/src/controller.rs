@@ -209,11 +209,18 @@ struct AgentEntry {
     peer_addr: Option<SocketAddr>,
     version: Option<String>,
     revision: Option<String>,
+    /// Identifies the agent *process*. A restart mints a new one, which is how
+    /// the controller knows the uplink sequence restarted at 1 rather than
+    /// continuing across a reconnect.
+    incarnation: String,
     connected_at: Instant,
     last_heartbeat: Instant,
     active_vus: u64,
     connected: bool,
     session: u64,
+    /// Highest uplink sequence applied for `incarnation`. Cumulative: every
+    /// sequence at or below it has been applied exactly once.
+    last_seq: u64,
     sender: AgentSender,
 }
 
@@ -223,6 +230,19 @@ struct PendingControl {
     action: String,
     scenario: String,
     notify: Arc<Notify>,
+}
+
+/// What to do with one inbound uplink message, decided under a single `agents`
+/// lock so the session fence and the deduplication cursor cannot disagree.
+enum Admit {
+    /// Live session, not yet applied.
+    Apply,
+    /// Live session, but already applied under this incarnation. The agent
+    /// replayed it because an acknowledgement was lost; it has been
+    /// acknowledged again.
+    Duplicate,
+    /// A newer registration superseded this stream. Nothing was touched.
+    Stale,
 }
 
 struct ControllerRun {
@@ -287,33 +307,79 @@ impl Inner {
         sender: AgentSender,
         session: u64,
     ) {
-        self.agents.lock().insert(
-            reg.agent_id.clone(),
-            AgentEntry {
-                name: reg.agent_name.clone(),
-                labels: reg.labels.clone(),
-                cores: reg.cpu_cores,
-                peer_addr,
-                version: non_empty(&reg.loadr_version),
-                revision: non_empty(&reg.build_revision),
-                connected_at: Instant::now(),
-                last_heartbeat: Instant::now(),
-                active_vus: 0,
-                connected: true,
-                session,
-                sender,
-            },
-        );
-        if !reg.resume_run_id.is_empty() {
-            tracing::info!(
-                agent = %reg.agent_id,
-                run_id = %reg.resume_run_id,
-                "agent resumed with an in-flight run"
-            );
-            // The agent came back within the grace window: let its run count again.
-            if let Some(run) = self.runs.lock().get(&reg.resume_run_id) {
-                run.lost.lock().remove(&reg.agent_id);
+        let superseded = {
+            let mut agents = self.agents.lock();
+            // Only a reconnect of the *same* process continues its uplink
+            // sequence. A restarted agent begins again at 1, so its cursor has
+            // to reset here — before its first message is admitted — or every
+            // message it sends looks like a duplicate and gets acknowledged
+            // against a cursor it never earned.
+            let last_seq = agents
+                .get(&reg.agent_id)
+                .filter(|prev| prev.incarnation == reg.incarnation)
+                .map_or(0, |prev| prev.last_seq);
+            agents.insert(
+                reg.agent_id.clone(),
+                AgentEntry {
+                    name: reg.agent_name.clone(),
+                    labels: reg.labels.clone(),
+                    cores: reg.cpu_cores,
+                    peer_addr,
+                    version: non_empty(&reg.loadr_version),
+                    revision: non_empty(&reg.build_revision),
+                    incarnation: reg.incarnation.clone(),
+                    connected_at: Instant::now(),
+                    last_heartbeat: Instant::now(),
+                    active_vus: 0,
+                    connected: true,
+                    session,
+                    last_seq,
+                    sender,
+                },
+            )
+        };
+        if let Some(previous) = superseded {
+            if previous.connected && previous.incarnation != reg.incarnation {
+                tracing::warn!(
+                    agent = %reg.agent_id,
+                    "a second agent process registered with this id; check for a duplicated agent id"
+                );
             }
+            // Close the stream this session replaced instead of leaving it to
+            // time out: the peer learns immediately, and with a reason.
+            let _ = previous.sender.try_send(Err(Status::aborted(
+                "session superseded by a newer registration",
+            )));
+        }
+        if !reg.resume_run_id.is_empty() {
+            self.resume_run(&reg.agent_id, &reg.resume_run_id);
+        }
+    }
+
+    /// A reconnecting agent claims an in-flight run. Clear its lost marker only
+    /// when the claim is credible: the run must exist, still be live, and
+    /// actually have this agent in its partition.
+    fn resume_run(&self, agent_id: &str, run_id: &str) {
+        let Some(run) = self.runs.lock().get(run_id).cloned() else {
+            tracing::debug!(agent = %agent_id, %run_id, "resume claim for an unknown run ignored");
+            return;
+        };
+        if !run.assigned.iter().any(|id| id == agent_id) {
+            tracing::warn!(
+                agent = %agent_id, %run_id,
+                "resume claim for a run this agent was never assigned"
+            );
+            return;
+        }
+        if run.state.lock().is_terminal() || run.done.lock().contains_key(agent_id) {
+            tracing::debug!(agent = %agent_id, %run_id, "resume claim for a completed run ignored");
+            return;
+        }
+        // The agent came back within the grace window: let its run count again.
+        if run.lost.lock().remove(agent_id) {
+            tracing::info!(agent = %agent_id, %run_id, "agent resumed an in-flight run");
+        } else {
+            tracing::info!(agent = %agent_id, %run_id, "agent reconnected with a run in flight");
         }
     }
 
@@ -326,11 +392,96 @@ impl Inner {
         }
     }
 
-    fn handle_agent_message(&self, agent_id: &str, msg: pb::AgentMessage) {
-        // Any traffic refreshes liveness.
-        if let Some(entry) = self.agents.lock().get_mut(agent_id) {
-            entry.last_heartbeat = Instant::now();
+    /// Fence one inbound message against the live session, move the
+    /// deduplication cursor and acknowledge it — all under one `agents` lock.
+    ///
+    /// A superseded stream is refused outright: it must not refresh liveness
+    /// (that would mask a real loss), must not move the cursor, and must not be
+    /// acknowledged. The agent's replay window is shared across its sessions, so
+    /// acknowledging here would retire messages this controller explicitly
+    /// declined to apply — losing them for good.
+    fn admit(&self, agent_id: &str, session: u64, seq: u64) -> Admit {
+        let mut agents = self.agents.lock();
+        let Some(entry) = agents.get_mut(agent_id) else {
+            return Admit::Stale;
+        };
+        if entry.session != session {
+            return Admit::Stale;
         }
+        // Any traffic from the live session is proof of life.
+        entry.last_heartbeat = Instant::now();
+
+        if seq == 0 {
+            // Ephemeral (a heartbeat): the agent never buffered it, so there is
+            // nothing to deduplicate. Re-advertise the cursor anyway — it is the
+            // only traffic an idle agent sends, so it is what releases a window
+            // whose acknowledgement went missing.
+            let cursor = entry.last_seq;
+            if cursor > 0 {
+                send_uplink_ack(entry, cursor);
+            }
+            return Admit::Apply;
+        }
+
+        if seq <= entry.last_seq {
+            // Our acknowledgement was lost, not the message. Re-acknowledge and
+            // drop the payload: metric merging is additive, so applying twice
+            // would inflate the run. Not acknowledging at all would make the
+            // agent replay it forever.
+            let cursor = entry.last_seq;
+            send_uplink_ack(entry, cursor);
+            return Admit::Duplicate;
+        }
+        if seq > entry.last_seq + 1 {
+            // Replaying from the oldest unacknowledged message makes this
+            // impossible; accept it rather than wedge the agent behind a
+            // sequence it can no longer produce.
+            tracing::warn!(
+                agent = %agent_id,
+                expected = entry.last_seq + 1,
+                got = seq,
+                "gap in the agent uplink sequence"
+            );
+        }
+        // The cursor is the commit point, and it advances under the same lock
+        // that validated the session. Deferring it to after the payload is
+        // applied would let a registration land in between and have its freshly
+        // reset cursor overwritten — silently discarding the new process's first
+        // messages as duplicates.
+        entry.last_seq = seq;
+        send_uplink_ack(entry, seq);
+        Admit::Apply
+    }
+
+    /// Apply one uplink message after fencing and deduplication. Returns `false`
+    /// once a newer registration has superseded `session`, so the caller stops
+    /// pumping a stream whose traffic will never be applied again.
+    fn handle_agent_message(&self, agent_id: &str, session: u64, msg: pb::AgentMessage) -> bool {
+        match self.admit(agent_id, session, msg.seq) {
+            Admit::Apply => {
+                self.apply_agent_message(agent_id, msg);
+                true
+            }
+            Admit::Duplicate => true,
+            Admit::Stale => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    session,
+                    seq = msg.seq,
+                    "dropped traffic from a superseded session"
+                );
+                false
+            }
+        }
+    }
+
+    /// The payload half.
+    ///
+    /// Every arm here is *total*: a message either takes effect or is
+    /// permanently inapplicable (an unknown run, an undecodable delta). Nothing
+    /// asks to be retried, which is what lets [`Inner::admit`] commit the cursor
+    /// and acknowledge up front.
+    fn apply_agent_message(&self, agent_id: &str, msg: pb::AgentMessage) {
         match msg.msg {
             Some(AgentMsg::Heartbeat(hb)) => {
                 if let Some(entry) = self.agents.lock().get_mut(agent_id) {
@@ -636,6 +787,19 @@ fn add_agent_identity(delta: &mut MetricsDelta, agent_name: &str, agent_id: &str
     }
 }
 
+/// Cumulative acknowledgement: every uplink sequence at or below `seq` has been
+/// applied.
+///
+/// Sent non-blocking so a congested downlink can never stall the inbound pump —
+/// a dropped acknowledgement is harmless because the next one carries the same
+/// or a higher cursor.
+fn send_uplink_ack(entry: &AgentEntry, seq: u64) {
+    let ack = pb::ControllerMessage {
+        msg: Some(CtrlMsg::UplinkAck(pb::UplinkAck { seq })),
+    };
+    let _ = entry.sender.try_send(Ok(ack));
+}
+
 fn control_message(
     run_id: &str,
     action: &str,
@@ -709,7 +873,15 @@ impl Coordination for CoordinationService {
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
-                    Ok(Some(msg)) => inner.handle_agent_message(&agent_id, msg),
+                    Ok(Some(msg)) => {
+                        if !inner.handle_agent_message(&agent_id, session, msg) {
+                            // Superseded, and permanently so: the session
+                            // counter only moves forward. Drop `inbound` so the
+                            // transport tears this stream down rather than
+                            // trickling messages nobody will ever apply.
+                            break;
+                        }
+                    }
                     Ok(None) => break,
                     Err(status) => {
                         tracing::debug!(agent = %agent_id, error = %status, "agent stream ended");
@@ -1295,33 +1467,24 @@ impl ControllerHandle {
 }
 
 #[cfg(test)]
-mod metrics_tests {
+mod test_support {
     use super::*;
-    use loadr_core::aggregate::{SeriesDelta, SeriesDeltaData};
-    use loadr_core::Tags;
 
-    #[test]
-    fn controller_overwrites_spoofed_agent_identity() {
-        let mut tags = Tags::new();
-        tags.insert("loadr_agent".into(), "spoofed".into());
-        tags.insert("loadr_agent_id".into(), "spoofed-id".into());
-        let mut delta = MetricsDelta {
-            series: vec![SeriesDelta {
-                metric: "http_reqs".into(),
-                kind: MetricKind::Counter,
-                tags,
-                data: SeriesDeltaData::Counter { delta: 1.0 },
-            }],
-        };
-        add_agent_identity(&mut delta, "worker-a", "agent-a-id");
-        assert_eq!(delta.series[0].tags["loadr_agent"], "worker-a");
-        assert_eq!(delta.series[0].tags["loadr_agent_id"], "agent-a-id");
+    pub(super) fn test_inner() -> Inner {
+        Inner {
+            controller_id: "controller-test".to_string(),
+            liveness: Duration::from_secs(6),
+            agents: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
+            session_counter: AtomicU64::new(0),
+            control_counter: AtomicU64::new(0),
+        }
     }
 
-    fn test_run(run_id: &str, agent_ids: &[&str]) -> Arc<ControllerRun> {
+    pub(super) fn test_run(run_id: &str, agent_ids: &[&str]) -> Arc<ControllerRun> {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(Snapshot::default()));
         Arc::new(ControllerRun {
-            run_id: run_id.into(),
+            run_id: run_id.to_string(),
             name: None,
             plan_yaml: String::new(),
             scenarios: Vec::new(),
@@ -1350,34 +1513,138 @@ mod metrics_tests {
         })
     }
 
+    pub(super) type Downlink = mpsc::Receiver<Result<pb::ControllerMessage, Status>>;
+
+    /// Register `agent_id` on `session` and hand back its downlink, both to
+    /// assert on acknowledgements and to keep the channel open.
+    pub(super) fn register(
+        inner: &Inner,
+        agent_id: &str,
+        incarnation: &str,
+        session: u64,
+    ) -> Downlink {
+        let (tx, rx) = mpsc::channel(16);
+        inner.register_agent(&registration(agent_id, incarnation), None, tx, session);
+        rx
+    }
+
+    pub(super) fn registration(agent_id: &str, incarnation: &str) -> pb::Register {
+        pb::Register {
+            agent_id: agent_id.to_string(),
+            agent_name: agent_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            loadr_version: String::new(),
+            cpu_cores: 1,
+            labels: HashMap::new(),
+            resume_run_id: String::new(),
+            build_revision: String::new(),
+            incarnation: incarnation.to_string(),
+        }
+    }
+
+    pub(super) fn heartbeat(active_vus: u64) -> pb::AgentMessage {
+        pb::AgentMessage {
+            seq: 0,
+            msg: Some(AgentMsg::Heartbeat(pb::Heartbeat {
+                active_vus,
+                cpu_load: 0.0,
+                run_id: String::new(),
+                run_state: "running".to_string(),
+            })),
+        }
+    }
+
+    /// A metrics batch carrying one `http_reqs` increment of `count`.
+    pub(super) fn metrics(run_id: &str, seq: u64, count: u64) -> pb::AgentMessage {
+        let mut agg = Aggregator::new();
+        for _ in 0..count {
+            agg.record(&loadr_core::Sample {
+                metric: Arc::from("http_reqs"),
+                kind: loadr_core::MetricKind::Counter,
+                value: 1.0,
+                tags: Arc::new(loadr_core::Tags::new()),
+                timestamp_ms: now_unix_ms(),
+            });
+        }
+        metrics_batch(run_id, seq, &agg.take_delta())
+    }
+
+    /// A metrics batch carrying `delta` verbatim, for tests that need a
+    /// particular series rather than a counter increment.
+    pub(super) fn metrics_batch(run_id: &str, seq: u64, delta: &MetricsDelta) -> pb::AgentMessage {
+        pb::AgentMessage {
+            seq,
+            msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
+                run_id: run_id.to_string(),
+                delta_json: serde_json::to_vec(delta).expect("delta json"),
+            })),
+        }
+    }
+
+    pub(super) fn run_event(run_id: &str, seq: u64, kind: &str) -> pb::AgentMessage {
+        pb::AgentMessage {
+            seq,
+            msg: Some(AgentMsg::Event(pb::RunEvent {
+                run_id: run_id.to_string(),
+                kind: kind.to_string(),
+                detail: String::new(),
+                summary_json: Vec::new(),
+            })),
+        }
+    }
+
+    /// Every acknowledged sequence currently queued on a downlink, in order.
+    pub(super) fn drain_acks(rx: &mut Downlink) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        while let Ok(Ok(cm)) = rx.try_recv() {
+            if let Some(CtrlMsg::UplinkAck(ack)) = cm.msg {
+                seqs.push(ack.seq);
+            }
+        }
+        seqs
+    }
+
+    pub(super) fn http_reqs(run: &ControllerRun) -> f64 {
+        run.agg
+            .lock()
+            .snapshot()
+            .series
+            .iter()
+            .filter(|s| s.metric == "http_reqs")
+            .map(|s| s.agg.sum)
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::test_support::*;
+    use super::*;
+    use loadr_core::aggregate::{SeriesDelta, SeriesDeltaData};
+    use loadr_core::Tags;
+
+    #[test]
+    fn controller_overwrites_spoofed_agent_identity() {
+        let mut tags = Tags::new();
+        tags.insert("loadr_agent".into(), "spoofed".into());
+        tags.insert("loadr_agent_id".into(), "spoofed-id".into());
+        let mut delta = MetricsDelta {
+            series: vec![SeriesDelta {
+                metric: "http_reqs".into(),
+                kind: MetricKind::Counter,
+                tags,
+                data: SeriesDeltaData::Counter { delta: 1.0 },
+            }],
+        };
+        add_agent_identity(&mut delta, "worker-a", "agent-a-id");
+        assert_eq!(delta.series[0].tags["loadr_agent"], "worker-a");
+        assert_eq!(delta.series[0].tags["loadr_agent_id"], "agent-a-id");
+    }
+
     #[test]
     fn late_delta_from_lost_agent_cannot_resurrect_live_gauges() {
-        let (sender, _keepalive) = mpsc::channel(8);
-        let inner = Inner {
-            controller_id: "ctrl".into(),
-            liveness: Duration::from_secs(6),
-            agents: Mutex::new(HashMap::new()),
-            runs: Mutex::new(HashMap::new()),
-            session_counter: AtomicU64::new(0),
-            control_counter: AtomicU64::new(0),
-        };
-        inner.agents.lock().insert(
-            "agent-a".into(),
-            AgentEntry {
-                name: "worker-a".into(),
-                labels: HashMap::new(),
-                cores: 1,
-                peer_addr: None,
-                version: None,
-                revision: None,
-                connected_at: Instant::now(),
-                last_heartbeat: Instant::now(),
-                active_vus: 0,
-                connected: true,
-                session: 1,
-                sender,
-            },
-        );
+        let inner = test_inner();
+        let _downlink = register(&inner, "agent-a", "proc-1", 1);
         let run = test_run("run-1", &["agent-a"]);
         inner.runs.lock().insert("run-1".into(), run.clone());
 
@@ -1393,12 +1660,6 @@ mod metrics_tests {
                 },
             }],
         };
-        let batch = |delta: &MetricsDelta| pb::AgentMessage {
-            msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
-                run_id: "run-1".into(),
-                delta_json: serde_json::to_vec(delta).expect("delta json"),
-            })),
-        };
         let fleet_vus = || {
             let (_, values) = run
                 .agg
@@ -1408,7 +1669,7 @@ mod metrics_tests {
             values.last
         };
 
-        inner.handle_agent_message("agent-a", batch(&delta));
+        inner.handle_agent_message("agent-a", 1, metrics_batch("run-1", 1, &delta));
         assert_eq!(fleet_vus(), Some(50.0));
 
         // The liveness sweep declares the agent lost and zeroes its gauges…
@@ -1416,40 +1677,19 @@ mod metrics_tests {
         inner.zero_agent_live_gauges(&run, "agent-a");
         assert_eq!(fleet_vus(), Some(0.0));
 
-        // …then an in-flight delta lands. It must not resurrect the gauge.
-        inner.handle_agent_message("agent-a", batch(&delta));
+        // …then an in-flight delta lands. It must not resurrect the gauge. A
+        // fresh sequence, since a replay of seq 1 would be deduplicated and
+        // would prove nothing about the zeroing.
+        inner.handle_agent_message("agent-a", 1, metrics_batch("run-1", 2, &delta));
         assert_eq!(fleet_vus(), Some(0.0));
     }
 
     #[test]
     fn controller_tick_publishes_one_complete_fleet_interval() {
-        let inner = Inner {
-            controller_id: "ctrl".into(),
-            liveness: Duration::from_secs(6),
-            agents: Mutex::new(HashMap::new()),
-            runs: Mutex::new(HashMap::new()),
-            session_counter: AtomicU64::new(0),
-            control_counter: AtomicU64::new(0),
-        };
-        for (index, agent_id) in ["agent-a", "agent-b"].into_iter().enumerate() {
-            let (sender, _keepalive) = mpsc::channel(8);
-            inner.agents.lock().insert(
-                agent_id.into(),
-                AgentEntry {
-                    name: format!("worker-{index}"),
-                    labels: HashMap::new(),
-                    cores: 1,
-                    peer_addr: None,
-                    version: None,
-                    revision: None,
-                    connected_at: Instant::now(),
-                    last_heartbeat: Instant::now(),
-                    active_vus: 0,
-                    connected: true,
-                    session: 1,
-                    sender,
-                },
-            );
+        let inner = test_inner();
+        let mut downlinks = Vec::new();
+        for agent_id in ["agent-a", "agent-b"] {
+            downlinks.push(register(&inner, agent_id, "proc-1", 1));
         }
         let run = test_run("run-1", &["agent-a", "agent-b"]);
         inner.runs.lock().insert("run-1".into(), run.clone());
@@ -1472,15 +1712,9 @@ mod metrics_tests {
                 },
             ],
         };
-        let batch = || pb::AgentMessage {
-            msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
-                run_id: "run-1".into(),
-                delta_json: serde_json::to_vec(&delta).expect("delta json"),
-            })),
-        };
 
-        inner.handle_agent_message("agent-a", batch());
-        inner.handle_agent_message("agent-b", batch());
+        inner.handle_agent_message("agent-a", 1, metrics_batch("run-1", 1, &delta));
+        inner.handle_agent_message("agent-b", 1, metrics_batch("run-1", 1, &delta));
         assert!(
             run.snapshot_rx.borrow().series.is_empty(),
             "agent arrivals must not roll a partial fleet interval"
@@ -1501,14 +1735,7 @@ mod metrics_tests {
 
     #[test]
     fn terminal_summary_is_frozen_at_finalization() {
-        let inner = Arc::new(Inner {
-            controller_id: "ctrl".into(),
-            liveness: Duration::from_secs(6),
-            agents: Mutex::new(HashMap::new()),
-            runs: Mutex::new(HashMap::new()),
-            session_counter: AtomicU64::new(0),
-            control_counter: AtomicU64::new(0),
-        });
+        let inner = Arc::new(test_inner());
         let run = test_run("run-1", &["agent-a"]);
         inner.runs.lock().insert("run-1".into(), run.clone());
         run.agg.lock().merge_delta(&MetricsDelta {
@@ -1534,14 +1761,7 @@ mod metrics_tests {
 
     #[test]
     fn first_started_event_ends_pending_state() {
-        let inner = Inner {
-            controller_id: "ctrl".into(),
-            liveness: Duration::from_secs(6),
-            agents: Mutex::new(HashMap::new()),
-            runs: Mutex::new(HashMap::new()),
-            session_counter: AtomicU64::new(0),
-            control_counter: AtomicU64::new(0),
-        };
+        let inner = test_inner();
         let run = test_run("run-1", &["agent-a"]);
         *run.state.lock() = RunState::Pending;
         inner.runs.lock().insert("run-1".into(), run.clone());
@@ -1562,29 +1782,16 @@ mod metrics_tests {
 
 #[cfg(test)]
 mod registration_tests {
+    use super::test_support::*;
     use super::*;
 
-    fn test_inner() -> Inner {
-        Inner {
-            controller_id: "controller-test".to_string(),
-            liveness: Duration::from_secs(6),
-            agents: Mutex::new(HashMap::new()),
-            runs: Mutex::new(HashMap::new()),
-            session_counter: AtomicU64::new(0),
-            control_counter: AtomicU64::new(0),
-        }
-    }
-
-    fn registration(id: &str, version: &str, revision: &str) -> pb::Register {
+    /// A registration carrying the build metadata the UI surfaces.
+    fn with_build_metadata(agent_id: &str, version: &str, revision: &str) -> pb::Register {
         pb::Register {
-            agent_id: id.to_string(),
-            agent_name: "worker".to_string(),
-            protocol_version: PROTOCOL_VERSION,
             loadr_version: version.to_string(),
-            cpu_cores: 8,
-            labels: HashMap::new(),
-            resume_run_id: String::new(),
             build_revision: revision.to_string(),
+            cpu_cores: 8,
+            ..registration(agent_id, "proc-1")
         }
     }
 
@@ -1595,7 +1802,7 @@ mod registration_tests {
     #[test]
     fn registration_accepts_missing_debug_metadata() {
         let inner = test_inner();
-        inner.register_agent(&registration("agent-a", "", ""), None, sender(), 1);
+        inner.register_agent(&with_build_metadata("agent-a", "", ""), None, sender(), 1);
 
         let agents = inner.agents.lock();
         let agent = agents.get("agent-a").expect("registered agent");
@@ -1611,13 +1818,13 @@ mod registration_tests {
         let second_peer = "10.0.0.4:42000".parse().expect("second peer");
 
         inner.register_agent(
-            &registration("agent-a", "1.28.0", "aaaaaaaaaaaa"),
+            &with_build_metadata("agent-a", "1.28.0", "aaaaaaaaaaaa"),
             Some(first_peer),
             sender(),
             1,
         );
         inner.register_agent(
-            &registration("agent-a", "1.29.0", "bbbbbbbbbbbb"),
+            &with_build_metadata("agent-a", "1.29.0", "bbbbbbbbbbbb"),
             Some(second_peer),
             sender(),
             2,
@@ -1629,5 +1836,337 @@ mod registration_tests {
         assert_eq!(agent.peer_addr, Some(second_peer));
         assert_eq!(agent.version.as_deref(), Some("1.29.0"));
         assert_eq!(agent.revision.as_deref(), Some("bbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn reconnect_of_the_same_agent_process_keeps_the_uplink_cursor() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+
+        let _first = register(&inner, "agent-a", "proc-1", 1);
+        assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 4)));
+
+        // Same process, new stream: the cursor survives, so the message it is
+        // about to replay is still recognized as a duplicate.
+        let _second = register(&inner, "agent-a", "proc-1", 2);
+        assert!(inner.handle_agent_message("agent-a", 2, metrics("run-1", 1, 4)));
+        assert_eq!(
+            http_reqs(&run),
+            4.0,
+            "a replay across a reconnect of the same process must not be merged twice"
+        );
+    }
+
+    #[test]
+    fn restarted_agent_process_resets_the_uplink_cursor() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+
+        let _first = register(&inner, "agent-a", "proc-1", 1);
+        for seq in 1..=3 {
+            assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", seq, 1)));
+        }
+
+        // A restarted process starts again at sequence 1. Without the
+        // incarnation reset every one of its messages would look like a
+        // duplicate and be discarded — wholesale silent loss.
+        let _second = register(&inner, "agent-a", "proc-2", 2);
+        assert!(inner.handle_agent_message("agent-a", 2, metrics("run-1", 1, 5)));
+        assert_eq!(
+            http_reqs(&run),
+            8.0,
+            "a restarted agent's fresh sequence space must be accepted"
+        );
+    }
+
+    #[test]
+    fn superseded_session_receives_an_abort_status() {
+        let inner = test_inner();
+        let mut first = register(&inner, "agent-a", "proc-1", 1);
+        let _second = register(&inner, "agent-a", "proc-1", 2);
+
+        let status = first
+            .try_recv()
+            .expect("the superseded downlink carries an item")
+            .expect_err("the item terminates the stream");
+        assert_eq!(status.code(), tonic::Code::Aborted);
+    }
+
+    #[test]
+    fn same_id_replaces_the_registered_entry() {
+        let inner = test_inner();
+        let _first = register(&inner, "agent-a", "proc-1", 1);
+        let _second = register(&inner, "agent-a", "proc-2", 2);
+
+        let agents = inner.agents.lock();
+        assert_eq!(agents.len(), 1);
+        let entry = agents.get("agent-a").expect("the agent is registered");
+        assert_eq!(entry.session, 2);
+        assert_eq!(entry.incarnation, "proc-2");
+    }
+
+    #[test]
+    fn resume_claim_from_an_assigned_agent_clears_the_lost_marker() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        run.lost.lock().insert("agent-a".to_string());
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+
+        let mut reg = registration("agent-a", "proc-1");
+        reg.resume_run_id = "run-1".to_string();
+        inner.register_agent(&reg, None, sender(), 1);
+
+        assert!(run.lost.lock().is_empty(), "the agent is counted again");
+    }
+
+    #[test]
+    fn resume_claim_for_a_run_this_agent_was_never_assigned_is_refused() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-b"]);
+        run.lost.lock().insert("agent-b".to_string());
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+
+        let mut reg = registration("agent-a", "proc-1");
+        reg.resume_run_id = "run-1".to_string();
+        inner.register_agent(&reg, None, sender(), 1);
+
+        assert_eq!(
+            run.lost.lock().len(),
+            1,
+            "an unassigned agent's claim must not touch the run's loss accounting"
+        );
+    }
+
+    #[test]
+    fn resume_claim_for_a_terminal_run_is_refused() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        run.lost.lock().insert("agent-a".to_string());
+        *run.state.lock() = RunState::Finished;
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+
+        let mut reg = registration("agent-a", "proc-1");
+        reg.resume_run_id = "run-1".to_string();
+        inner.register_agent(&reg, None, sender(), 1);
+
+        assert_eq!(
+            run.lost.lock().len(),
+            1,
+            "a finished run's completeness record is already settled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_fencing_tests {
+    use super::test_support::*;
+    use super::*;
+
+    /// Register two sessions for one agent id. Returns the stale downlink and
+    /// the live one.
+    fn two_sessions(inner: &Inner, agent_id: &str) -> (Downlink, Downlink) {
+        let stale = register(inner, agent_id, "proc-1", 1);
+        let live = register(inner, agent_id, "proc-1", 2);
+        (stale, live)
+    }
+
+    #[test]
+    fn stale_session_heartbeat_cannot_suppress_loss_detection() {
+        let inner = test_inner();
+        let (_stale, _live) = two_sessions(&inner, "agent-a");
+        // Backdate the live entry so the liveness sweep is already about to
+        // declare it lost.
+        inner
+            .agents
+            .lock()
+            .get_mut("agent-a")
+            .expect("registered")
+            .last_heartbeat = Instant::now() - Duration::from_secs(30);
+
+        assert!(!inner.handle_agent_message("agent-a", 1, heartbeat(7)));
+
+        let agents = inner.agents.lock();
+        let entry = agents.get("agent-a").expect("registered");
+        assert!(
+            entry.last_heartbeat.elapsed() > inner.liveness,
+            "a superseded stream must not vouch for the live session's liveness"
+        );
+        assert_eq!(entry.active_vus, 0, "nor report its VU count");
+    }
+
+    #[test]
+    fn stale_session_metrics_are_not_merged() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let (_stale, _live) = two_sessions(&inner, "agent-a");
+
+        assert!(!inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 9)));
+        assert_eq!(http_reqs(&run), 0.0);
+
+        assert!(inner.handle_agent_message("agent-a", 2, metrics("run-1", 1, 9)));
+        assert_eq!(http_reqs(&run), 9.0, "the live session is still served");
+    }
+
+    #[test]
+    fn stale_session_terminal_event_cannot_finalize_a_run() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let (_stale, _live) = two_sessions(&inner, "agent-a");
+
+        assert!(!inner.handle_agent_message("agent-a", 1, run_event("run-1", 1, "finished")));
+        assert!(run.done.lock().is_empty());
+        assert!(
+            !run.state.lock().is_terminal(),
+            "a superseded stream must not complete the run"
+        );
+    }
+
+    #[test]
+    fn stale_session_message_is_never_acknowledged() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let (mut stale, mut live) = two_sessions(&inner, "agent-a");
+
+        assert!(!inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 3)));
+        assert!(
+            drain_acks(&mut stale).is_empty() && drain_acks(&mut live).is_empty(),
+            "the agent's replay window is shared across its sessions, so acknowledging \
+             a message the controller declined to apply would lose it for good"
+        );
+    }
+
+    #[test]
+    fn stale_session_traffic_stops_the_inbound_pump() {
+        let inner = test_inner();
+        let (_stale, _live) = two_sessions(&inner, "agent-a");
+        assert!(
+            !inner.handle_agent_message("agent-a", 1, heartbeat(0)),
+            "a superseded session is permanently superseded, so its pump should stop"
+        );
+        assert!(inner.handle_agent_message("agent-a", 2, heartbeat(0)));
+    }
+
+    #[test]
+    fn replayed_metric_delta_merges_exactly_once() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let _live = register(&inner, "agent-a", "proc-1", 1);
+
+        for _ in 0..3 {
+            assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 6)));
+        }
+        assert_eq!(
+            http_reqs(&run),
+            6.0,
+            "metric merging is additive, so a replay must be discarded"
+        );
+    }
+
+    #[test]
+    fn replayed_terminal_event_records_one_agent_summary() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a", "agent-b"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let _live = register(&inner, "agent-a", "proc-1", 1);
+
+        let mut finished = run_event("run-1", 1, "finished");
+        let summary = {
+            let mut agg = Aggregator::new();
+            Summary::build(
+                None,
+                "run-1".to_string(),
+                now_unix_ms(),
+                vec!["default".to_string()],
+                &mut agg,
+                Vec::new(),
+                None,
+                Vec::new(),
+            )
+        };
+        if let Some(AgentMsg::Event(ev)) = finished.msg.as_mut() {
+            ev.summary_json = serde_json::to_vec(&summary).expect("summary json");
+        }
+
+        assert!(inner.handle_agent_message("agent-a", 1, finished.clone()));
+        assert!(inner.handle_agent_message("agent-a", 1, finished));
+        assert_eq!(
+            run.summaries.lock().len(),
+            1,
+            "a double-counted agent summary would inflate the fleet report"
+        );
+        assert_eq!(run.done.lock().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_uplink_message_is_acknowledged_again() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let mut live = register(&inner, "agent-a", "proc-1", 1);
+
+        assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 1)));
+        assert_eq!(drain_acks(&mut live), vec![1]);
+
+        assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 1)));
+        assert_eq!(
+            drain_acks(&mut live),
+            vec![1],
+            "an unacknowledged duplicate would be replayed forever and wedge the window"
+        );
+    }
+
+    #[test]
+    fn uplink_acknowledgement_carries_the_controller_cursor() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let mut live = register(&inner, "agent-a", "proc-1", 1);
+
+        for seq in 1..=3 {
+            assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", seq, 1)));
+        }
+        assert_eq!(drain_acks(&mut live), vec![1, 2, 3]);
+
+        assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 2, 1)));
+        assert_eq!(
+            drain_acks(&mut live),
+            vec![3],
+            "a replay is answered with the cursor, not the replayed sequence, so one \
+             round trip retires the whole acknowledged prefix"
+        );
+    }
+
+    #[test]
+    fn sequence_gap_advances_the_cursor_rather_than_wedging_the_agent() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let mut live = register(&inner, "agent-a", "proc-1", 1);
+
+        assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 7, 2)));
+        assert_eq!(http_reqs(&run), 2.0, "a gap is accepted, not refused");
+        assert_eq!(drain_acks(&mut live), vec![7]);
+    }
+
+    #[test]
+    fn idle_heartbeat_readvertises_the_uplink_cursor() {
+        let inner = test_inner();
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".to_string(), run.clone());
+        let mut live = register(&inner, "agent-a", "proc-1", 1);
+
+        assert!(inner.handle_agent_message("agent-a", 1, metrics("run-1", 1, 1)));
+        assert_eq!(drain_acks(&mut live), vec![1]);
+
+        // The agent's acknowledgement went missing. An idle agent sends nothing
+        // but heartbeats, so that is what has to unpin its window.
+        assert!(inner.handle_agent_message("agent-a", 1, heartbeat(0)));
+        assert_eq!(drain_acks(&mut live), vec![1]);
     }
 }

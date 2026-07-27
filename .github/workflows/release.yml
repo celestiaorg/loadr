@@ -18,6 +18,8 @@ on:
     paths-ignore:
       - 'desktop/**'
       - 'site/**'
+      - 'prompts/**'
+      - 'demos/**'
       - 'benchmarks/**'
       - 'docs/**'
       - '.github/workflows/desktop-release.yml'

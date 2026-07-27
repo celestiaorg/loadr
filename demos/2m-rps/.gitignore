@@ -1,0 +1,12 @@
+plans/*.yaml
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate*
+terraform/*.tfvars
+
+# The repo-root `**/target` rule (Rust build dirs) also matches this demo's
+# target *app* directory and hides its source. Re-include the dir (required —
+# the parent dir is what's excluded) so the Go source terraform reads at apply
+# time (compute.tf: file("../target/main.go")) is actually committed.
+!target/
+!target/main.go
