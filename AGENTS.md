@@ -26,17 +26,10 @@
 The mechanics matter as much as the intent: the default way of starting a branch
 from `main` silently aims every later push at `main`.
 
-- Create the branch **without tracking**, so its upstream is never a shared
-  branch:
+- Create the branch: 
 
       git fetch origin main
-      git switch -c <branch> --no-track origin/main
-
-  Omitting `--no-track` makes git set the new branch's upstream to `origin/main`,
-  because `branch.autoSetupMerge` defaults to `true` and a remote-tracking ref is
-  treated as a branch to *track*, not merely a commit to start at. With a global
-  `push.default=upstream` — a common setting — every push from that branch then
-  goes to `main` no matter which branch name the command names.
+      git checkout -b <feature 
 
 - Check the destination before the first push to a shared remote:
 
