@@ -21,6 +21,28 @@
   branch instead of creating a child branch. Never fold it directly into
   `main`.
 
+## Creating and publishing the branch
+
+The mechanics matter as much as the intent: the default way of starting a branch
+from `main` silently aims every later push at `main`.
+
+- Create the branch: 
+
+      git fetch origin main
+      git checkout -b <feature 
+
+- Check the destination before the first push to a shared remote:
+
+      git rev-parse --abbrev-ref '@{upstream}'   # must not be a shared branch
+      git push --dry-run origin HEAD             # prints the real destination
+
+- Publish with an explicit destination:
+
+      git push -u origin refs/heads/<branch>:refs/heads/<branch>
+
+This repository sets `push.default=current` locally so a branch name cannot
+resolve to a shared branch. Leave it in place.
+
 ## Completing and integrating work
 
 - Test and review changes on their owning branch.
