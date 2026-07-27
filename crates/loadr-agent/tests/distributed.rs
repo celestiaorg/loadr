@@ -2,149 +2,15 @@
 //! with a mock HTTP protocol handler injected through the factory seam.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use loadr_agent::agent::validate_data_file_path;
 use loadr_agent::controller::scale_shares;
-use loadr_agent::{
-    Agent, AgentConfig, AgentTls, Controller, ControllerConfig, ControllerHandle, ControllerTls,
-    RunnerDeps, SubmitOptions,
-};
-use loadr_core::{
-    PreparedRequest, ProtocolError, ProtocolHandler, ProtocolRegistry, ProtocolResponse, Timings,
-    VuContext,
-};
-use tokio_util::sync::CancellationToken;
+use loadr_agent::{AgentTls, Controller, ControllerConfig, ControllerTls};
 
-// ---------------------------------------------------------------------------
-// Test scaffolding
-// ---------------------------------------------------------------------------
-
-/// A mock "http" protocol handler: sleeps 1–5ms and returns 200 with timings.
-struct MockHttpHandler {
-    counter: AtomicU64,
-}
-
-#[async_trait::async_trait]
-impl ProtocolHandler for MockHttpHandler {
-    fn name(&self) -> &str {
-        "http"
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &mut VuContext,
-        request: &PreparedRequest,
-    ) -> Result<ProtocolResponse, ProtocolError> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let ms = 1 + (n % 5);
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-        let d = ms as f64;
-        Ok(ProtocolResponse {
-            status: 200,
-            status_text: "OK".to_string(),
-            protocol_version: "HTTP/1.1".to_string(),
-            timings: Timings {
-                waiting_ms: d,
-                duration_ms: d,
-                ..Default::default()
-            },
-            bytes_sent: 100,
-            bytes_received: 256,
-            url: request.url.clone(),
-            ..Default::default()
-        })
-    }
-}
-
-fn mock_deps() -> RunnerDeps {
-    RunnerDeps {
-        protocols: Arc::new(|_defaults, _base_dir| {
-            let mut registry = ProtocolRegistry::new();
-            registry.register(Arc::new(MockHttpHandler {
-                counter: AtomicU64::new(0),
-            }));
-            Ok(registry)
-        }),
-        script: None,
-    }
-}
-
-fn localhost0() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("loadr-agent-test-{tag}-{}", uuid::Uuid::new_v4()))
-}
-
-fn spawn_agent(
-    controller_addr: String,
-    name: &str,
-    agent_id: Option<String>,
-    tls: Option<AgentTls>,
-) -> CancellationToken {
-    let token = CancellationToken::new();
-    let config = AgentConfig {
-        controller_addr,
-        agent_id,
-        agent_name: name.to_string(),
-        labels: HashMap::new(),
-        tls,
-        work_dir: temp_dir(name),
-        deps: mock_deps(),
-    };
-    let child = token.clone();
-    tokio::spawn(async move {
-        let _ = Agent::run(config, child).await;
-    });
-    token
-}
-
-async fn start_controller(liveness: Duration) -> ControllerHandle {
-    Controller::start(ControllerConfig {
-        bind: localhost0(),
-        tls: None,
-        agent_liveness: liveness,
-    })
-    .await
-    .expect("controller start")
-}
-
-async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration, what: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while !cond() {
-        assert!(
-            tokio::time::Instant::now() <= deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn run_state(handle: &ControllerHandle, run_id: &str) -> String {
-    handle
-        .runs()
-        .into_iter()
-        .find(|r| r.run_id == run_id)
-        .map(|r| r.state)
-        .unwrap_or_default()
-}
-
-fn is_terminal(state: &str) -> bool {
-    matches!(state, "finished" | "aborted" | "failed")
-}
-
-fn quick_submit() -> SubmitOptions {
-    SubmitOptions {
-        start_barrier: Duration::from_millis(300),
-        ..Default::default()
-    }
-}
+mod support;
+use support::*;
 
 // ---------------------------------------------------------------------------
 // End-to-end: exact metric merging across 3 agents

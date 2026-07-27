@@ -22,6 +22,7 @@ use crate::pb;
 use crate::pb::agent_message::Msg as AgentMsg;
 use crate::pb::controller_message::Msg as CtrlMsg;
 use crate::pb::coordination_client::CoordinationClient;
+use crate::uplink::{SessionWriter, Uplink};
 use crate::{now_unix_ms, PROTOCOL_VERSION};
 
 /// Builds a [`ProtocolRegistry`] for one run from the plan's HTTP defaults and
@@ -104,24 +105,16 @@ impl Agent {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let endpoint = build_endpoint(&config)?;
         let current: SharedRun = Arc::new(Mutex::new(None));
-        // The uplink outlives individual connections so run events and metric
-        // batches queued during a reconnect are delivered afterwards.
-        let (uplink_tx, mut uplink_rx) = mpsc::channel::<pb::AgentMessage>(256);
+        // The uplink window outlives individual connections: a message stays in
+        // it until the controller acknowledges it, so whatever a dying session
+        // failed to deliver is replayed over the next one.
+        let uplink = Arc::new(Uplink::new());
         let mut backoff = Duration::from_millis(500);
 
         while !shutdown.is_cancelled() {
             let outcome = match endpoint.connect().await {
                 Ok(channel) => {
-                    run_session(
-                        channel,
-                        &config,
-                        &agent_id,
-                        &current,
-                        &uplink_tx,
-                        &mut uplink_rx,
-                        &shutdown,
-                    )
-                    .await
+                    run_session(channel, &config, &agent_id, &current, &uplink, &shutdown).await
                 }
                 Err(e) => Err(AgentError::Transport(format!("connect failed: {e}"))),
             };
@@ -149,6 +142,10 @@ impl Agent {
         if let Some(run) = current.lock().take() {
             run.handle.kill("agent shutting down");
         }
+        // Release any producer parked on a full window. Without this an
+        // embedded agent (tests, a host process that outlives the run) would
+        // leave that task waiting for room nothing will ever free.
+        uplink.close();
         Ok(())
     }
 }
@@ -182,48 +179,82 @@ fn read_file(path: &Path) -> Result<Vec<u8>, AgentError> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Open one session and serve it until the stream ends or shutdown fires.
+///
+/// The uplink window is streamed by a dedicated writer task rather than from
+/// the session loop, so a stalled wire cannot stop the loop from reading the
+/// acknowledgements that free window room.
 async fn run_session(
     channel: Channel,
     config: &AgentConfig,
     agent_id: &str,
     current: &SharedRun,
-    uplink_tx: &mpsc::Sender<pb::AgentMessage>,
-    uplink_rx: &mut mpsc::Receiver<pb::AgentMessage>,
+    uplink: &Arc<Uplink>,
     shutdown: &CancellationToken,
 ) -> Result<SessionEnd, AgentError> {
     let mut client = CoordinationClient::new(channel);
-    let (tx, rx) = mpsc::channel::<pb::AgentMessage>(64);
+    // Shallow on purpose: the uplink window is the buffer, so this only needs
+    // room for the frames in flight plus a heartbeat.
+    let (tx, rx) = mpsc::channel::<pb::AgentMessage>(8);
 
     // Queue Register before opening the stream: the controller only answers
     // the Session call once it has read the registration.
-    let resume_run_id = current
-        .lock()
-        .as_ref()
-        .map(|r| r.run_id.clone())
-        .unwrap_or_default();
-    let register = pb::AgentMessage {
-        msg: Some(AgentMsg::Register(pb::Register {
-            agent_id: agent_id.to_string(),
-            agent_name: config.agent_name.clone(),
-            protocol_version: PROTOCOL_VERSION,
-            loadr_version: env!("CARGO_PKG_VERSION").to_string(),
-            cpu_cores: std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(1),
-            labels: config.labels.clone(),
-            resume_run_id,
-        })),
-    };
-    tx.try_send(register)
+    tx.try_send(register_message(config, agent_id, uplink, current))
         .map_err(|_| AgentError::Transport("could not queue register message".into()))?;
 
-    let mut inbound = client
+    let inbound = client
         .session(ReceiverStream::new(rx))
         .await
         .map_err(|e| AgentError::Transport(format!("session open failed: {e}")))?
         .into_inner();
 
+    let writer = SessionWriter::spawn(uplink.clone(), tx.clone());
+    let outcome = session_loop(inbound, &tx, config, current, uplink, shutdown).await;
+    // Stop the writer before returning: whatever it took from the window but
+    // never got onto the wire is still unacknowledged, so the next session
+    // replays it from the front.
+    writer.stop().await;
+    outcome
+}
+
+fn register_message(
+    config: &AgentConfig,
+    agent_id: &str,
+    uplink: &Uplink,
+    current: &SharedRun,
+) -> pb::AgentMessage {
+    let resume_run_id = current
+        .lock()
+        .as_ref()
+        .map(|r| r.run_id.clone())
+        .unwrap_or_default();
+    agent_msg(AgentMsg::Register(pb::Register {
+        agent_id: agent_id.to_string(),
+        agent_name: config.agent_name.clone(),
+        protocol_version: PROTOCOL_VERSION,
+        loadr_version: env!("CARGO_PKG_VERSION").to_string(),
+        cpu_cores: std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1),
+        labels: config.labels.clone(),
+        resume_run_id,
+        incarnation: uplink.incarnation().to_string(),
+    }))
+}
+
+/// Serve one open session.
+///
+/// Every arm here must stay non-blocking apart from `inbound.message()`.
+/// Acknowledgements arrive on `inbound`, so a loop that parks waiting for the
+/// wire or for uplink-window room could never be unparked.
+async fn session_loop(
+    mut inbound: tonic::Streaming<pb::ControllerMessage>,
+    tx: &mpsc::Sender<pb::AgentMessage>,
+    config: &AgentConfig,
+    current: &SharedRun,
+    uplink: &Arc<Uplink>,
+    shutdown: &CancellationToken,
+) -> Result<SessionEnd, AgentError> {
     let mut registered = false;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -241,18 +272,10 @@ async fn run_session(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
-            msg = uplink_rx.recv() => {
-                if let Some(m) = msg {
-                    if tx.send(m).await.is_err() {
-                        return end(registered);
-                    }
-                }
-            }
             res = inbound.message() => {
                 match res {
                     Ok(Some(cm)) => {
-                        handle_controller_message(cm, config, current, uplink_tx, &mut registered)
-                            .await;
+                        handle_controller_message(cm, config, current, uplink, &mut registered);
                     }
                     Ok(None) => return end(registered),
                     Err(status) => {
@@ -262,19 +285,27 @@ async fn run_session(
                 }
             }
             _ = heartbeat.tick() => {
-                if tx.send(make_heartbeat(current)).await.is_err() {
-                    return end(registered);
+                // A heartbeat describes the moment it is built, so it is never
+                // windowed and never replayed. When the outbound channel is
+                // congested, skip the tick rather than block: the traffic
+                // already in flight refreshes controller liveness anyway.
+                match tx.try_send(make_heartbeat(current)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => return end(registered),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!("outbound stream congested; skipping a heartbeat");
+                    }
                 }
             }
         }
     }
 }
 
-async fn handle_controller_message(
+fn handle_controller_message(
     cm: pb::ControllerMessage,
     config: &AgentConfig,
     current: &SharedRun,
-    uplink_tx: &mpsc::Sender<pb::AgentMessage>,
+    uplink: &Arc<Uplink>,
     registered: &mut bool,
 ) {
     match cm.msg {
@@ -291,11 +322,13 @@ async fn handle_controller_message(
         }
         Some(CtrlMsg::Assignment(a)) => {
             let run_id = a.run_id.clone();
-            if let Err(detail) = handle_assignment(a, config, current, uplink_tx) {
+            if let Err(detail) = handle_assignment(a, config, current, uplink) {
                 tracing::warn!(run_id = %run_id, error = %detail, "assignment failed");
-                let _ = uplink_tx
-                    .send(run_event(&run_id, "failed", detail, Vec::new()))
-                    .await;
+                // Non-blocking: this runs on the session loop, and the
+                // acknowledgements that would free window room arrive there too.
+                if !uplink.try_enqueue(run_event(&run_id, "failed", detail, Vec::new())) {
+                    tracing::warn!(run_id = %run_id, "uplink window full; failure event dropped");
+                }
             }
         }
         Some(CtrlMsg::Start(s)) => {
@@ -331,6 +364,7 @@ async fn handle_controller_message(
                 other => tracing::warn!(action = other, "unknown control action"),
             }
         }
+        Some(CtrlMsg::UplinkAck(ack)) => uplink.ack(ack.seq),
         None => {}
     }
 }
@@ -341,7 +375,7 @@ fn handle_assignment(
     a: pb::Assignment,
     config: &AgentConfig,
     current: &SharedRun,
-    uplink_tx: &mpsc::Sender<pb::AgentMessage>,
+    uplink: &Arc<Uplink>,
 ) -> Result<(), String> {
     {
         let cur = current.lock();
@@ -392,7 +426,7 @@ fn handle_assignment(
     let output = DeltaOutput {
         run_id: a.run_id.clone(),
         agg: Aggregator::new(),
-        uplink: uplink_tx.clone(),
+        uplink: uplink.clone(),
     };
     let engine = Engine::new(
         plan,
@@ -416,13 +450,7 @@ fn handle_assignment(
         handle,
         start_tx: Some(start_tx),
     });
-    spawn_run(
-        engine,
-        start_rx,
-        a.run_id,
-        uplink_tx.clone(),
-        current.clone(),
-    );
+    spawn_run(engine, start_rx, a.run_id, uplink.clone(), current.clone());
     Ok(())
 }
 
@@ -432,7 +460,7 @@ fn spawn_run(
     engine: Engine,
     start_rx: oneshot::Receiver<i64>,
     run_id: String,
-    uplink: mpsc::Sender<pb::AgentMessage>,
+    uplink: Arc<Uplink>,
     current: SharedRun,
 ) {
     tokio::spawn(async move {
@@ -451,9 +479,7 @@ fn spawn_run(
         if start_ms > now {
             tokio::time::sleep(Duration::from_millis((start_ms - now) as u64)).await;
         }
-        let _ = uplink
-            .send(run_event(&run_id, "started", String::new(), Vec::new()))
-            .await;
+        report_run_event(&uplink, &run_id, "started", String::new(), Vec::new()).await;
         match engine.run().await {
             Ok(result) => {
                 let summary_json = serde_json::to_vec(&result.summary).unwrap_or_default();
@@ -461,28 +487,50 @@ fn spawn_run(
                     Some(reason) => ("aborted", reason),
                     None => ("finished", String::new()),
                 };
-                let _ = uplink
-                    .send(run_event(&run_id, kind, detail, summary_json))
-                    .await;
+                report_run_event(&uplink, &run_id, kind, detail, summary_json).await;
             }
             Err(e) => {
-                let _ = uplink
-                    .send(run_event(&run_id, "failed", e.to_string(), Vec::new()))
-                    .await;
+                report_run_event(&uplink, &run_id, "failed", e.to_string(), Vec::new()).await;
             }
         }
         clear(&current, &run_id);
     });
 }
 
+/// Queue a lifecycle event, waiting for window room. Run events are the
+/// controller's only completion signal, so they are worth parking a detached run
+/// task for; the sole failure is a shutdown that already closed the uplink.
+async fn report_run_event(
+    uplink: &Uplink,
+    run_id: &str,
+    kind: &str,
+    detail: String,
+    summary_json: Vec<u8>,
+) {
+    if !uplink
+        .enqueue(run_event(run_id, kind, detail, summary_json))
+        .await
+    {
+        tracing::debug!(run_id = %run_id, kind, "run event dropped: agent shutting down");
+    }
+}
+
 fn run_event(run_id: &str, kind: &str, detail: String, summary_json: Vec<u8>) -> pb::AgentMessage {
+    agent_msg(AgentMsg::Event(pb::RunEvent {
+        run_id: run_id.to_string(),
+        kind: kind.to_string(),
+        detail,
+        summary_json,
+    }))
+}
+
+/// An unsequenced message. [`Uplink`] stamps `seq` when it admits one into its
+/// window; the messages that bypass the window — `Register` and `Heartbeat` —
+/// keep 0 and are never replayed.
+fn agent_msg(msg: AgentMsg) -> pb::AgentMessage {
     pb::AgentMessage {
-        msg: Some(AgentMsg::Event(pb::RunEvent {
-            run_id: run_id.to_string(),
-            kind: kind.to_string(),
-            detail,
-            summary_json,
-        })),
+        msg: Some(msg),
+        seq: 0,
     }
 }
 
@@ -505,14 +553,12 @@ fn make_heartbeat(current: &SharedRun) -> pb::AgentMessage {
         }
         None => (String::new(), "idle".to_string(), 0),
     };
-    pb::AgentMessage {
-        msg: Some(AgentMsg::Heartbeat(pb::Heartbeat {
-            active_vus,
-            cpu_load: 0.0,
-            run_id,
-            run_state,
-        })),
-    }
+    agent_msg(AgentMsg::Heartbeat(pb::Heartbeat {
+        active_vus,
+        cpu_load: 0.0,
+        run_id,
+        run_state,
+    }))
 }
 
 /// Validate a data-file relative path: it must be relative and contain only
@@ -567,18 +613,16 @@ fn materialize_files(dir: &Path, files: &[pb::DataFile]) -> Result<(), AgentErro
 struct DeltaOutput {
     run_id: String,
     agg: Aggregator,
-    uplink: mpsc::Sender<pb::AgentMessage>,
+    uplink: Arc<Uplink>,
 }
 
 impl DeltaOutput {
     fn batch(&self, delta: &loadr_core::MetricsDelta) -> Option<pb::AgentMessage> {
         let delta_json = serde_json::to_vec(delta).ok()?;
-        Some(pb::AgentMessage {
-            msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
-                run_id: self.run_id.clone(),
-                delta_json,
-            })),
-        })
+        Some(agent_msg(AgentMsg::Metrics(pb::MetricsBatch {
+            run_id: self.run_id.clone(),
+            delta_json,
+        })))
     }
 }
 
@@ -595,6 +639,12 @@ impl Output for DeltaOutput {
     }
 
     async fn on_snapshot(&mut self, _snapshot: &Snapshot) {
+        if self.uplink.is_full() {
+            // Leave the delta where it is instead of serializing it just to be
+            // refused: through a long disconnect this runs every flush over a
+            // payload that only grows, and it coalesces into the next one.
+            return;
+        }
         let delta = self.agg.take_delta();
         if delta.series.is_empty() {
             return;
@@ -602,9 +652,10 @@ impl Output for DeltaOutput {
         let Some(msg) = self.batch(&delta) else {
             return;
         };
-        // Never block the aggregator: when the uplink is congested (e.g. a
-        // reconnect in progress) fold the delta back in and retry next flush.
-        if self.uplink.try_send(msg).is_err() {
+        // Never block the aggregator: when the unacknowledged window is full
+        // (e.g. a reconnect in progress) fold the delta back in and retry next
+        // flush. Nothing is lost, only temporal resolution.
+        if !self.uplink.try_enqueue(msg) {
             self.agg.merge_delta(&delta);
         }
     }
@@ -615,7 +666,11 @@ impl Output for DeltaOutput {
             return;
         }
         if let Some(msg) = self.batch(&delta) {
-            let _ = self.uplink.send(msg).await;
+            // The run is ending: wait for window room so the final delta is
+            // durable rather than best-effort.
+            if !self.uplink.enqueue(msg).await {
+                tracing::warn!(run_id = %self.run_id, "final metrics delta dropped: agent shutting down");
+            }
         }
     }
 }

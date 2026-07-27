@@ -3,6 +3,11 @@
 // A single bidirectional stream carries everything: the agent registers,
 // then heartbeats, metric deltas and run lifecycle events flow up while
 // assignments, the synchronized start barrier and control commands flow down.
+//
+// Uplink delivery is at-least-once on the wire and effectively-once at the
+// controller: the agent keeps every sequenced message until it is acknowledged
+// and replays the unacknowledged tail over the next session, while the
+// controller discards what it has already applied. See `UplinkAck`.
 
 syntax = "proto3";
 
@@ -19,6 +24,12 @@ message AgentMessage {
     MetricsBatch metrics = 3;
     RunEvent event = 4;
   }
+  // Position in this agent incarnation's uplink sequence, starting at 1.
+  //
+  // 0 means ephemeral: Register and Heartbeat describe the moment they are
+  // built, so replaying one would report state that no longer holds. They are
+  // never buffered, never retried and never acknowledged.
+  uint64 seq = 6;
 }
 
 message Register {
@@ -30,6 +41,11 @@ message Register {
   map<string, string> labels = 6;
   // Set on reconnection when a run is still in flight (controller decides policy).
   string resume_run_id = 7;
+  // Identifies this agent process's uplink sequence space. `agent_id` is
+  // stable across restarts by design, so a restarted agent's fresh `seq = 1`
+  // would otherwise look like a duplicate to a controller that still remembers
+  // a high cursor. A new incarnation resets that cursor.
+  string incarnation = 9;
 }
 
 message Heartbeat {
@@ -60,7 +76,27 @@ message ControllerMessage {
     Assignment assignment = 2;
     Start start = 3;
     Control control = 4;
+    UplinkAck uplink_ack = 5;
   }
+}
+
+// Cumulative receipt: every AgentMessage through `seq` has been processed and
+// will never be requested again. The agent discards them from its replay
+// window.
+//
+// Two obligations follow from at-least-once delivery. The controller MUST
+// discard any `seq` at or below its own cursor before applying it --
+// metric merging is additive, so a replayed MetricsBatch would double-count.
+// And it MUST acknowledge messages it discards, including duplicates and
+// messages it can never apply: an unacknowledged message is replayed forever
+// and eventually fills the agent's window.
+//
+// An acknowledgement is only valid on the session that produced it. The
+// controller never acknowledges a superseded stream, because the agent's
+// window is shared across its sessions and retiring an entry the controller
+// refused to apply would lose it permanently.
+message UplinkAck {
+  uint64 seq = 1;
 }
 
 message Registered {
