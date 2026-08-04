@@ -1,7 +1,7 @@
 # Plugin-backed on-demand data source: a native plugin signs a fresh,
 # time-sensitive payload per request instead of loading it from a CSV/JSON
-# fixture. See docs/custom-grpc-plugin-feeder.md for the motivating design
-# and docs/src/yaml/data.md#plugin-backed-on-demand-sources for the syntax.
+# fixture. See docs/src/yaml/data.md#plugin-backed-on-demand-sources for the
+# syntax.
 #
 # Build and install the example plugin first, then point `url:` at a real gRPC
 # target implementing `mempool.Submitter/Submit`:

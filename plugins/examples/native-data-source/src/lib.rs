@@ -1,9 +1,9 @@
 //! Example native data-source plugin (`tx-signer`).
 //!
 //! Generates a fresh Ed25519-signed "transaction" per `next_row` call, for
-//! use as `data.<name>.type: plugin`. Demonstrates the motivating use case
-//! from `docs/custom-grpc-plugin-feeder.md`: a gRPC request body field that
-//! must contain a freshly signed, time-sensitive payload.
+//! use as `data.<name>.type: plugin`. Demonstrates the motivating use case:
+//! a gRPC request body field that must contain a freshly signed,
+//! time-sensitive payload.
 //!
 //! Wire payload layout (signed message, then the 64-byte signature appended):
 //! `chain_id bytes || vu (u64 LE) || seq (u64 LE) || ts_ms (u64 LE) || signature`,

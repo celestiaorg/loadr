@@ -1027,6 +1027,84 @@ thresholds:
     );
 }
 
+/// The `blocking: true` twin of the fixed-count run: the bracketed fetch path
+/// must produce byte-identical results — same counts, same thresholds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugin_data_source_with_blocking_flag_runs_at_fixed_count() {
+    let plugin_path = build_native_plugin(
+        "loadr-plugin-example-native-data-source",
+        "native_data_source",
+    );
+    let dir = tempfile::tempdir().expect("tmp");
+    let yaml = format!(
+        r#"
+name: e2e-plugin-data-source-blocking
+plugins:
+  - name: tx-signer
+    path: {plugin_path}
+    config: {{ seed: 1 }}
+data:
+  signed_tx:
+    type: plugin
+    source: tx-signer
+    config: {{ chain_id: throughput-test }}
+    blocking: true
+scenarios:
+  generate:
+    executor: shared-iterations
+    vus: 3
+    iterations: 12
+    flow:
+      - request:
+          name: generate signed payload
+          protocol: noop
+          url: noop://local
+          method: POST
+          body: "${{data.signed_tx.tx_b64}}"
+thresholds:
+  noop_reqs: [ "count==12" ]
+  http_req_failed: [ "rate==0" ]
+"#,
+        plugin_path = plugin_path.display(),
+    );
+    let test = write_test(dir.path(), "t.yaml", &yaml);
+    let summary_path = dir.path().join("summary.json");
+
+    let output = Command::new(BIN)
+        .args([
+            "run",
+            "--quiet",
+            "--summary-export",
+            summary_path.to_str().expect("path"),
+            test.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run loadr");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected success.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_path).expect("summary file"))
+            .expect("summary json");
+    let metric = |name: &str| {
+        summary["metrics"]
+            .as_array()
+            .expect("metrics")
+            .iter()
+            .find(|m| m["metric"] == name)
+            .unwrap_or_else(|| panic!("missing metric {name}: {summary}"))
+    };
+    assert_eq!(metric("noop_reqs")["agg"]["sum"], serde_json::json!(12.0));
+    assert_eq!(
+        metric("http_req_failed")["agg"]["rate"],
+        serde_json::json!(0.0)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_data_source_missing_capability_fails_before_vus_start() {
     // hmac-signer is a real `kind = service` plugin that does not implement

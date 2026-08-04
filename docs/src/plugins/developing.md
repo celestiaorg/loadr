@@ -405,8 +405,7 @@ lock-free uniqueness across VUs with no shared state on your side. `request`
 is the name of the request currently being prepared, or absent when the row
 is fetched outside request preparation (e.g. from a JS step). Row values
 cross as JSON scalars; strings map straight through, and a `bytes` protobuf
-field expects base64 (`prost-reflect` decodes it automatically — see
-[the gRPC feeder design](../custom-grpc-plugin-feeder.md)).
+field expects base64 (`prost-reflect` decodes it automatically).
 
 ### Testing
 
