@@ -392,6 +392,7 @@ mod tests {
             loadr_config::DataSource::Plugin {
                 source: "signer".to_string(),
                 config: serde_json::Value::Null,
+                blocking: false,
             },
         );
         let mut plugins: HashMap<String, Box<dyn crate::data::DataSourcePlugin>> = HashMap::new();

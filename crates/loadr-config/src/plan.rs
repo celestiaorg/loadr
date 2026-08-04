@@ -1957,6 +1957,12 @@ pub enum DataSource {
         /// Source-level config passed to the plugin at init.
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         config: serde_json::Value,
+        /// Fetch this source's rows under `tokio::task::block_in_place`, so a
+        /// CPU-heavy (signing, hashing) or I/O-backed feeder cannot stall the
+        /// runtime's worker threads. Off by default: the bracket has a fixed
+        /// cost that a cheap in-memory generator should not pay.
+        #[serde(default, skip_serializing_if = "is_false")]
+        blocking: bool,
     },
 }
 
@@ -2399,9 +2405,14 @@ flow:
             serde_yaml::from_str("{ type: plugin, source: tx-signer, config: { chain_id: t-1 } }")
                 .expect("parse");
         match &ds {
-            DataSource::Plugin { source, config } => {
+            DataSource::Plugin {
+                source,
+                config,
+                blocking,
+            } => {
                 assert_eq!(source, "tx-signer");
                 assert_eq!(config["chain_id"], "t-1");
+                assert!(!blocking, "blocking defaults to off");
             }
             other => panic!("expected DataSource::Plugin, got {other:?}"),
         }
@@ -2411,11 +2422,39 @@ flow:
     }
 
     #[test]
+    fn plugin_data_source_blocking_flag_round_trips() {
+        let ds: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer, blocking: true }")
+                .expect("parse");
+        assert!(matches!(ds, DataSource::Plugin { blocking: true, .. }));
+        let yaml = serde_yaml::to_string(&ds).expect("serialize");
+        assert!(yaml.contains("blocking: true"), "explicit opt-in survives");
+        let back: DataSource = serde_yaml::from_str(&yaml).expect("reparse");
+        assert!(matches!(back, DataSource::Plugin { blocking: true, .. }));
+
+        let off: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer, blocking: false }")
+                .expect("parse");
+        assert!(matches!(
+            off,
+            DataSource::Plugin {
+                blocking: false,
+                ..
+            }
+        ));
+        let yaml = serde_yaml::to_string(&off).expect("serialize");
+        assert!(
+            !yaml.contains("blocking"),
+            "the default is not serialized back out"
+        );
+    }
+
+    #[test]
     fn plugin_data_source_config_defaults_to_null() {
         let ds: DataSource =
             serde_yaml::from_str("{ type: plugin, source: tx-signer }").expect("parse");
         match &ds {
-            DataSource::Plugin { source, config } => {
+            DataSource::Plugin { source, config, .. } => {
                 assert_eq!(source, "tx-signer");
                 assert!(config.is_null());
             }

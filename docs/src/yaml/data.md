@@ -90,9 +90,17 @@ scenarios:
 ```
 
 The config surface is exactly `{ type: plugin, source: <plugin>, config:
-<object> }`. **`mode`, `on_eof` and `pick` do not apply** and are ignored if
-present — those describe iterating over a stored set of rows, which doesn't
-exist here; a plugin generates every row fresh, per call.
+<object>, blocking: <bool> }`. **`mode`, `on_eof` and `pick` do not apply**
+and are ignored if present — those describe iterating over a stored set of
+rows, which doesn't exist here; a plugin generates every row fresh, per call.
+
+**`blocking: true`** fetches this source's rows under
+`tokio::task::block_in_place`, so a CPU-heavy (signing, hashing) or
+I/O-backed (database, vault) feeder cannot stall the runtime's worker
+threads — without it, enough concurrently-preparing VUs on a slow feeder
+delay timers and unrelated VUs, degrading the load shape itself. Leave it
+off (the default) for cheap in-memory generation: the bracket has a fixed
+per-call cost that a microsecond feeder should not pay.
 
 **Freshness is per-request, not per-iteration.** CSV/JSON/inline sources
 cache one row per iteration (all references in the same iteration see the
