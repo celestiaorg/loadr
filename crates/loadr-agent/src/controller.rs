@@ -421,6 +421,7 @@ impl Inner {
                 }
             }
             Some(AgentMsg::Event(ev)) => self.handle_run_event(agent_id, ev),
+            Some(AgentMsg::AssignmentReady(_)) => {}
             Some(AgentMsg::Register(_)) | None => {}
         }
     }
