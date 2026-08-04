@@ -81,6 +81,31 @@ pub fn mock_deps() -> RunnerDeps {
     }
 }
 
+/// [`mock_deps`] whose protocol factory sleeps first — assignment setup that
+/// takes `delay`, since the factories run inside the agent's preparation.
+pub fn slow_deps(delay: Duration) -> RunnerDeps {
+    RunnerDeps {
+        protocols: Arc::new(move |_defaults, _base_dir| {
+            std::thread::sleep(delay);
+            let mut registry = ProtocolRegistry::new();
+            registry.register(Arc::new(MockHttpHandler {
+                counter: AtomicU64::new(0),
+            }));
+            Ok(registry)
+        }),
+        script: None,
+    }
+}
+
+/// [`mock_deps`] whose protocol factory fails — an assignment this agent can
+/// never prepare.
+pub fn failing_deps(msg: &'static str) -> RunnerDeps {
+    RunnerDeps {
+        protocols: Arc::new(move |_defaults, _base_dir| Err(msg.to_string())),
+        script: None,
+    }
+}
+
 pub fn localhost0() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
@@ -95,15 +120,36 @@ pub fn spawn_agent(
     agent_id: Option<String>,
     tls: Option<AgentTls>,
 ) -> CancellationToken {
+    spawn_agent_with_deps(controller_addr, name, agent_id, tls, mock_deps())
+}
+
+pub fn spawn_agent_with_deps(
+    controller_addr: String,
+    name: &str,
+    agent_id: Option<String>,
+    tls: Option<AgentTls>,
+    deps: RunnerDeps,
+) -> CancellationToken {
+    spawn_labeled_agent_with_deps(controller_addr, name, agent_id, tls, deps, HashMap::new())
+}
+
+pub fn spawn_labeled_agent_with_deps(
+    controller_addr: String,
+    name: &str,
+    agent_id: Option<String>,
+    tls: Option<AgentTls>,
+    deps: RunnerDeps,
+    labels: HashMap<String, String>,
+) -> CancellationToken {
     let token = CancellationToken::new();
     let config = AgentConfig {
         controller_addr,
         agent_id,
         agent_name: name.to_string(),
-        labels: HashMap::new(),
+        labels,
         tls,
         work_dir: temp_dir(name),
-        deps: mock_deps(),
+        deps,
     };
     let child = token.clone();
     tokio::spawn(async move {
@@ -249,6 +295,15 @@ pub struct FakeAgent {
 
 impl FakeAgent {
     pub async fn connect(controller: SocketAddr, agent_id: &str, incarnation: &str) -> Self {
+        Self::connect_with_resume(controller, agent_id, incarnation, "").await
+    }
+
+    pub async fn connect_with_resume(
+        controller: SocketAddr,
+        agent_id: &str,
+        incarnation: &str,
+        resume_run_id: &str,
+    ) -> Self {
         let mut client = CoordinationClient::connect(format!("http://{controller}"))
             .await
             .expect("connect to the controller");
@@ -263,7 +318,7 @@ impl FakeAgent {
                     loadr_version: "fake".to_string(),
                     cpu_cores: 1,
                     labels: HashMap::new(),
-                    resume_run_id: String::new(),
+                    resume_run_id: resume_run_id.to_string(),
                     incarnation: incarnation.to_string(),
                 })),
             })
@@ -325,6 +380,51 @@ impl FakeAgent {
         }
         None
     }
+
+    /// Scan inbound frames, skipping whatever `pick` rejects (acks and other
+    /// traffic), until it accepts one — or the stream stays silent for a full
+    /// [`FakeAgent::next`] window, which returns `None` and doubles as the
+    /// "this frame must NOT arrive" assertion.
+    pub async fn find_map<T>(
+        &mut self,
+        mut pick: impl FnMut(pb::controller_message::Msg) -> Option<T>,
+    ) -> Option<T> {
+        while let Some(Ok(cm)) = self.next().await {
+            if let Some(msg) = cm.msg {
+                if let Some(found) = pick(msg) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// The next Assignment frame, skimming past other traffic.
+    pub async fn next_assignment(&mut self) -> Option<pb::Assignment> {
+        self.find_map(|msg| match msg {
+            pb::controller_message::Msg::Assignment(a) => Some(a),
+            _ => None,
+        })
+        .await
+    }
+
+    /// The next Start frame, skimming past other traffic.
+    pub async fn next_start(&mut self) -> Option<pb::Start> {
+        self.find_map(|msg| match msg {
+            pb::controller_message::Msg::Start(s) => Some(s),
+            _ => None,
+        })
+        .await
+    }
+
+    /// The next Control frame, skimming past other traffic.
+    pub async fn next_control(&mut self) -> Option<pb::Control> {
+        self.find_map(|msg| match msg {
+            pb::controller_message::Msg::Control(c) => Some(c),
+            _ => None,
+        })
+        .await
+    }
 }
 
 /// A metrics batch carrying `count` `http_reqs` increments at sequence `seq`.
@@ -357,6 +457,18 @@ pub fn run_event(run_id: &str, seq: u64, kind: &str) -> pb::AgentMessage {
             detail: String::new(),
             summary_json: Vec::new(),
         })),
+    }
+}
+
+pub fn assignment_ready(run_id: &str, seq: u64, partition_index: u64) -> pb::AgentMessage {
+    pb::AgentMessage {
+        seq,
+        msg: Some(pb::agent_message::Msg::AssignmentReady(
+            pb::AssignmentReady {
+                run_id: run_id.to_string(),
+                partition_index,
+            },
+        )),
     }
 }
 
