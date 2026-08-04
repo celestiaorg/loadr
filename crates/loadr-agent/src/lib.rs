@@ -27,14 +27,19 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// Coordination protocol version. Registration with a different version is
 /// rejected by the controller.
 ///
-/// Version 2 added control-command acknowledgements (`Control.command_id`,
-/// `ControlAck`). Version 3 added acknowledged uplink delivery
-/// (`AgentMessage.seq`, `Register.incarnation`, `UplinkAck`). The new fields are
-/// wire-compatible, so nothing but this check stops an agent that expects
-/// acknowledgements from connecting to a controller that never sends them —
-/// where it would fill its replay window and silently stop shipping metrics.
-/// Hence the hard rejection.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 introduced the assignment readiness handshake
+/// (`AgentMessage.assignment_ready`, heartbeat `run_state = "preparing"`,
+/// `RunEvent.kind = "prep_failed"`). The field is wire-compatible, but a v4
+/// controller never sends `Start` until every assigned agent has reported
+/// readiness — a v3 agent never does, so every mixed-fleet run would hang
+/// until the preparation timeout. Hence the hard rejection.
+/// Version 3 added acknowledged uplink delivery (`AgentMessage.seq`,
+/// `Register.incarnation`, `UplinkAck`) — nothing but this check stops an
+/// agent that expects acknowledgements from connecting to a controller that
+/// never sends them, where it would fill its replay window and silently stop
+/// shipping metrics. Version 2 added control-command acknowledgements
+/// (`Control.command_id`, `ControlAck`).
+pub const PROTOCOL_VERSION: u32 = 4;
 
 pub use agent::{
     Agent, AgentConfig, AgentTls, DataSourceFactory, ProtocolFactory, RunnerDeps, ScriptFactory,

@@ -1,8 +1,11 @@
 // Coordination protocol between the loadr controller and its load agents.
 //
 // A single bidirectional stream carries everything: the agent registers,
-// then heartbeats, metric deltas and run lifecycle events flow up while
-// assignments, the synchronized start barrier and control commands flow down.
+// then heartbeats, metric deltas, assignment readiness and run lifecycle
+// events flow up while assignments, the synchronized start barrier and
+// control commands flow down. An assignment is prepared off the agent's
+// session loop and acknowledged with AssignmentReady; the controller sends
+// Start only once every assigned agent is ready.
 //
 // Uplink delivery is at-least-once on the wire and effectively-once at the
 // controller: the agent keeps every sequenced message until it is acknowledged
@@ -24,6 +27,8 @@ message AgentMessage {
     MetricsBatch metrics = 3;
     RunEvent event = 4;
     ControlAck control_ack = 5;
+    // 6 is taken by `seq` below.
+    AssignmentReady assignment_ready = 7;
   }
   // Position in this agent incarnation's uplink sequence, starting at 1.
   //
@@ -55,6 +60,7 @@ message Heartbeat {
   uint64 active_vus = 1;
   double cpu_load = 2;
   string run_id = 3;
+  // idle | preparing | pending | running | stopping | finished
   string run_state = 4;
 }
 
@@ -66,11 +72,26 @@ message MetricsBatch {
 
 message RunEvent {
   string run_id = 1;
-  // started | finished | failed | aborted
+  // started | finished | failed | aborted | prep_failed
+  //
+  // prep_failed means the assignment never became a running engine (setup
+  // error, busy agent, cancelled preparation); the controller fails the run
+  // as a preparation failure instead of an execution failure.
   string kind = 2;
   string detail = 3;
   // serde_json encoding of loadr_core::Summary (finished/aborted only).
   bytes summary_json = 4;
+}
+
+// The agent finished materializing an assignment (files written, plan
+// loaded, engine built) and is armed behind the start barrier. Sequenced
+// (seq >= 1): readiness is durable across reconnects, and the controller
+// must not compute a start timestamp until every assigned agent said this.
+message AssignmentReady {
+  string run_id = 1;
+  // Echoes Assignment.partition_index so a stale or misdirected readiness
+  // claim can be rejected.
+  uint64 partition_index = 2;
 }
 
 message ControllerMessage {
@@ -122,7 +143,8 @@ message DataFile {
   bytes content = 2;
 }
 
-// Synchronized start barrier.
+// Synchronized start barrier. Sent only after every assigned agent has
+// reported AssignmentReady, so the timestamp is never eaten by setup time.
 message Start {
   string run_id = 1;
   int64 start_unix_ms = 2;

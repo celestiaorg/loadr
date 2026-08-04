@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,6 +96,34 @@ pub struct AgentConfig {
     pub deps: RunnerDeps,
 }
 
+/// The run currently occupying this agent.
+enum RunPhase {
+    /// Assignment accepted; setup is running on the blocking pool.
+    Preparing {
+        run_id: String,
+        /// Set by a controller stop/kill (or shutdown). Preparation itself
+        /// cannot be interrupted mid-call; the flag makes the preparation
+        /// task discard its engine at the guarded transition instead of
+        /// arming it.
+        cancel: Arc<AtomicBool>,
+        /// A `Start` that raced ahead of readiness (a controller replay).
+        /// Honored the moment the run is armed.
+        pending_start: Option<i64>,
+    },
+    /// Engine built: armed behind the start barrier (`start_tx` is `Some`)
+    /// or already running/finished (`start_tx` taken).
+    Armed(ActiveRun),
+}
+
+impl RunPhase {
+    fn run_id(&self) -> &str {
+        match self {
+            RunPhase::Preparing { run_id, .. } => run_id,
+            RunPhase::Armed(run) => &run.run_id,
+        }
+    }
+}
+
 /// The run currently executing (or armed and waiting for `Start`).
 struct ActiveRun {
     run_id: String,
@@ -102,7 +131,7 @@ struct ActiveRun {
     start_tx: Option<oneshot::Sender<i64>>,
 }
 
-type SharedRun = Arc<Mutex<Option<ActiveRun>>>;
+type SharedRun = Arc<Mutex<Option<RunPhase>>>;
 
 enum SessionEnd {
     Shutdown,
@@ -156,8 +185,10 @@ impl Agent {
             backoff = (backoff * 2).min(Duration::from_secs(15));
         }
 
-        if let Some(run) = current.lock().take() {
-            run.handle.kill("agent shutting down");
+        match current.lock().take() {
+            Some(RunPhase::Preparing { cancel, .. }) => cancel.store(true, Ordering::Relaxed),
+            Some(RunPhase::Armed(run)) => run.handle.kill("agent shutting down"),
+            None => {}
         }
         // Release any producer parked on a full window. Without this an
         // embedded agent (tests, a host process that outlives the run) would
@@ -240,10 +271,12 @@ fn register_message(
     uplink: &Uplink,
     current: &SharedRun,
 ) -> pb::AgentMessage {
+    // A run still preparing counts: the controller must know this agent holds
+    // the assignment so it can replay per phase instead of declaring it gone.
     let resume_run_id = current
         .lock()
         .as_ref()
-        .map(|r| r.run_id.clone())
+        .map(|p| p.run_id().to_string())
         .unwrap_or_default();
     agent_msg(AgentMsg::Register(pb::Register {
         agent_id: agent_id.to_string(),
@@ -264,7 +297,10 @@ fn register_message(
 ///
 /// Every arm here must stay non-blocking apart from `inbound.message()`.
 /// Acknowledgements arrive on `inbound`, so a loop that parks waiting for the
-/// wire or for uplink-window room could never be unparked.
+/// wire or for uplink-window room could never be unparked. Assignments are
+/// only *accepted* here; their setup (file I/O, plugin loading, engine
+/// construction) runs detached on the blocking pool precisely so heartbeats
+/// and acknowledgements keep flowing however long preparation takes.
 async fn session_loop(
     mut inbound: tonic::Streaming<pb::ControllerMessage>,
     tx: &mpsc::Sender<pb::AgentMessage>,
@@ -340,38 +376,110 @@ fn handle_controller_message(
         }
         Some(CtrlMsg::Assignment(a)) => {
             let run_id = a.run_id.clone();
-            if let Err(detail) = handle_assignment(a, config, current, uplink) {
-                tracing::warn!(run_id = %run_id, error = %detail, "assignment failed");
+            if let Err(detail) = arm_assignment(a, config, current, uplink) {
+                tracing::warn!(run_id = %run_id, error = %detail, "assignment rejected");
                 // Non-blocking: this runs on the session loop, and the
                 // acknowledgements that would free window room arrive there too.
-                if !uplink.try_enqueue(run_event(&run_id, "failed", detail, Vec::new())) {
-                    tracing::warn!(run_id = %run_id, "uplink window full; failure event dropped");
+                if !uplink.try_enqueue(run_event(&run_id, "prep_failed", detail, Vec::new())) {
+                    tracing::warn!(run_id = %run_id, "uplink window full; rejection dropped");
                 }
             }
         }
         Some(CtrlMsg::Start(s)) => {
             let mut cur = current.lock();
-            if let Some(run) = cur.as_mut() {
-                if run.run_id == s.run_id {
+            match cur.as_mut() {
+                Some(RunPhase::Armed(run)) if run.run_id == s.run_id => {
                     if let Some(start_tx) = run.start_tx.take() {
                         let _ = start_tx.send(s.start_unix_ms);
                     }
                 }
+                Some(RunPhase::Preparing {
+                    run_id,
+                    pending_start,
+                    ..
+                }) if *run_id == s.run_id => {
+                    // A Start ahead of our readiness report is a replay of an
+                    // earlier barrier decision; honor it once armed.
+                    *pending_start = Some(s.start_unix_ms);
+                }
+                _ => {}
             }
         }
         Some(CtrlMsg::Control(c)) => {
-            let handle = current
-                .lock()
-                .as_ref()
-                .filter(|r| r.run_id == c.run_id)
-                .map(|r| r.handle.clone());
-            let Some(handle) = handle else {
-                enqueue_control_ack(
-                    uplink,
-                    &c,
-                    Err("run is not active on this agent".to_string()),
-                );
-                return;
+            let stopish = matches!(c.action.as_str(), "stop" | "kill");
+            let handle = {
+                let mut cur = current.lock();
+                enum Action {
+                    CancelPrep,
+                    Disarm,
+                    Drive(RunHandle),
+                    Preparing,
+                    Unknown,
+                }
+                let action = match cur.as_ref() {
+                    Some(RunPhase::Preparing { run_id, cancel, .. }) if *run_id == c.run_id => {
+                        if stopish {
+                            cancel.store(true, Ordering::Relaxed);
+                            Action::CancelPrep
+                        } else {
+                            Action::Preparing
+                        }
+                    }
+                    Some(RunPhase::Armed(run)) if run.run_id == c.run_id => {
+                        if stopish && run.start_tx.is_some() {
+                            Action::Disarm
+                        } else {
+                            Action::Drive(run.handle.clone())
+                        }
+                    }
+                    _ => Action::Unknown,
+                };
+                match action {
+                    Action::CancelPrep => {
+                        // Free the slot now: the controller has settled this
+                        // run and may reassign the agent immediately. The flag
+                        // makes the preparation task discard its engine.
+                        *cur = None;
+                        drop(cur);
+                        enqueue_control_ack(uplink, &c, Ok(()));
+                        return;
+                    }
+                    Action::Disarm => {
+                        // Armed but never started: `RunHandle::stop`/`kill`
+                        // only cancel tokens — `run()` was never called, so
+                        // the parked run task would wait forever for a Start
+                        // that will not come. Dropping `start_tx` wakes it.
+                        let disarmed = cur.take();
+                        drop(cur);
+                        if let Some(RunPhase::Armed(run)) = disarmed {
+                            run.handle.kill("controller requested stop before start");
+                        }
+                        enqueue_control_ack(uplink, &c, Ok(()));
+                        return;
+                    }
+                    Action::Drive(handle) => handle,
+                    Action::Preparing => {
+                        // pause/resume/scale address a running engine; none
+                        // exists yet. Acknowledge truthfully so the control
+                        // barrier reports it rather than timing out.
+                        drop(cur);
+                        enqueue_control_ack(
+                            uplink,
+                            &c,
+                            Err("run is still preparing on this agent".to_string()),
+                        );
+                        return;
+                    }
+                    Action::Unknown => {
+                        drop(cur);
+                        enqueue_control_ack(
+                            uplink,
+                            &c,
+                            Err("run is not active on this agent".to_string()),
+                        );
+                        return;
+                    }
+                }
             };
             let result = match c.action.as_str() {
                 "stop" => {
@@ -432,26 +540,15 @@ fn enqueue_control_ack(uplink: &Uplink, control: &pb::Control, result: Result<()
     }
 }
 
-/// Materialize an assignment, build the engine and arm it behind the start
-/// barrier. Returns a human-readable failure reason on error.
-fn handle_assignment(
+/// Accept an assignment: claim the slot and hand the heavy setup to the
+/// blocking pool. Runs on the session loop, so it must stay cheap — the
+/// dedup/busy decision and validations only.
+fn arm_assignment(
     a: pb::Assignment,
     config: &AgentConfig,
     current: &SharedRun,
     uplink: &Arc<Uplink>,
 ) -> Result<(), String> {
-    {
-        let cur = current.lock();
-        if let Some(run) = cur.as_ref() {
-            if run.run_id == a.run_id {
-                // Duplicate assignment (e.g. after a resume): keep the run.
-                return Ok(());
-            }
-            if !matches!(run.handle.status(), RunStatus::Finished { .. }) {
-                return Err(format!("agent is busy with run {}", run.run_id));
-            }
-        }
-    }
     if a.partition_count == 0 || a.partition_index >= a.partition_count {
         return Err(format!(
             "invalid partition {}/{}",
@@ -459,6 +556,131 @@ fn handle_assignment(
         ));
     }
     validate_run_id(&a.run_id).map_err(|e| e.to_string())?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut cur = current.lock();
+        match cur.as_ref() {
+            // Duplicate assignment (e.g. a controller replay after a
+            // reconnect): the run is already preparing or armed; keep it.
+            Some(phase) if phase.run_id() == a.run_id => return Ok(()),
+            Some(RunPhase::Preparing { run_id, .. }) => {
+                return Err(format!("agent is busy with run {run_id}"));
+            }
+            Some(RunPhase::Armed(run))
+                if !matches!(run.handle.status(), RunStatus::Finished { .. }) =>
+            {
+                return Err(format!("agent is busy with run {}", run.run_id));
+            }
+            _ => {}
+        }
+        *cur = Some(RunPhase::Preparing {
+            run_id: a.run_id.clone(),
+            cancel: cancel.clone(),
+            pending_start: None,
+        });
+    }
+    tokio::spawn(prepare_assignment(
+        a,
+        config.clone(),
+        current.clone(),
+        uplink.clone(),
+        cancel,
+    ));
+    Ok(())
+}
+
+/// Drive one assignment's preparation off the session loop: build the engine
+/// on the blocking pool, then arm the run and report readiness — or report a
+/// preparation failure.
+async fn prepare_assignment(
+    a: pb::Assignment,
+    config: AgentConfig,
+    current: SharedRun,
+    uplink: Arc<Uplink>,
+    cancel: Arc<AtomicBool>,
+) {
+    let run_id = a.run_id.clone();
+    let partition_index = a.partition_index;
+    let output_uplink = uplink.clone();
+    let result = tokio::task::spawn_blocking(move || prepare_engine(a, &config, output_uplink))
+        .await
+        .unwrap_or_else(|e| Err(format!("assignment preparation panicked: {e}")));
+
+    let engine = match result {
+        Ok(engine) => engine,
+        Err(detail) => {
+            {
+                let mut cur = current.lock();
+                if matches!(
+                    cur.as_ref(),
+                    Some(RunPhase::Preparing { run_id: id, .. }) if *id == run_id
+                ) {
+                    *cur = None;
+                }
+            }
+            if cancel.load(Ordering::Relaxed) {
+                tracing::debug!(run_id = %run_id, "cancelled preparation failed quietly");
+                return;
+            }
+            tracing::warn!(run_id = %run_id, error = %detail, "assignment preparation failed");
+            report_run_event(&uplink, &run_id, "prep_failed", detail, Vec::new()).await;
+            return;
+        }
+    };
+
+    let (start_tx, start_rx) = oneshot::channel::<i64>();
+    {
+        let mut cur = current.lock();
+        if !matches!(
+            cur.as_ref(),
+            Some(RunPhase::Preparing { run_id: id, .. }) if *id == run_id
+        ) {
+            // The slot was cancelled-and-freed or re-owned while we built the
+            // engine. The controller has already settled this run: discard
+            // the engine and say nothing.
+            tracing::debug!(run_id = %run_id, "prepared assignment discarded");
+            return;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            *cur = None;
+            tracing::debug!(run_id = %run_id, "prepared assignment discarded: cancelled");
+            return;
+        }
+        let latched_start = match cur.as_ref() {
+            Some(RunPhase::Preparing { pending_start, .. }) => *pending_start,
+            _ => None,
+        };
+        let mut start_tx = Some(start_tx);
+        if let Some(start_ms) = latched_start {
+            if let Some(tx) = start_tx.take() {
+                let _ = tx.send(start_ms);
+            }
+        }
+        *cur = Some(RunPhase::Armed(ActiveRun {
+            run_id: run_id.clone(),
+            handle: engine.handle(),
+            start_tx,
+        }));
+    }
+    spawn_run(engine, start_rx, run_id.clone(), uplink.clone(), current);
+    // Durable and allowed to park: readiness is what the controller's start
+    // barrier waits for, and the window replays it across reconnects.
+    if !uplink
+        .enqueue(assignment_ready(&run_id, partition_index))
+        .await
+    {
+        tracing::debug!(run_id = %run_id, "readiness dropped: agent shutting down");
+    }
+}
+
+/// The blocking half of preparation: filesystem materialization, plan
+/// loading, factory construction and engine setup. Runs on the blocking pool
+/// so the session loop keeps heartbeating however long this takes.
+fn prepare_engine(
+    a: pb::Assignment,
+    config: &AgentConfig,
+    uplink: Arc<Uplink>,
+) -> Result<Engine, String> {
     let run_dir = config.work_dir.join(&a.run_id);
     std::fs::create_dir_all(&run_dir)
         .map_err(|e| format!("cannot create {}: {e}", run_dir.display()))?;
@@ -492,9 +714,9 @@ fn handle_assignment(
 
     let output = DeltaOutput {
         run_id: a.run_id.clone(),
-        uplink: uplink.clone(),
+        uplink,
     };
-    let engine = Engine::new(
+    Engine::new(
         plan,
         run_dir,
         EngineOptions {
@@ -508,17 +730,7 @@ fn handle_assignment(
             data_sources,
         },
     )
-    .map_err(|e| format!("engine setup failed: {e}"))?;
-
-    let handle = engine.handle();
-    let (start_tx, start_rx) = oneshot::channel::<i64>();
-    *current.lock() = Some(ActiveRun {
-        run_id: a.run_id.clone(),
-        handle,
-        start_tx: Some(start_tx),
-    });
-    spawn_run(engine, start_rx, a.run_id, uplink.clone(), current.clone());
-    Ok(())
+    .map_err(|e| format!("engine setup failed: {e}"))
 }
 
 /// Hold the engine ready, wait for the synchronized start, run to completion
@@ -531,9 +743,11 @@ fn spawn_run(
     current: SharedRun,
 ) {
     tokio::spawn(async move {
+        // Clear only the exact run this task armed: a Preparing entry (or an
+        // Armed entry for another run) belongs to a newer assignment.
         let clear = |current: &SharedRun, run_id: &str| {
             let mut cur = current.lock();
-            if cur.as_ref().map(|r| r.run_id == run_id).unwrap_or(false) {
+            if matches!(cur.as_ref(), Some(RunPhase::Armed(r)) if r.run_id == run_id) {
                 *cur = None;
             }
         };
@@ -591,6 +805,13 @@ fn run_event(run_id: &str, kind: &str, detail: String, summary_json: Vec<u8>) ->
     }))
 }
 
+fn assignment_ready(run_id: &str, partition_index: u64) -> pb::AgentMessage {
+    agent_msg(AgentMsg::AssignmentReady(pb::AssignmentReady {
+        run_id: run_id.to_string(),
+        partition_index,
+    }))
+}
+
 /// An unsequenced message. [`Uplink`] stamps `seq` when it admits one into its
 /// window; the messages that bypass the window — `Register` and `Heartbeat` —
 /// keep 0 and are never replayed.
@@ -603,7 +824,8 @@ fn agent_msg(msg: AgentMsg) -> pb::AgentMessage {
 
 fn make_heartbeat(current: &SharedRun) -> pb::AgentMessage {
     let (run_id, run_state, active_vus) = match current.lock().as_ref() {
-        Some(run) => {
+        Some(RunPhase::Preparing { run_id, .. }) => (run_id.clone(), "preparing".to_string(), 0),
+        Some(RunPhase::Armed(run)) => {
             let state = match run.handle.status() {
                 RunStatus::Pending => "pending",
                 RunStatus::Running => "running",

@@ -186,7 +186,11 @@ async fn replaying_over_a_new_session_merges_a_delta_only_once() {
 
 /// A restarted agent process reuses its stable agent id but starts its uplink
 /// sequence again at 1. Without the incarnation reset the controller would
-/// discard every one of those messages as a duplicate.
+/// discard every one of those messages as a duplicate — observable on the
+/// wire as an acknowledgement that never reaches the fresh sequence.
+///
+/// The restart also settles the run the old process was reserved for: its
+/// work is gone with the process, and keeping the run open would strand it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarting_with_a_new_incarnation_is_not_treated_as_a_duplicate() {
     let handle = start_controller(Duration::from_secs(30)).await;
@@ -205,19 +209,19 @@ async fn restarting_with_a_new_incarnation_is_not_treated_as_a_duplicate() {
     );
     drop(agent);
 
-    let reborn = FakeAgent::connect(handle.addr(), "agent-reborn", "proc-2").await;
-    reborn.send(metrics_batch(&run_id, 1, 7)).await;
-    reborn.send(run_event(&run_id, 2, "finished")).await;
+    let mut reborn = FakeAgent::connect(handle.addr(), "agent-reborn", "proc-2").await;
     wait_until(
         || is_terminal(&run_state(&handle, &run_id)),
         Duration::from_secs(10),
-        "run completion",
+        "a restarted process settles the run it was reserved for",
     )
     .await;
-    assert_eq!(
-        summary_metric_sum(&handle, &run_id, "http_reqs"),
-        22.0,
-        "the restarted process's fresh sequence space must be accepted, not deduplicated away"
+
+    reborn.send(metrics_batch(&run_id, 1, 7)).await;
+    assert!(
+        reborn.acks().await.contains(&1),
+        "the restarted process's fresh sequence space must be accepted, not deduplicated away \
+         (a stale cursor would re-acknowledge 3 and never 1)"
     );
 
     handle.shutdown();

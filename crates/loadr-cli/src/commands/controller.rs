@@ -539,6 +539,7 @@ impl loadr_plugin_webui::UiBackend for ControllerBackend {
                     agent_filter: None,
                     on_agent_loss: Default::default(),
                     start_barrier: std::time::Duration::from_secs(2),
+                    preparation_timeout: std::time::Duration::from_secs(120),
                 },
             )
             .await
