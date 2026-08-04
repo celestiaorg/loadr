@@ -53,7 +53,7 @@ impl Default for ControllerConfig {
         ControllerConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tls: None,
-            agent_liveness: Duration::from_secs(6),
+            agent_liveness: Duration::from_secs(90),
         }
     }
 }
