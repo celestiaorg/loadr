@@ -73,16 +73,33 @@ struct MemoryFeed {
 
 enum Feed {
     Memory(MemoryFeed),
-    Plugin(Arc<dyn DataSourcePlugin>),
+    Plugin {
+        plugin: Arc<dyn DataSourcePlugin>,
+        /// Fetch rows under `block_in_place` so a slow feeder cannot stall
+        /// the runtime (opt-in per source via `blocking: true`).
+        blocking: bool,
+    },
 }
 
 impl std::fmt::Debug for Feed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Feed::Memory(feed) => feed.fmt(f),
-            Feed::Plugin(plugin) => write!(f, "Feed::Plugin({})", plugin.name()),
+            Feed::Plugin { plugin, blocking } => {
+                write!(f, "Feed::Plugin({}, blocking: {blocking})", plugin.name())
+            }
         }
     }
+}
+
+/// Whether a fetch should run under [`tokio::task::block_in_place`]: only
+/// when the source opted in, and only where the bracket is legal — inside a
+/// multi-thread Tokio runtime. `block_in_place` panics on a current-thread
+/// runtime and outside any runtime; both fall back to the plain inline call.
+fn bracket_plugin_fetch(blocking: bool) -> bool {
+    blocking
+        && tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
 }
 
 /// Per-VU feeder state: sequential cursors, per-VU shuffle orders, and
@@ -181,6 +198,7 @@ impl DataFeeds {
             if let DataSource::Plugin {
                 source: plugin_name,
                 config,
+                ..
             } = source
             {
                 plugin_groups
@@ -213,6 +231,7 @@ impl DataFeeds {
             let feed = match source {
                 DataSource::Plugin {
                     source: plugin_name,
+                    blocking,
                     ..
                 } => {
                     has_on_demand = true;
@@ -220,7 +239,10 @@ impl DataFeeds {
                         .get(plugin_name)
                         .expect("initialized above for every referenced plugin")
                         .clone();
-                    Feed::Plugin(plugin)
+                    Feed::Plugin {
+                        plugin,
+                        blocking: *blocking,
+                    }
                 }
                 DataSource::Csv {
                     path,
@@ -384,7 +406,7 @@ impl DataFeeds {
 
     /// Whether `name` is a plugin-backed (on-demand) source.
     pub fn is_on_demand(&self, name: &str) -> bool {
-        matches!(self.feeds.get(name), Some(Feed::Plugin(_)))
+        matches!(self.feeds.get(name), Some(Feed::Plugin { .. }))
     }
 
     /// Fetch the next row for `source`, honoring its mode, pick strategy and
@@ -405,7 +427,7 @@ impl DataFeeds {
             .ok_or_else(|| NextRowError::UnknownSource(source.to_string()))?;
 
         let feed = match feed {
-            Feed::Plugin(plugin) => {
+            Feed::Plugin { plugin, blocking } => {
                 let seq = state.next_plugin_seq(source);
                 let ctx = PluginRowCtx {
                     run_id: &self.run_id,
@@ -420,7 +442,15 @@ impl DataFeeds {
                     request: id.request,
                     ts_ms: crate::metrics::now_millis(),
                 };
-                return match plugin.next_row(&ctx) {
+                // The plugin call is synchronous FFI on a runtime worker; a
+                // feeder that signs, hashes or does I/O would otherwise stall
+                // timers and unrelated VUs for its whole call.
+                let fetched = if bracket_plugin_fetch(*blocking) {
+                    tokio::task::block_in_place(|| plugin.next_row(&ctx))
+                } else {
+                    plugin.next_row(&ctx)
+                };
+                return match fetched {
                     Ok(PluginRowResult::Row(row)) => Ok(Arc::new(row)),
                     Ok(PluginRowResult::Exhausted) => {
                         Err(NextRowError::Exhausted(EndOfData(source.to_string())))
@@ -536,6 +566,11 @@ mod tests {
         EchoSeq,
         AlwaysErr(String),
         AlwaysExhausted,
+        /// Signal entry, then sleep before answering — a slow FFI feeder.
+        SleepyEcho {
+            entered: std::sync::mpsc::SyncSender<()>,
+            delay: std::time::Duration,
+        },
     }
 
     struct FakePlugin {
@@ -582,8 +617,32 @@ mod tests {
                 }
                 FakeMode::AlwaysErr(msg) => Err(msg.clone()),
                 FakeMode::AlwaysExhausted => Ok(PluginRowResult::Exhausted),
+                FakeMode::SleepyEcho { entered, delay } => {
+                    let _ = entered.try_send(());
+                    std::thread::sleep(*delay);
+                    let mut row = Row::new();
+                    row.insert("seq".to_string(), ctx.seq.to_string());
+                    Ok(PluginRowResult::Row(row))
+                }
             }
         }
+    }
+
+    /// One plugin-backed source named `rows`, wired to the given fake.
+    fn plugin_feeds(plugin: FakePlugin, blocking: bool) -> DataFeeds {
+        let name = plugin.name.clone();
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert(name.clone(), Box::new(plugin));
+        let mut sources = IndexMap::new();
+        sources.insert(
+            "rows".to_string(),
+            DataSource::Plugin {
+                source: name,
+                config: serde_json::Value::Null,
+                blocking,
+            },
+        );
+        DataFeeds::load(&sources, Path::new("."), plugins).expect("load")
     }
 
     fn csv_feeds(
@@ -836,6 +895,7 @@ mod tests {
             DataSource::Plugin {
                 source: plugin_name.to_string(),
                 config: serde_json::Value::Null,
+                blocking: false,
             },
         );
         sources
@@ -1007,6 +1067,7 @@ mod tests {
             DataSource::Plugin {
                 source: "signer".to_string(),
                 config: serde_json::json!({"k": "a"}),
+                blocking: false,
             },
         );
         sources.insert(
@@ -1014,6 +1075,7 @@ mod tests {
             DataSource::Plugin {
                 source: "signer".to_string(),
                 config: serde_json::json!({"k": "b"}),
+                blocking: false,
             },
         );
         let (plugin, handle) = fake_plugin("signer", FakeMode::EchoSeq);
@@ -1085,5 +1147,100 @@ mod tests {
         assert!(feeds.has_on_demand());
         assert!(feeds.is_on_demand("signed"));
         assert!(!feeds.is_on_demand("static_rows"));
+    }
+
+    #[test]
+    fn bracket_decision_respects_flag_and_runtime_flavor() {
+        // No runtime on this thread: always inline.
+        assert!(!bracket_plugin_fetch(true));
+        assert!(!bracket_plugin_fetch(false));
+
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        multi.block_on(async {
+            assert!(bracket_plugin_fetch(true));
+            assert!(!bracket_plugin_fetch(false), "off stays inline everywhere");
+        });
+
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        current.block_on(async {
+            assert!(
+                !bracket_plugin_fetch(true),
+                "block_in_place panics on a current_thread runtime; fall back inline"
+            );
+        });
+    }
+
+    /// The data-source twin of the protocol-side runtime-liveness regression:
+    /// on a saturated one-worker runtime, a 300ms blocking-flagged fetch must
+    /// not delay a concurrent 50ms timer — `block_in_place` demotes the
+    /// worker and Tokio installs a replacement. The unchanged inline path
+    /// would hold the timer for roughly the whole fetch.
+    #[test]
+    fn blocking_fetch_does_not_stall_the_runtime_timer() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (plugin, _handle) = fake_plugin(
+            "sleepy",
+            FakeMode::SleepyEcho {
+                entered: entered_tx,
+                delay: std::time::Duration::from_millis(300),
+            },
+        );
+        let feeds = Arc::new(plugin_feeds(plugin, true));
+
+        runtime.block_on(async {
+            let fetch = tokio::spawn({
+                let feeds = feeds.clone();
+                async move {
+                    let mut st = VuFeedState::new();
+                    let mut r = rng();
+                    feeds.next_row("rows", &mut st, &mut r, &id())
+                }
+            });
+            // Arm the timer only once the fetch is provably inside next_row,
+            // so task-start order cannot make the test pass accidentally.
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the fetch entered the plugin");
+            let armed = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let timer_elapsed = armed.elapsed();
+            assert!(
+                timer_elapsed < std::time::Duration::from_millis(200),
+                "the timer must fire while the 300ms fetch is in flight, took {timer_elapsed:?}"
+            );
+            let row = fetch
+                .await
+                .expect("fetch task join")
+                .expect("the fetched row is returned intact");
+            assert!(row.get("seq").is_some(), "the row survives the bracket");
+        });
+    }
+
+    /// A blocking-flagged source on a current_thread runtime neither panics
+    /// (block_in_place would) nor deadlocks — the flavor guard goes inline.
+    #[test]
+    fn blocking_flag_falls_back_inline_on_a_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let (plugin, _handle) = fake_plugin("signer", FakeMode::EchoSeq);
+        let feeds = plugin_feeds(plugin, true);
+
+        runtime.block_on(async {
+            let mut st = VuFeedState::new();
+            let mut r = rng();
+            let row = feeds.next_row("rows", &mut st, &mut r, &id()).expect("row");
+            assert!(row.get("seq").is_some());
+        });
     }
 }
