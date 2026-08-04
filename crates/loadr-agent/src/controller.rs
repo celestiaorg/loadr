@@ -322,9 +322,10 @@ impl Inner {
                 let Some(run) = run else { return };
                 match serde_json::from_slice::<MetricsDelta>(&batch.delta_json) {
                     Ok(mut delta) => {
-                        run.contributing.lock().insert(agent_id.to_string());
                         // Identity labels are supplied by the registered
                         // controller session, never trusted from sample tags.
+                        // Looked up before the state lock: no state → agents
+                        // ordering edge.
                         let agent_name = self
                             .agents
                             .lock()
@@ -332,14 +333,31 @@ impl Inner {
                             .map(|entry| entry.name.clone())
                             .unwrap_or_else(|| agent_id.to_string());
                         add_agent_identity(&mut delta, &agent_name, agent_id);
+                        // Apply under the run state lock: finalize_run holds
+                        // it while freezing the merged summary, so a delta
+                        // either fully applies (contributing + merge as one)
+                        // before the freeze, or is dropped after it. Without
+                        // this, the freeze could land between the two writes
+                        // and publish "every agent contributed" beside an
+                        // empty final summary.
+                        let state = run.state.lock();
+                        if state.is_terminal() {
+                            tracing::debug!(
+                                run_id = %batch.run_id,
+                                agent = %agent_id,
+                                "delta after the terminal freeze dropped"
+                            );
+                            return;
+                        }
+                        run.contributing.lock().insert(agent_id.to_string());
                         run.agg.lock().merge_delta(&delta);
                         // A delta can race the liveness sweep (or land after the
                         // agent's terminal event on a resumed stream). The sweep
                         // only zeroes *newly* lost agents, so re-zero here or the
                         // stale batch resurrects the agent's live gauges forever.
-                        if run.lost.lock().contains(agent_id)
-                            || run.done.lock().contains_key(agent_id)
-                        {
+                        let lost = run.lost.lock().contains(agent_id);
+                        let done = run.done.lock().contains_key(agent_id);
+                        if lost || done {
                             self.zero_agent_live_gauges(&run, agent_id);
                         }
                     }
@@ -1390,6 +1408,73 @@ mod metrics_tests {
         // …then an in-flight delta lands. It must not resurrect the gauge.
         inner.handle_agent_message("agent-a", batch(&delta));
         assert_eq!(fleet_vus(), Some(0.0));
+    }
+
+    /// The terminal freeze and a delta's contributing-insert + merge must not
+    /// interleave. A sweep-driven finalization used to be able to freeze the
+    /// summary between the two writes: the UI then showed "every agent
+    /// contributed" beside an empty (all-dash) final table.
+    #[test]
+    fn post_terminal_delta_cannot_claim_contribution() {
+        let (sender, _keepalive) = mpsc::channel(8);
+        let inner = Inner {
+            controller_id: "ctrl".into(),
+            liveness: Duration::from_secs(6),
+            agents: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
+            session_counter: AtomicU64::new(0),
+            control_counter: AtomicU64::new(0),
+        };
+        inner.agents.lock().insert(
+            "agent-a".into(),
+            AgentEntry {
+                name: "worker-a".into(),
+                labels: HashMap::new(),
+                cores: 1,
+                connected_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                active_vus: 0,
+                connected: true,
+                session: 1,
+                sender,
+            },
+        );
+        let run = test_run("run-1", &["agent-a"]);
+        inner.runs.lock().insert("run-1".into(), run.clone());
+
+        // The sweep-abort shape: the run finalizes while the survivors' first
+        // flush is still in flight.
+        inner.finalize_run(&run, RunState::Failed);
+
+        let delta = MetricsDelta {
+            series: vec![SeriesDelta {
+                metric: "http_reqs".into(),
+                kind: MetricKind::Counter,
+                tags: Tags::new(),
+                data: SeriesDeltaData::Counter { delta: 40.0 },
+            }],
+        };
+        let batch = pb::AgentMessage {
+            msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
+                run_id: "run-1".into(),
+                delta_json: serde_json::to_vec(&delta).expect("delta json"),
+            })),
+        };
+        inner.handle_agent_message("agent-a", batch);
+
+        assert!(
+            run.contributing.lock().is_empty(),
+            "a post-freeze delta must not mark its agent as contributing"
+        );
+        let frozen = run
+            .merged_summary
+            .lock()
+            .clone()
+            .expect("finalization froze a summary");
+        assert!(
+            frozen.metrics.iter().all(|m| m.metric != "http_reqs"),
+            "the frozen summary must not gain data after the freeze"
+        );
     }
 
     #[test]
