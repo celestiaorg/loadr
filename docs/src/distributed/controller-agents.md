@@ -9,13 +9,21 @@ gRPC stream per agent:
 agent ──▶ Register{agent_id, incarnation, name, protocol_version, cores, labels}
       ◀── Registered{controller_id}
       ◀── Assignment{run_id, plan_yaml, partition i/n, data files}
-      ◀── Start{run_id, start_unix_ms}          # synchronized barrier
+      ──▶ AssignmentReady{run_id, partition}  seq=n  # engine built, armed
+      ◀── Start{run_id, start_unix_ms}         # sent once EVERY agent is ready
       ──▶ MetricsBatch{run_id, delta}    seq=n  # every second
       ──▶ Heartbeat{active_vus, run_state}      # every 2 seconds, unsequenced
       ◀── UplinkAck{seq}                        # cumulative receipt
       ◀── Control{stop|kill|pause|resume|scale}
-      ──▶ RunEvent{started|finished|failed, summary}   seq=n
+      ──▶ RunEvent{started|finished|failed|prep_failed, summary}   seq=n
 ```
+
+An assignment is *accepted* on the agent's session loop but *prepared* off it,
+on the blocking pool: file materialization, plugin loading and engine
+construction never block heartbeats or acknowledgements, however long they
+take. The agent reports `AssignmentReady` once armed, and the controller
+computes the synchronized start timestamp only after every assigned agent has
+done so — setup time can never eat into the start barrier.
 
 The protocol is versioned; an agent with an incompatible
 `protocol_version` is rejected at registration.
@@ -71,14 +79,33 @@ the internet.
 ## Failure handling
 
 - **Heartbeats** every 2 s; an agent silent past the liveness window
-  (default 6 s) is marked unhealthy.
+  (default 6 s) is marked unhealthy. A preparing agent heartbeats
+  `run_state = "preparing"` — slow setup does not risk the liveness window.
+- **Preparation failures are distinct from execution failures.** An agent
+  that cannot materialize its assignment (a missing plugin, a bad plan, a
+  busy agent) reports `prep_failed`; the controller stops the already-ready
+  agents, releases the fleet and fails the run with a preparation reason.
+  The same applies when an agent is lost or restarted before `Start`, when
+  preparation exceeds the per-submission timeout
+  (`SubmitOptions::preparation_timeout`, default 120 s), and — finalized as
+  `aborted` rather than `failed` — when the user stops a pending run.
+- **Agents are reserved at submission.** A second submission while every
+  matching agent is reserved is refused up front ("all matching agents are
+  busy") instead of creating a run its agents would reject. Reservations
+  survive reconnects and are released when the run reaches a terminal state.
 - **Reconnection**: agents reconnect with jittered exponential backoff and
-  re-register, resuming their identity.
+  re-register, resuming their identity. The controller replays what the
+  disconnect lost: the Assignment for an agent that never became ready, or
+  the stored `Start` timestamp for one that did. An agent process restart
+  (fresh incarnation) instead terminates its participation — its prepared
+  state died with the process — and frees the agent for new work.
 - **Agent loss during a run** is policy-driven per submission:
   - `continue` (default) — remaining agents keep their share; the lost
     agent's portion of the load simply stops (the summary notes the
     reduced fleet).
   - `abort` — the controller stops the run everywhere.
+  Loss *before* `Start` is always a preparation failure; the policy governs
+  a running fleet only.
 
 ## Data files
 
