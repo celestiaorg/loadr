@@ -84,9 +84,14 @@ pub struct GrpcRequest {
     pub service: String,
     pub method: String,
     /// Unary request message (JSON-encoded).
-    pub message: Option<serde_json::Value>,
+    pub message: Option<Arc<serde_json::Value>>,
     /// Streaming request messages.
-    pub messages: Vec<serde_json::Value>,
+    pub messages: Arc<Vec<serde_json::Value>>,
+    /// True when the message JSON contains no template substitutions: the
+    /// `Arc`(s) above are then the compile-time values, handed out unchanged
+    /// every iteration (stable identity), so the handler may cache the
+    /// encoded body per `Arc`.
+    pub message_literal: bool,
     pub metadata: Vec<(String, String)>,
 }
 

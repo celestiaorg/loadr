@@ -3,8 +3,9 @@
 //! mock protocol handler. (JS-condition while/if coverage lives in the CLI
 //! e2e suite, which wires the real QuickJS engine.)
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use loadr_core::{
@@ -40,11 +41,99 @@ impl ProtocolHandler for RecordingHandler {
     }
 }
 
+struct BlockingHandler {
+    started: AtomicU64,
+    completed: AtomicU64,
+    released: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+impl BlockingHandler {
+    fn new() -> Arc<Self> {
+        Arc::new(BlockingHandler {
+            started: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            released: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn wait_started(&self) {
+        loop {
+            let started = self.started_notify.notified();
+            if self.started.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            started.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl ProtocolHandler for BlockingHandler {
+    fn name(&self) -> &str {
+        "http"
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut VuContext,
+        request: &PreparedRequest,
+    ) -> Result<ProtocolResponse, ProtocolError> {
+        self.started.fetch_add(1, Ordering::Release);
+        self.started_notify.notify_waiters();
+        loop {
+            let released = self.release_notify.notified();
+            if self.released.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(ProtocolResponse {
+            status: 200,
+            protocol_version: "HTTP/1.1".into(),
+            url: request.url.clone(),
+            ..Default::default()
+        })
+    }
+}
+
 fn registry(handler: Arc<RecordingHandler>) -> ProtocolRegistry {
     let mut reg = ProtocolRegistry::new();
     reg.register(handler);
     reg.register_alias("https", "http");
     reg
+}
+
+fn engine_with_handler<H>(
+    yaml: &str,
+    handler: Arc<H>,
+    snapshot_interval: Duration,
+) -> loadr_core::Engine
+where
+    H: ProtocolHandler + 'static,
+{
+    let loaded = loadr_config::load_str(yaml, &loadr_config::LoadOptions::new()).expect("parse");
+    let mut reg = ProtocolRegistry::new();
+    reg.register(handler);
+    Engine::new(
+        loaded.plan,
+        std::path::PathBuf::from("."),
+        EngineOptions {
+            protocols: reg,
+            snapshot_interval,
+            ..Default::default()
+        },
+    )
+    .expect("engine")
 }
 
 async fn run(yaml: &str, handler: Arc<RecordingHandler>) -> loadr_core::RunResult {
@@ -351,6 +440,174 @@ scenarios:
         count >= 20,
         "throttle too aggressive: only {count} requests"
     );
+}
+
+fn assert_cancelled_request_metrics(result: &loadr_core::RunResult) {
+    let http_reqs = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "http_reqs")
+        .expect("http_reqs");
+    assert_eq!(http_reqs.agg.sum, 1.0);
+
+    let duration = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "http_req_duration")
+        .expect("http_req_duration");
+    assert_eq!(duration.agg.count, 1);
+    assert!(duration.agg.max.is_some());
+
+    let failed = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "http_req_failed")
+        .expect("http_req_failed");
+    assert_eq!(failed.agg.count, 1);
+    assert_eq!(failed.agg.sum, 1.0);
+
+    let cancelled = result
+        .summary
+        .snapshot
+        .series
+        .iter()
+        .find(|s| {
+            s.metric == "http_req_failed"
+                && s.tags.get("error_kind").map(String::as_str) == Some("cancelled")
+        })
+        .expect("cancelled failure series");
+    assert_eq!(cancelled.agg.count, 1);
+    assert_eq!(cancelled.agg.sum, 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_kill_records_cancelled_in_flight_request_metrics() {
+    let handler = BlockingHandler::new();
+    let engine = engine_with_handler(
+        r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 30s
+    flow:
+      - request: { url: "http://x/slow" }
+"#,
+        handler.clone(),
+        Duration::from_millis(100),
+    );
+    let handle = engine.handle();
+    let run = tokio::spawn(engine.run());
+
+    handler.wait_started().await;
+    handle.kill("test kill");
+
+    let result = match tokio::time::timeout(Duration::from_secs(5), run).await {
+        Ok(joined) => joined.expect("run task").expect("run"),
+        Err(_) => {
+            handler.release();
+            panic!("run did not finish after hard kill");
+        }
+    };
+
+    assert_eq!(handler.completed.load(Ordering::Relaxed), 0);
+    assert_cancelled_request_metrics(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_stop_deadline_records_cancelled_in_flight_request_metrics() {
+    let handler = BlockingHandler::new();
+    let engine = engine_with_handler(
+        r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 30s
+    graceful_stop: 50ms
+    flow:
+      - request: { url: "http://x/slow" }
+"#,
+        handler.clone(),
+        Duration::from_millis(100),
+    );
+    let handle = engine.handle();
+    let run = tokio::spawn(engine.run());
+
+    handler.wait_started().await;
+    handle.stop("test stop");
+
+    let result = match tokio::time::timeout(Duration::from_secs(5), run).await {
+        Ok(joined) => joined.expect("run task").expect("run"),
+        Err(_) => {
+            handler.release();
+            panic!("run did not finish after graceful stop deadline");
+        }
+    };
+
+    assert_eq!(handler.completed.load(Ordering::Relaxed), 0);
+    assert_cancelled_request_metrics(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_in_flight_gauge_tracks_active_requests() {
+    let handler = BlockingHandler::new();
+    let engine = engine_with_handler(
+        r#"
+scenarios:
+  s:
+    executor: shared-iterations
+    vus: 1
+    iterations: 1
+    flow:
+      - request: { url: "http://x/slow" }
+"#,
+        handler.clone(),
+        Duration::from_millis(50),
+    );
+    let handle = engine.handle();
+    let mut snapshots = handle.watch_snapshots();
+    let run = tokio::spawn(engine.run());
+
+    handler.wait_started().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snap = snapshots.borrow_and_update().clone();
+        let max_in_flight = snap
+            .series
+            .iter()
+            .filter(|s| s.metric == "requests_in_flight")
+            .filter_map(|s| s.agg.max)
+            .fold(0.0_f64, f64::max);
+        if max_in_flight >= 1.0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            handler.release();
+            panic!("requests_in_flight never reached 1");
+        }
+        snapshots.changed().await.expect("snapshots");
+    }
+
+    handler.release();
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run timeout")
+        .expect("run task")
+        .expect("run");
+
+    assert_eq!(handler.completed.load(Ordering::Relaxed), 1);
+    let gauge = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "requests_in_flight")
+        .expect("requests_in_flight");
+    assert!(gauge.agg.max.unwrap_or_default() >= 1.0);
+    assert_eq!(gauge.agg.last, Some(0.0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

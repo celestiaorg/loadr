@@ -1,6 +1,7 @@
 //! Metric primitives: kinds, samples, the metric registry and the sample bus.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,6 +73,7 @@ pub const BUILTIN_METRIC_DEFS: &[(&str, MetricKind, bool)] = &[
     ("dropped_iterations", MetricKind::Counter, false),
     ("vus", MetricKind::Gauge, false),
     ("vus_max", MetricKind::Gauge, false),
+    ("requests_in_flight", MetricKind::Gauge, false),
     ("checks", MetricKind::Rate, false),
     // Script (JS) exceptions raised in hooks, exec functions, and js steps.
     // Tagged with `exception` (a normalised message) and `scenario`.
@@ -201,6 +203,7 @@ enum Sink {
 #[derive(Clone)]
 pub struct MetricsBus {
     sink: Sink,
+    requests_in_flight: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for MetricsBus {
@@ -218,7 +221,13 @@ impl std::fmt::Debug for MetricsBus {
 impl MetricsBus {
     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Sample>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (MetricsBus { sink: Sink::Tx(tx) }, rx)
+        (
+            MetricsBus {
+                sink: Sink::Tx(tx),
+                requests_in_flight: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
     }
 
     /// Build a bus that records straight into `shards` instead of a channel
@@ -227,6 +236,7 @@ impl MetricsBus {
     pub fn sharded(shards: Arc<crate::aggregate::MetricShards>) -> Self {
         MetricsBus {
             sink: Sink::Shard { shards, idx: 0 },
+            requests_in_flight: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -234,16 +244,18 @@ impl MetricsBus {
     /// Applied once, in `VuContext::new`, so every emit site — VUs, the JS
     /// host, plugin protocols — is covered with no call-site changes.
     pub fn for_vu(&self, vu_id: u64) -> Self {
-        match &self.sink {
-            Sink::Tx(tx) => MetricsBus {
-                sink: Sink::Tx(tx.clone()),
-            },
-            Sink::Shard { shards, .. } => MetricsBus {
-                sink: Sink::Shard {
+        let sink = match &self.sink {
+            Sink::Tx(tx) => Sink::Tx(tx.clone()),
+            Sink::Shard { shards, .. } => {
+                Sink::Shard {
                     shards: shards.clone(),
                     idx: (vu_id % shards.len() as u64) as usize,
-                },
-            },
+                }
+            }
+        };
+        MetricsBus {
+            sink,
+            requests_in_flight: self.requests_in_flight.clone(),
         }
     }
 
@@ -290,6 +302,18 @@ impl MetricsBus {
     pub fn trend(&self, metric: &Arc<str>, value: f64, tags: &Arc<Tags>) {
         self.emit_value(metric, MetricKind::Trend, value, tags);
     }
+
+    pub(crate) fn begin_request(&self) {
+        self.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn end_request(&self) {
+        self.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn requests_in_flight(&self) -> u64 {
+        self.requests_in_flight.load(Ordering::Relaxed)
+    }
 }
 
 /// Interned built-in metric names, resolved once per engine.
@@ -314,6 +338,8 @@ pub struct BuiltinMetrics {
     pub faults_injected: Arc<str>,
     pub data_sent: Arc<str>,
     pub data_received: Arc<str>,
+    pub grpc_reqs: Arc<str>,
+    pub grpc_req_duration: Arc<str>,
 }
 
 impl BuiltinMetrics {
@@ -344,6 +370,8 @@ impl BuiltinMetrics {
             faults_injected: name("faults_injected"),
             data_sent: name("data_sent"),
             data_received: name("data_received"),
+            grpc_reqs: name("grpc_reqs"),
+            grpc_req_duration: name("grpc_req_duration"),
         }
     }
 }
@@ -359,6 +387,10 @@ mod tests {
         assert_eq!(def.kind, MetricKind::Trend);
         assert!(def.time);
         assert_eq!(reg.get("checks").map(|d| d.kind), Some(MetricKind::Rate));
+        assert_eq!(
+            reg.get("requests_in_flight").map(|d| d.kind),
+            Some(MetricKind::Gauge)
+        );
     }
 
     #[test]

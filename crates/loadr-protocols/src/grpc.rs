@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use bytes::{BufMut as _, Bytes};
 use loadr_config::HttpDefaults;
 use loadr_core::error::ProtocolError;
 use loadr_core::protocol::{
@@ -71,8 +72,16 @@ impl DynamicCodec {
     }
 }
 
+/// Outbound message: built dynamically per call, or pre-encoded bytes served
+/// from the per-VU literal-message cache (skips JSON→DynamicMessage→encode).
+#[derive(Clone)]
+enum Outbound {
+    Dynamic(DynamicMessage),
+    Encoded(Bytes),
+}
+
 impl Codec for DynamicCodec {
-    type Encode = DynamicMessage;
+    type Encode = Outbound;
     type Decode = DynamicMessage;
     type Encoder = DynamicEncoder;
     type Decoder = DynamicDecoder;
@@ -91,12 +100,19 @@ impl Codec for DynamicCodec {
 struct DynamicEncoder;
 
 impl Encoder for DynamicEncoder {
-    type Item = DynamicMessage;
+    type Item = Outbound;
     type Error = Status;
 
-    fn encode(&mut self, item: DynamicMessage, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        item.encode(dst)
-            .map_err(|e| Status::internal(format!("failed to encode message: {e}")))
+    fn encode(&mut self, item: Outbound, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+        match item {
+            Outbound::Dynamic(message) => message
+                .encode(dst)
+                .map_err(|e| Status::internal(format!("failed to encode message: {e}"))),
+            Outbound::Encoded(bytes) => {
+                dst.put_slice(&bytes);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -125,6 +141,50 @@ impl Decoder for DynamicDecoder {
 #[derive(Default)]
 struct GrpcChannels {
     channels: HashMap<String, Channel>,
+    /// Resolved call state, one entry per distinct request shape this VU has
+    /// executed (usually one). Linear scan on string keys — no per-request
+    /// allocation. A VU runs one request at a time, so `&mut` access and the
+    /// cached `Grpc` client's poll_ready discipline are safe; never share
+    /// these across VUs.
+    calls: Vec<CachedCall>,
+}
+
+/// Everything about a (endpoint, service, method) call that is invariant
+/// across iterations: descriptors, path, codec, shape, a client pinned to the
+/// VU's channel, and encoded bodies for literal messages.
+struct CachedCall {
+    endpoint: String,
+    service: String,
+    method_name: String,
+    reflection: bool,
+    proto_files: Vec<PathBuf>,
+    /// Part of the identity: the same files can resolve differently under
+    /// different include roots.
+    proto_includes: Vec<PathBuf>,
+    input_desc: prost_reflect::MessageDescriptor,
+    path: http::uri::PathAndQuery,
+    codec: DynamicCodec,
+    shape: (bool, bool),
+    client: tonic::client::Grpc<Channel>,
+    /// Encoded literal message frames keyed by the message `Arc`'s pointer
+    /// identity (stable for the run: the Arc is owned by the compiled plan).
+    encoded: HashMap<usize, EncodedMessages>,
+}
+
+struct EncodedMessages {
+    frames: Vec<Bytes>,
+    bytes_sent: u64,
+}
+
+impl CachedCall {
+    fn matches(&self, endpoint: &str, grpc: &GrpcRequest) -> bool {
+        self.endpoint == endpoint
+            && self.service == grpc.service
+            && self.method_name == grpc.method
+            && self.reflection == grpc.reflection
+            && self.proto_files == grpc.proto_files
+            && self.proto_includes == grpc.proto_includes
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -340,81 +400,158 @@ impl ProtocolHandler for GrpcHandler {
             ProtocolError::InvalidRequest("grpc request requires `grpc:` options".to_string())
         })?;
         let (endpoint, tls) = self.endpoint_uri(&request.url)?;
-        let channel = self.channel(ctx, &endpoint, tls)?;
 
         let start = Instant::now();
 
-        // Resolve the descriptor pool.
-        let pool = if grpc.reflection {
-            match tokio::time::timeout(
-                request.timeout,
-                self.pool_from_reflection(channel.clone(), &endpoint, &grpc.service),
-            )
-            .await
-            {
-                Ok(Ok(pool)) => pool,
-                Ok(Err(message)) => {
-                    return Ok(grpc_error_response(message, start, &request.url));
-                }
-                Err(_) => return Ok(crate::http::timeout_response(request, start)),
-            }
-        } else if !grpc.proto_files.is_empty() {
-            self.pool_from_protos(grpc)?
-        } else {
-            return Err(ProtocolError::InvalidRequest(
-                "grpc request needs `proto_files` or `reflection: true`".to_string(),
-            ));
-        };
+        // Resolve call state (descriptors, path, codec, client) — cached per
+        // VU after the first iteration of each request shape.
+        let state = ctx.extensions.get_or_insert_with(GrpcChannels::default);
+        let call_idx = match state.calls.iter().position(|c| c.matches(&endpoint, grpc)) {
+            Some(idx) => idx,
+            None => {
+                let channel = self.channel(ctx, &endpoint, tls)?;
 
-        let service = pool.get_service_by_name(&grpc.service).ok_or_else(|| {
-            ProtocolError::InvalidRequest(format!("service `{}` not found", grpc.service))
-        })?;
-        let method = service
-            .methods()
-            .find(|m| m.name() == grpc.method)
-            .ok_or_else(|| {
-                ProtocolError::InvalidRequest(format!(
-                    "method `{}` not found on `{}`",
-                    grpc.method, grpc.service
-                ))
-            })?;
+                // Resolve the descriptor pool.
+                let pool = if grpc.reflection {
+                    match tokio::time::timeout(
+                        request.timeout,
+                        self.pool_from_reflection(channel.clone(), &endpoint, &grpc.service),
+                    )
+                    .await
+                    {
+                        Ok(Ok(pool)) => pool,
+                        Ok(Err(message)) => {
+                            return Ok(grpc_error_response(message, start, &request.url));
+                        }
+                        Err(_) => return Ok(crate::http::timeout_response(request, start)),
+                    }
+                } else if !grpc.proto_files.is_empty() {
+                    self.pool_from_protos(grpc)?
+                } else {
+                    return Err(ProtocolError::InvalidRequest(
+                        "grpc request needs `proto_files` or `reflection: true`".to_string(),
+                    ));
+                };
 
-        // Build input messages from JSON.
-        let input_desc = method.input();
-        let raw_messages: Vec<&serde_json::Value> = if !grpc.messages.is_empty() {
-            grpc.messages.iter().collect()
-        } else {
-            grpc.message.iter().collect()
-        };
-        let mut messages = Vec::with_capacity(raw_messages.len().max(1));
-        if raw_messages.is_empty() {
-            messages.push(DynamicMessage::new(input_desc.clone()));
-        } else {
-            for json in raw_messages {
-                let message = DynamicMessage::deserialize(input_desc.clone(), json.clone())
-                    .map_err(|e| {
+                let service = pool.get_service_by_name(&grpc.service).ok_or_else(|| {
+                    ProtocolError::InvalidRequest(format!("service `{}` not found", grpc.service))
+                })?;
+                let method = service
+                    .methods()
+                    .find(|m| m.name() == grpc.method)
+                    .ok_or_else(|| {
                         ProtocolError::InvalidRequest(format!(
-                            "message does not match `{}`: {e}",
-                            input_desc.full_name()
+                            "method `{}` not found on `{}`",
+                            grpc.method, grpc.service
                         ))
                     })?;
-                messages.push(message);
+                let path = http::uri::PathAndQuery::try_from(format!(
+                    "/{}/{}",
+                    service.full_name(),
+                    method.name()
+                ))
+                .map_err(|e| ProtocolError::InvalidRequest(format!("invalid grpc path: {e}")))?;
+
+                let cached = CachedCall {
+                    endpoint: endpoint.clone(),
+                    service: grpc.service.clone(),
+                    method_name: grpc.method.clone(),
+                    reflection: grpc.reflection,
+                    proto_files: grpc.proto_files.clone(),
+                    proto_includes: grpc.proto_includes.clone(),
+                    input_desc: method.input(),
+                    path,
+                    codec: DynamicCodec::for_method(&method),
+                    shape: (method.is_client_streaming(), method.is_server_streaming()),
+                    client: tonic::client::Grpc::new(channel),
+                    encoded: HashMap::new(),
+                };
+                let state = ctx.extensions.get_or_insert_with(GrpcChannels::default);
+                state.calls.push(cached);
+                state.calls.len() - 1
             }
-        }
-        let bytes_sent: u64 = messages.iter().map(|m| m.encoded_len() as u64 + 5).sum();
+        };
+        let state = ctx.extensions.get_or_insert_with(GrpcChannels::default);
+        let cached = &mut state.calls[call_idx];
 
-        let path = http::uri::PathAndQuery::try_from(format!(
-            "/{}/{}",
-            service.full_name(),
-            method.name()
-        ))
-        .map_err(|e| ProtocolError::InvalidRequest(format!("invalid grpc path: {e}")))?;
-        let codec = DynamicCodec::for_method(&method);
+        // Build outbound messages: pre-encoded bytes for literal messages
+        // (cached by the message Arc's identity), dynamic otherwise.
+        let raw: Vec<&serde_json::Value> = if !grpc.messages.is_empty() {
+            grpc.messages.iter().collect()
+        } else {
+            grpc.message.iter().map(|m| m.as_ref()).collect()
+        };
+        let literal_key = if grpc.message_literal {
+            if !grpc.messages.is_empty() {
+                Some(Arc::as_ptr(&grpc.messages) as usize)
+            } else {
+                grpc.message.as_ref().map(|m| Arc::as_ptr(m) as usize)
+            }
+        } else {
+            None
+        };
+        let (outbound, bytes_sent) = match literal_key {
+            Some(key) => {
+                if !cached.encoded.contains_key(&key) {
+                    let mut frames = Vec::with_capacity(raw.len());
+                    let mut total: u64 = 0;
+                    for json in raw {
+                        let message =
+                            DynamicMessage::deserialize(cached.input_desc.clone(), json.clone())
+                                .map_err(|e| {
+                                    ProtocolError::InvalidRequest(format!(
+                                        "message does not match `{}`: {e}",
+                                        cached.input_desc.full_name()
+                                    ))
+                                })?;
+                        let bytes = Bytes::from(message.encode_to_vec());
+                        total += bytes.len() as u64 + 5;
+                        frames.push(bytes);
+                    }
+                    cached.encoded.insert(
+                        key,
+                        EncodedMessages {
+                            frames,
+                            bytes_sent: total,
+                        },
+                    );
+                }
+                let enc = &cached.encoded[&key];
+                let outbound: Vec<Outbound> = enc
+                    .frames
+                    .iter()
+                    .map(|b| Outbound::Encoded(b.clone()))
+                    .collect();
+                (outbound, enc.bytes_sent)
+            }
+            None => {
+                let mut messages = Vec::with_capacity(raw.len().max(1));
+                if raw.is_empty() {
+                    messages.push(DynamicMessage::new(cached.input_desc.clone()));
+                } else {
+                    for json in raw {
+                        let message =
+                            DynamicMessage::deserialize(cached.input_desc.clone(), json.clone())
+                                .map_err(|e| {
+                                    ProtocolError::InvalidRequest(format!(
+                                        "message does not match `{}`: {e}",
+                                        cached.input_desc.full_name()
+                                    ))
+                                })?;
+                        messages.push(message);
+                    }
+                }
+                let bytes_sent: u64 = messages.iter().map(|m| m.encoded_len() as u64 + 5).sum();
+                let outbound: Vec<Outbound> = messages.into_iter().map(Outbound::Dynamic).collect();
+                (outbound, bytes_sent)
+            }
+        };
+
         let metadata = build_metadata(grpc, &request.headers)?;
-
-        let mut client = tonic::client::Grpc::new(channel);
-        let shape = (method.is_client_streaming(), method.is_server_streaming());
-        let call = invoke(&mut client, shape, messages, path, codec, metadata);
+        let shape = cached.shape;
+        let path = cached.path.clone();
+        let codec = cached.codec.clone();
+        let call = invoke(&mut cached.client, shape, outbound, path, codec, metadata);
         let outcome = match tokio::time::timeout(request.timeout, call).await {
             Ok(outcome) => outcome,
             Err(_) => return Ok(crate::http::timeout_response(request, start)),
@@ -509,7 +646,7 @@ fn build_metadata(
 async fn invoke(
     client: &mut tonic::client::Grpc<Channel>,
     shape: (bool, bool),
-    messages: Vec<DynamicMessage>,
+    messages: Vec<Outbound>,
     path: http::uri::PathAndQuery,
     codec: DynamicCodec,
     metadata: tonic::metadata::MetadataMap,

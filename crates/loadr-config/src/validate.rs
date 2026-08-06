@@ -32,6 +32,7 @@ pub const BUILTIN_METRICS: &[&str] = &[
     "dropped_iterations",
     "vus",
     "vus_max",
+    "requests_in_flight",
     "checks",
     "faults_injected",
     "data_sent",
@@ -1086,6 +1087,26 @@ scenarios:
       - request: { url: https://example.com/ }
 thresholds:
   faults_injected: "count<100"
+"#;
+        let diags = validate(&plan_of(yaml), Some(yaml), &ValidateOptions::default());
+        assert!(
+            diags.iter().all(|d| !d.path.starts_with("thresholds")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn requests_in_flight_is_a_known_threshold_metric() {
+        let yaml = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request: { url: https://example.com/ }
+thresholds:
+  requests_in_flight: "value<10"
 "#;
         let diags = validate(&plan_of(yaml), Some(yaml), &ValidateOptions::default());
         assert!(

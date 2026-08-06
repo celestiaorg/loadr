@@ -413,7 +413,7 @@ async fn grpc_unary_via_proto_files() {
             proto_files: vec![proto_path],
             service: "loadr.test.Echo".to_string(),
             method: "UnaryEcho".to_string(),
-            message: Some(serde_json::json!({"message": "hi grpc"})),
+            message: Some(Arc::new(serde_json::json!({"message": "hi grpc"}))),
             ..Default::default()
         },
     );
@@ -425,6 +425,75 @@ async fn grpc_unary_via_proto_files() {
     assert_eq!(json["message"], "hi grpc");
     assert_eq!(response.extras["message_count"], 1);
     assert!(response.timings.duration_ms > 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_unary_literal_message_cache() {
+    let server = GrpcEchoServer::spawn().await.expect("grpc server");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proto_path = dir.path().join("echo.proto");
+    std::fs::write(&proto_path, ECHO_PROTO).expect("write proto");
+
+    let handler = GrpcHandler::new(&HttpDefaults::default(), Path::new(".")).expect("handler");
+    let mut vu = vu();
+
+    let request = grpc_request(
+        &format!("grpc://{}", server.addr),
+        GrpcRequest {
+            proto_files: vec![proto_path],
+            service: "loadr.test.Echo".to_string(),
+            method: "UnaryEcho".to_string(),
+            message: Some(Arc::new(serde_json::json!({"message": "cached"}))),
+            message_literal: true,
+            ..Default::default()
+        },
+    );
+
+    // The first call resolves and encodes; later calls reuse both per-VU
+    // caches while preserving the response.
+    for _ in 0..3 {
+        let response = handler.execute(&mut vu, &request).await.expect("response");
+        assert_eq!(response.status, 0, "status_text: {}", response.status_text);
+        assert!(!response.failed());
+        let json: serde_json::Value = serde_json::from_slice(&response.body).expect("json body");
+        assert_eq!(json["message"], "cached");
+    }
+}
+
+/// The per-VU call cache keys on proto_includes too: the same VU executing
+/// the same service/method with a different include set must not reuse the
+/// previous entry (same files can resolve differently under other roots).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_call_cache_discriminates_proto_includes() {
+    let server = GrpcEchoServer::spawn().await.expect("grpc server");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proto_path = dir.path().join("echo.proto");
+    std::fs::write(&proto_path, ECHO_PROTO).expect("write proto");
+
+    let handler = GrpcHandler::new(&HttpDefaults::default(), Path::new(".")).expect("handler");
+    let mut vu = vu();
+
+    let base = GrpcRequest {
+        proto_files: vec![proto_path],
+        service: "loadr.test.Echo".to_string(),
+        method: "UnaryEcho".to_string(),
+        message: Some(Arc::new(serde_json::json!({"message": "includes"}))),
+        ..Default::default()
+    };
+    let without_includes = grpc_request(&format!("grpc://{}", server.addr), base.clone());
+    let with_includes = grpc_request(
+        &format!("grpc://{}", server.addr),
+        GrpcRequest {
+            proto_includes: vec![dir.path().to_path_buf()],
+            ..base
+        },
+    );
+    for request in [&without_includes, &with_includes, &without_includes] {
+        let response = handler.execute(&mut vu, request).await.expect("response");
+        assert_eq!(response.status, 0, "status_text: {}", response.status_text);
+        let json: serde_json::Value = serde_json::from_slice(&response.body).expect("json body");
+        assert_eq!(json["message"], "includes");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -443,7 +512,9 @@ async fn grpc_server_streaming_collects_all_messages() {
             proto_files: vec![proto_path],
             service: "loadr.test.Echo".to_string(),
             method: "ServerStreamEcho".to_string(),
-            message: Some(serde_json::json!({"message": "stream", "repeat": 3})),
+            message: Some(Arc::new(
+                serde_json::json!({"message": "stream", "repeat": 3}),
+            )),
             ..Default::default()
         },
     );
@@ -468,7 +539,7 @@ async fn grpc_unary_via_reflection() {
             reflection: true,
             service: "loadr.test.Echo".to_string(),
             method: "UnaryEcho".to_string(),
-            message: Some(serde_json::json!({"message": "reflected"})),
+            message: Some(Arc::new(serde_json::json!({"message": "reflected"}))),
             ..Default::default()
         },
     );

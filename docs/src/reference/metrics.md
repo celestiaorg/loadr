@@ -12,6 +12,7 @@ Kinds: **Counter** (sum), **Gauge** (last/min/max), **Rate** (pass fraction),
 | `dropped_iterations` | Counter | arrival-rate starts skipped (no free VU at `max_vus`) |
 | `vus` | Gauge | active virtual users |
 | `vus_max` | Gauge | peak VUs |
+| `requests_in_flight` | Gauge | active protocol requests |
 | `checks` | Rate | check pass rate (tag `check` = name) |
 | `vu_exceptions` | Counter | uncaught JS exceptions in hooks/`exec`/`js` steps (tags `exception` = normalised message, `site`) |
 | `data_sent` / `data_received` | Counter | bytes on the wire |
