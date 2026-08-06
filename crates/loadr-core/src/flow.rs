@@ -12,11 +12,11 @@ use loadr_config::{
 use crate::conditions::{CompiledCondition, ConditionResult};
 use crate::error::EngineError;
 use crate::extract::{CompiledExtractor, ExtractError};
-use crate::metrics::{BuiltinMetrics, MetricKind, Tags};
+use crate::metrics::{BuiltinMetrics, MetricKind, MetricRegistry, MetricsBus, Tags};
 use crate::pacing::sample_think_time;
 use crate::protocol::{
-    GrpcRequest, PreparedRequest, ProtocolRegistry, ProtocolResponse, RequestOptions,
-    SocketRequest, WsFrame, WsRequest,
+    GrpcProtobufFieldCheck, GrpcRequest, PreparedRequest, ProtocolRegistry, ProtocolResponse,
+    RequestOptions, SocketRequest, Timings, WsFrame, WsRequest,
 };
 use crate::script::{HostHttpRequest, HostHttpResponse, ScriptHost, ScriptLogLevel, VuScript};
 use crate::vu::{json_to_string, VuContext};
@@ -169,6 +169,259 @@ pub struct CompiledChoice {
     pub steps: Vec<CompiledStep>,
 }
 
+enum CompiledJson {
+    Literal(serde_json::Value),
+    String(Template),
+    Splice(Template),
+    Array(Vec<CompiledJson>),
+    Object(Vec<(String, CompiledJson)>),
+}
+
+impl CompiledJson {
+    fn compile(value: &serde_json::Value, what: &str) -> Result<Self, EngineError> {
+        let compiled = match value {
+            serde_json::Value::String(source) => {
+                let template = parse_template(source, what)?;
+                if template.is_literal() {
+                    Self::Literal(value.clone())
+                } else if template.parts.len() == 1 {
+                    Self::Splice(template)
+                } else {
+                    Self::String(template)
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|item| Self::compile(item, what))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if items.iter().all(Self::is_literal) {
+                    Self::Literal(value.clone())
+                } else {
+                    Self::Array(items)
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let fields = map
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), Self::compile(value, what)?)))
+                    .collect::<Result<Vec<_>, EngineError>>()?;
+                if fields.iter().all(|(_, value)| value.is_literal()) {
+                    Self::Literal(value.clone())
+                } else {
+                    Self::Object(fields)
+                }
+            }
+            _ => Self::Literal(value.clone()),
+        };
+        Ok(compiled)
+    }
+
+    fn is_literal(&self) -> bool {
+        matches!(self, Self::Literal(_))
+    }
+
+    fn render<F, E>(&self, render_template: &mut F) -> Result<serde_json::Value, E>
+    where
+        F: FnMut(&Template) -> Result<String, E>,
+    {
+        Ok(match self {
+            Self::Literal(value) => value.clone(),
+            Self::String(template) => serde_json::Value::String(render_template(template)?),
+            Self::Splice(template) => {
+                let rendered = render_template(template)?;
+                serde_json::from_str(&rendered).unwrap_or(serde_json::Value::String(rendered))
+            }
+            Self::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| item.render(render_template))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Object(fields) => {
+                let mut map = serde_json::Map::with_capacity(fields.len());
+                for (key, value) in fields {
+                    map.insert(key.clone(), value.render(render_template)?);
+                }
+                serde_json::Value::Object(map)
+            }
+        })
+    }
+}
+
+enum CompiledGrpcValue {
+    Literal(Arc<serde_json::Value>),
+    Dynamic(CompiledJson),
+}
+
+impl CompiledGrpcValue {
+    fn compile(value: &serde_json::Value, what: &str) -> Result<Self, EngineError> {
+        match CompiledJson::compile(value, what)? {
+            CompiledJson::Literal(value) => Ok(Self::Literal(Arc::new(value))),
+            dynamic => Ok(Self::Dynamic(dynamic)),
+        }
+    }
+
+    fn is_literal(&self) -> bool {
+        matches!(self, Self::Literal(_))
+    }
+
+    fn render<F, E>(&self, render_template: &mut F) -> Result<Arc<serde_json::Value>, E>
+    where
+        F: FnMut(&Template) -> Result<String, E>,
+    {
+        match self {
+            Self::Literal(value) => Ok(value.clone()),
+            Self::Dynamic(value) => value.render(render_template).map(Arc::new),
+        }
+    }
+}
+
+enum CompiledGrpcValues {
+    Literal(Arc<Vec<serde_json::Value>>),
+    Dynamic(Vec<CompiledJson>),
+}
+
+impl CompiledGrpcValues {
+    fn compile(values: &[serde_json::Value], what: &str) -> Result<Self, EngineError> {
+        let compiled = values
+            .iter()
+            .map(|value| CompiledJson::compile(value, what))
+            .collect::<Result<Vec<_>, _>>()?;
+        if compiled.iter().all(CompiledJson::is_literal) {
+            Ok(Self::Literal(Arc::new(values.to_vec())))
+        } else {
+            Ok(Self::Dynamic(compiled))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Literal(values) => values.is_empty(),
+            Self::Dynamic(values) => values.is_empty(),
+        }
+    }
+
+    fn is_literal(&self) -> bool {
+        matches!(self, Self::Literal(_))
+    }
+
+    fn render<F, E>(&self, render_template: &mut F) -> Result<Arc<Vec<serde_json::Value>>, E>
+    where
+        F: FnMut(&Template) -> Result<String, E>,
+    {
+        match self {
+            Self::Literal(values) => Ok(values.clone()),
+            Self::Dynamic(values) => values
+                .iter()
+                .map(|value| value.render(render_template))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Arc::new),
+        }
+    }
+}
+
+struct CompiledGrpc {
+    proto_files: Arc<[std::path::PathBuf]>,
+    proto_includes: Arc<[std::path::PathBuf]>,
+    reflection: bool,
+    service: Arc<str>,
+    method: Arc<str>,
+    message: Option<CompiledGrpcValue>,
+    messages: CompiledGrpcValues,
+    metadata: Vec<(String, Template)>,
+    channel_pool_size: Option<usize>,
+    transport: loadr_config::GrpcTransport,
+}
+
+impl CompiledGrpc {
+    fn compile(
+        grpc: &loadr_config::GrpcOptions,
+        base_dir: &std::path::Path,
+    ) -> Result<Self, EngineError> {
+        let resolve = |path: &std::path::PathBuf| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                base_dir.join(path)
+            }
+        };
+        Ok(Self {
+            proto_files: grpc
+                .proto_files
+                .iter()
+                .map(&resolve)
+                .collect::<Vec<_>>()
+                .into(),
+            proto_includes: grpc
+                .proto_includes
+                .iter()
+                .map(&resolve)
+                .collect::<Vec<_>>()
+                .into(),
+            reflection: grpc.reflection,
+            service: grpc.service.clone().into(),
+            method: grpc.method.clone().into(),
+            message: grpc
+                .message
+                .as_ref()
+                .map(|message| CompiledGrpcValue::compile(message, "grpc message"))
+                .transpose()?,
+            messages: CompiledGrpcValues::compile(&grpc.messages, "grpc message")?,
+            metadata: grpc
+                .metadata
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        parse_template(value, &format!("grpc metadata `{key}`"))?,
+                    ))
+                })
+                .collect::<Result<_, EngineError>>()?,
+            channel_pool_size: grpc.channel_pool_size,
+            transport: grpc.transport,
+        })
+    }
+
+    fn render<F, E>(&self, render_template: &mut F) -> Result<GrpcRequest, E>
+    where
+        F: FnMut(&Template) -> Result<String, E>,
+    {
+        let message = self
+            .message
+            .as_ref()
+            .map(|message| message.render(render_template))
+            .transpose()?;
+        let messages = self.messages.render(render_template)?;
+        let message_literal = if self.messages.is_empty() {
+            self.message
+                .as_ref()
+                .is_some_and(CompiledGrpcValue::is_literal)
+        } else {
+            self.messages.is_literal()
+        };
+        let metadata = self
+            .metadata
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), render_template(value)?)))
+            .collect::<Result<_, E>>()?;
+        Ok(GrpcRequest {
+            proto_files: self.proto_files.clone(),
+            proto_includes: self.proto_includes.clone(),
+            reflection: self.reflection,
+            service: self.service.clone(),
+            method: self.method.clone(),
+            message,
+            messages,
+            message_literal,
+            metadata,
+            channel_pool_size: self.channel_pool_size,
+            transport: self.transport,
+            ..Default::default()
+        })
+    }
+}
+
 pub struct CompiledRequest {
     /// Metric `name` tag (template); falls back to the raw URL string.
     pub name: Option<Template>,
@@ -185,8 +438,18 @@ pub struct CompiledRequest {
     pub extract: Vec<CompiledExtractor>,
     pub assert: Vec<CompiledCondition>,
     pub checks: Vec<CompiledCondition>,
+    /// Descriptor-aware protobuf checks, bound to the condition result slots
+    /// above. Empty for every pre-existing plan.
+    pub grpc_protobuf_checks: Option<Arc<Vec<GrpcProtobufFieldCheck>>>,
+    /// Compile-time half of the gRPC lazy-decode gate: true when `extract`,
+    /// or any `assert`/`checks` condition, needs the response body. Protobuf
+    /// field checks deliberately do not count — they read the decoded message,
+    /// not the JSON body. `prepare` ANDs in the remaining gate inputs
+    /// (`grpc_protobuf_checks` and a script `afterRequest` hook) before
+    /// setting `GrpcRequest.discard_response_body`.
+    pub reads_response_body: bool,
     pub ws: Option<loadr_config::WsOptions>,
-    pub grpc: Option<loadr_config::GrpcOptions>,
+    grpc: Option<CompiledGrpc>,
     pub graphql: Option<loadr_config::GraphqlOptions>,
     pub socket: Option<loadr_config::SocketOptions>,
     pub sse: Option<loadr_config::SseOptions>,
@@ -431,19 +694,42 @@ fn compile_request(
         })
         .to_ascii_uppercase();
 
-    // Resolve gRPC proto file paths against the test definition directory.
-    let grpc = req.grpc.clone().map(|mut g| {
-        let resolve = |p: &std::path::PathBuf| {
-            if p.is_absolute() {
-                p.clone()
-            } else {
-                base_dir.join(p)
-            }
-        };
-        g.proto_files = g.proto_files.iter().map(&resolve).collect();
-        g.proto_includes = g.proto_includes.iter().map(&resolve).collect();
-        g
-    });
+    let grpc = req
+        .grpc
+        .as_ref()
+        .map(|grpc| CompiledGrpc::compile(grpc, base_dir))
+        .transpose()?;
+
+    let extract: Vec<CompiledExtractor> = req
+        .extract
+        .iter()
+        .map(|e| CompiledExtractor::compile(e).map_err(|e| EngineError::Config(e.to_string())))
+        .collect::<Result<_, _>>()?;
+    let mut assert: Vec<CompiledCondition> = req
+        .assert
+        .iter()
+        .map(|c| CompiledCondition::compile(c).map_err(EngineError::Config))
+        .collect::<Result<_, _>>()?;
+    let mut checks: Vec<CompiledCondition> = req
+        .checks
+        .iter()
+        .map(|c| CompiledCondition::compile(c).map_err(EngineError::Config))
+        .collect::<Result<_, _>>()?;
+    let mut grpc_protobuf_checks = Vec::new();
+    for condition in assert.iter_mut().chain(checks.iter_mut()) {
+        if let Some(check) = condition.bind_protobuf_check(grpc_protobuf_checks.len() as u32) {
+            grpc_protobuf_checks.push(check);
+        }
+    }
+    let grpc_protobuf_checks =
+        (!grpc_protobuf_checks.is_empty()).then(|| Arc::new(grpc_protobuf_checks));
+    // Compile-time half of the gRPC lazy-decode gate (see
+    // `CompiledRequest::reads_response_body`); `Kind::Js` always counts as
+    // reading the body since we can't know in advance what the expression
+    // touches.
+    let reads_response_body = !extract.is_empty()
+        || assert.iter().any(CompiledCondition::reads_body)
+        || checks.iter().any(CompiledCondition::reads_body);
 
     Ok(CompiledRequest {
         name: req
@@ -473,21 +759,11 @@ fn compile_request(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        extract: req
-            .extract
-            .iter()
-            .map(|e| CompiledExtractor::compile(e).map_err(|e| EngineError::Config(e.to_string())))
-            .collect::<Result<_, _>>()?,
-        assert: req
-            .assert
-            .iter()
-            .map(|c| CompiledCondition::compile(c).map_err(EngineError::Config))
-            .collect::<Result<_, _>>()?,
-        checks: req
-            .checks
-            .iter()
-            .map(|c| CompiledCondition::compile(c).map_err(EngineError::Config))
-            .collect::<Result<_, _>>()?,
+        extract,
+        assert,
+        checks,
+        grpc_protobuf_checks,
+        reads_response_body,
         ws: req.ws.clone(),
         grpc,
         graphql: req.graphql.clone(),
@@ -925,6 +1201,7 @@ impl FlowRunner {
         child.rng = rand::SeedableRng::seed_from_u64(
             parent.vu_id ^ parent.iteration.wrapping_mul(0x9E37) ^ branch.wrapping_mul(0xC2B2),
         );
+        child.data_state = parent.data_state.fork_for_parallel();
         child
     }
 
@@ -1007,8 +1284,15 @@ impl FlowRunner {
             }
         }
 
-        // 1. Render the request.
-        let mut prepared = match self.prepare(req, vu, script) {
+        // 1. Render the request. Plugin-backed rows are per-request: mark the
+        // request being prepared so `begin_request` evicts stale on-demand
+        // rows, then clear it on every outcome so a later step (e.g. a JS
+        // step reached via `RequestFlow::Continue`) never observes a stale
+        // request name.
+        vu.begin_request(&req.display_name);
+        let prepared_result = self.prepare(req, vu, script);
+        vu.current_request = None;
+        let mut prepared = match prepared_result {
             Ok(p) => p,
             Err(PrepareError::DataExhausted) => return RequestFlow::StopVu,
             Err(PrepareError::Other(e)) => {
@@ -1066,6 +1350,8 @@ impl FlowRunner {
         let drop_before_send =
             drop_fault && faults.drop_mode.unwrap_or_default() == DropMode::BeforeSend;
 
+        let emitter = RequestMetricEmitter::from_vu(vu, self.builtins.clone());
+        let mut metrics_guard = RequestMetricsGuard::new(emitter, &prepared);
         let response = if drop_before_send {
             // Fail as a transport-class error without sending; mirrors the
             // handler-error shape below so it lands in `http_req_failed` and
@@ -1095,7 +1381,7 @@ impl FlowRunner {
         };
 
         // 4. Metrics.
-        self.emit_request_metrics(vu, &prepared, &response);
+        metrics_guard.record_completed(&response);
 
         // 5. Extraction (classic extractors and fused chains).
         let mut chain_flow = RequestFlow::Continue;
@@ -1195,7 +1481,21 @@ impl FlowRunner {
         }
         for condition in &req.checks {
             let result = self.eval_condition(condition, &response, vu, script);
-            let tags = vu.sample_tags(&[("check", &result.name)]);
+            // Grouped failures are the rare branch; the common all-pass path
+            // must stay a stack slice with no per-check allocation.
+            let tags = match &result.failure_group {
+                None => vu.sample_tags(&[("check", &result.name)]),
+                Some(group) => match group.code.map(|code| code.to_string()) {
+                    None => {
+                        vu.sample_tags(&[("check", &result.name), ("failure_group", &group.label)])
+                    }
+                    Some(code) => vu.sample_tags(&[
+                        ("check", &result.name),
+                        ("failure_group", &group.label),
+                        ("failure_code", &code),
+                    ]),
+                },
+            };
             vu.metrics.rate(&self.builtins.checks, result.pass, &tags);
         }
         // Record whether this request failed, so `retry` can react to it.
@@ -1240,166 +1540,6 @@ impl FlowRunner {
             }
         }
         result
-    }
-
-    /// Emit the standard metric families for a completed request.
-    fn emit_request_metrics(
-        &self,
-        vu: &mut VuContext,
-        request: &PreparedRequest,
-        response: &ProtocolResponse,
-    ) {
-        let b = &self.builtins;
-        let status = response.status.to_string();
-        // Transport errors get a coarse `error_kind` tag so the UI can group
-        // failures by cause (timeout / connection / dns / tls / ...).
-        let error_kind = response
-            .error
-            .as_deref()
-            .map(classify_transport_error)
-            .unwrap_or("");
-        let mut tag_pairs: Vec<(&str, &str)> = vec![
-            ("name", &request.name),
-            ("method", &request.method),
-            ("status", &status),
-            ("proto", &request.protocol),
-        ];
-        if !error_kind.is_empty() {
-            tag_pairs.push(("error_kind", error_kind));
-        }
-        let tags = vu.sample_tags(&tag_pairs);
-        let m = &vu.metrics;
-        let t = &response.timings;
-
-        m.counter(&b.data_sent, response.bytes_sent as f64, &tags);
-        m.counter(&b.data_received, response.bytes_received as f64, &tags);
-
-        match request.protocol.as_str() {
-            "http" | "graphql" => {
-                m.counter(&b.http_reqs, 1.0, &tags);
-                m.trend(&b.http_req_duration, t.duration_ms, &tags);
-                m.trend(&b.http_req_blocked, t.blocked_ms, &tags);
-                m.trend(&b.http_req_connecting, t.connect_ms, &tags);
-                m.trend(&b.http_req_tls_handshaking, t.tls_ms, &tags);
-                m.trend(&b.http_req_sending, t.sending_ms, &tags);
-                m.trend(&b.http_req_waiting, t.waiting_ms, &tags);
-                m.trend(&b.http_req_receiving, t.receiving_ms, &tags);
-                m.rate(&b.http_req_failed, response.failed(), &tags);
-                if request.protocol == "graphql" {
-                    self.emit_named(vu, "graphql_reqs", MetricKind::Counter, 1.0, &tags);
-                    self.emit_named(
-                        vu,
-                        "graphql_req_duration",
-                        MetricKind::Trend,
-                        t.duration_ms,
-                        &tags,
-                    );
-                }
-            }
-            "ws" => {
-                self.emit_named(vu, "ws_connecting", MetricKind::Trend, t.blocked_ms, &tags);
-                self.emit_named(
-                    vu,
-                    "ws_session_duration",
-                    MetricKind::Trend,
-                    t.duration_ms,
-                    &tags,
-                );
-                let sent = response
-                    .extras
-                    .get("msgs_sent")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let received = response
-                    .extras
-                    .get("msgs_received")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                self.emit_named(vu, "ws_msgs_sent", MetricKind::Counter, sent, &tags);
-                self.emit_named(vu, "ws_msgs_received", MetricKind::Counter, received, &tags);
-                m.rate(&b.http_req_failed, response.error.is_some(), &tags);
-            }
-            other => {
-                // grpc/tcp/udp built-ins keep their own family name. The
-                // `sse`/`browser` built-ins historically share the generic
-                // `plugin` family — preserve that so existing dashboards and
-                // thresholds keep working. Everything else is a loaded protocol
-                // *plugin*, which gets a family derived from its own protocol
-                // name (so the `mongo` plugin emits `mongo_reqs` /
-                // `mongo_req_duration` / `mongo_docs`, the `postgres` / `mysql`
-                // plugins emit `postgres_reqs` / `mysql_reqs`, and the `redis`
-                // plugin emits `redis_reqs` / `redis_req_duration`).
-                let family = match other {
-                    "grpc" | "tcp" | "udp" => other.to_string(),
-                    "sse" | "browser" => "plugin".to_string(),
-                    name => metric_family(name),
-                };
-                self.emit_named(
-                    vu,
-                    &format!("{family}_reqs"),
-                    MetricKind::Counter,
-                    1.0,
-                    &tags,
-                );
-                self.emit_named(
-                    vu,
-                    &format!("{family}_req_duration"),
-                    MetricKind::Trend,
-                    t.duration_ms,
-                    &tags,
-                );
-                // Plugin protocols may report a count of affected/returned
-                // records: `extras.docs` (e.g. Mongo documents) is surfaced as
-                // `<family>_docs`, `extras.rows` (e.g. SQL rows returned or
-                // affected) as `<family>_rows`, and `extras.msgs` (e.g. Kafka
-                // messages produced or fetched) as `<family>_msgs`.
-                if let Some(docs) = response.extras.get("docs").and_then(|v| v.as_f64()) {
-                    self.emit_named(
-                        vu,
-                        &format!("{family}_docs"),
-                        MetricKind::Counter,
-                        docs,
-                        &tags,
-                    );
-                }
-                if let Some(rows) = response.extras.get("rows").and_then(|v| v.as_f64()) {
-                    self.emit_named(
-                        vu,
-                        &format!("{family}_rows"),
-                        MetricKind::Counter,
-                        rows,
-                        &tags,
-                    );
-                }
-                if let Some(msgs) = response.extras.get("msgs").and_then(|v| v.as_f64()) {
-                    self.emit_named(
-                        vu,
-                        &format!("{family}_msgs"),
-                        MetricKind::Counter,
-                        msgs,
-                        &tags,
-                    );
-                }
-                m.rate(&b.http_req_failed, response.failed(), &tags);
-            }
-        }
-    }
-
-    fn emit_named(
-        &self,
-        vu: &VuContext,
-        name: &str,
-        kind: MetricKind,
-        value: f64,
-        tags: &Arc<Tags>,
-    ) {
-        let metric = vu
-            .run
-            .registry
-            .get(name)
-            .map(|d| d.name)
-            .unwrap_or_else(|| Arc::from(name));
-        vu.metrics.emit_value(&metric, kind, value, tags);
     }
 
     /// Record an injected chaos fault on the `faults_injected` counter,
@@ -1606,28 +1746,24 @@ impl FlowRunner {
             });
         }
         if let Some(grpc) = &req.grpc {
-            options.grpc = Some(GrpcRequest {
-                proto_files: grpc.proto_files.clone(),
-                proto_includes: grpc.proto_includes.clone(),
-                reflection: grpc.reflection,
-                service: grpc.service.clone(),
-                method: grpc.method.clone(),
-                message: grpc
-                    .message
-                    .as_ref()
-                    .map(|m| render_json(self, m, vu, script))
-                    .transpose()?,
-                messages: grpc
-                    .messages
-                    .iter()
-                    .map(|m| render_json(self, m, vu, script))
-                    .collect::<Result<_, _>>()?,
-                metadata: grpc
-                    .metadata
-                    .iter()
-                    .map(|(k, v)| Ok((k.clone(), render_str(self, v, vu, script)?)))
-                    .collect::<Result<_, PrepareError>>()?,
-            });
+            let mut rendered =
+                grpc.render(&mut |template| render_template(self, template, vu, script))?;
+            let has_after_request = script
+                .as_ref()
+                .is_some_and(|s| s.has_function("afterRequest"));
+            let has_protobuf_checks = req.grpc_protobuf_checks.is_some();
+            let discard_response_body =
+                !req.reads_response_body && !has_protobuf_checks && !has_after_request;
+            // Skip decode when nothing in the plan reads the body and no
+            // `afterRequest` hook can see it either (`has_function` is an
+            // O(1) HashSet lookup — no extra caching machinery needed).
+            rendered.discard_response_body = discard_response_body;
+            // Checks are the only body reader: decode the message, skip the
+            // JSON conversion.
+            rendered.protobuf_only_response =
+                has_protobuf_checks && !req.reads_response_body && !has_after_request;
+            rendered.protobuf_checks = req.grpc_protobuf_checks.clone();
+            options.grpc = Some(rendered);
         }
         if let Some(socket) = &req.socket {
             let payload = if let Some(text) = &socket.send_text {
@@ -1736,6 +1872,231 @@ enum RequestFlow {
     AbortTest(String),
 }
 
+struct RequestMetricContext {
+    name: String,
+    method: String,
+    protocol: String,
+    url: String,
+}
+
+impl From<&PreparedRequest> for RequestMetricContext {
+    fn from(request: &PreparedRequest) -> Self {
+        RequestMetricContext {
+            name: request.name.clone(),
+            method: request.method.clone(),
+            protocol: request.protocol.clone(),
+            url: request.url.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestMetricEmitter {
+    metrics: MetricsBus,
+    registry: Arc<MetricRegistry>,
+    builtins: Arc<BuiltinMetrics>,
+    base_tags: Arc<Tags>,
+    groups: Vec<String>,
+}
+
+impl RequestMetricEmitter {
+    fn from_vu(vu: &VuContext, builtins: Arc<BuiltinMetrics>) -> Self {
+        RequestMetricEmitter {
+            metrics: vu.metrics.clone(),
+            registry: vu.run.registry.clone(),
+            builtins,
+            base_tags: vu.base_tags.clone(),
+            groups: vu.groups.clone(),
+        }
+    }
+
+    fn sample_tags(&self, extras: &[(&str, &str)]) -> Arc<Tags> {
+        if extras.is_empty() && self.groups.is_empty() {
+            return self.base_tags.clone();
+        }
+        let mut tags = (*self.base_tags).clone();
+        if !self.groups.is_empty() {
+            tags.insert("group".to_string(), format!("::{}", self.groups.join("::")));
+        }
+        for (k, v) in extras {
+            tags.insert((*k).to_string(), (*v).to_string());
+        }
+        Arc::new(tags)
+    }
+
+    /// Emit the standard metric families for a completed or cancelled request.
+    fn emit_request_metrics(&self, request: &RequestMetricContext, response: &ProtocolResponse) {
+        let b = &self.builtins;
+        let status = response.status.to_string();
+        // Transport errors get a coarse `error_kind` tag so the UI can group
+        // failures by cause (timeout / connection / dns / tls / ...).
+        let error_kind = response
+            .error
+            .as_deref()
+            .map(classify_transport_error)
+            .unwrap_or("");
+        let mut tag_pairs: Vec<(&str, &str)> = vec![
+            ("name", &request.name),
+            ("method", &request.method),
+            ("status", &status),
+            ("proto", &request.protocol),
+        ];
+        if !error_kind.is_empty() {
+            tag_pairs.push(("error_kind", error_kind));
+        }
+        let tags = self.sample_tags(&tag_pairs);
+        let m = &self.metrics;
+        let t = &response.timings;
+
+        m.counter(&b.data_sent, response.bytes_sent as f64, &tags);
+        m.counter(&b.data_received, response.bytes_received as f64, &tags);
+
+        match request.protocol.as_str() {
+            "http" | "graphql" => {
+                m.counter(&b.http_reqs, 1.0, &tags);
+                m.trend(&b.http_req_duration, t.duration_ms, &tags);
+                m.trend(&b.http_req_blocked, t.blocked_ms, &tags);
+                m.trend(&b.http_req_connecting, t.connect_ms, &tags);
+                m.trend(&b.http_req_tls_handshaking, t.tls_ms, &tags);
+                m.trend(&b.http_req_sending, t.sending_ms, &tags);
+                m.trend(&b.http_req_waiting, t.waiting_ms, &tags);
+                m.trend(&b.http_req_receiving, t.receiving_ms, &tags);
+                m.rate(&b.http_req_failed, response.failed(), &tags);
+                if request.protocol == "graphql" {
+                    self.emit_named("graphql_reqs", MetricKind::Counter, 1.0, &tags);
+                    self.emit_named(
+                        "graphql_req_duration",
+                        MetricKind::Trend,
+                        t.duration_ms,
+                        &tags,
+                    );
+                }
+            }
+            "ws" => {
+                self.emit_named("ws_connecting", MetricKind::Trend, t.blocked_ms, &tags);
+                self.emit_named(
+                    "ws_session_duration",
+                    MetricKind::Trend,
+                    t.duration_ms,
+                    &tags,
+                );
+                let sent = response
+                    .extras
+                    .get("msgs_sent")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let received = response
+                    .extras
+                    .get("msgs_received")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                self.emit_named("ws_msgs_sent", MetricKind::Counter, sent, &tags);
+                self.emit_named("ws_msgs_received", MetricKind::Counter, received, &tags);
+                m.rate(&b.http_req_failed, response.error.is_some(), &tags);
+            }
+            other => {
+                // grpc/tcp/udp built-ins keep their own family name. The
+                // `sse`/`browser` built-ins historically share the generic
+                // `plugin` family — preserve that so existing dashboards and
+                // thresholds keep working. Everything else is a loaded protocol
+                // *plugin*, which gets a family derived from its own protocol
+                // name (so the `mongo` plugin emits `mongo_reqs` /
+                // `mongo_req_duration` / `mongo_docs`, the `postgres` / `mysql`
+                // plugins emit `postgres_reqs` / `mysql_reqs`, and the `redis`
+                // plugin emits `redis_reqs` / `redis_req_duration`).
+                let family = match other {
+                    "grpc" | "tcp" | "udp" => other.to_string(),
+                    "sse" | "browser" => "plugin".to_string(),
+                    name => metric_family(name),
+                };
+                self.emit_named(&format!("{family}_reqs"), MetricKind::Counter, 1.0, &tags);
+                self.emit_named(
+                    &format!("{family}_req_duration"),
+                    MetricKind::Trend,
+                    t.duration_ms,
+                    &tags,
+                );
+                // Plugin protocols may report a count of affected/returned
+                // records: `extras.docs` (e.g. Mongo documents) is surfaced as
+                // `<family>_docs`, `extras.rows` (e.g. SQL rows returned or
+                // affected) as `<family>_rows`, and `extras.msgs` (e.g. Kafka
+                // messages produced or fetched) as `<family>_msgs`.
+                if let Some(docs) = response.extras.get("docs").and_then(|v| v.as_f64()) {
+                    self.emit_named(&format!("{family}_docs"), MetricKind::Counter, docs, &tags);
+                }
+                if let Some(rows) = response.extras.get("rows").and_then(|v| v.as_f64()) {
+                    self.emit_named(&format!("{family}_rows"), MetricKind::Counter, rows, &tags);
+                }
+                if let Some(msgs) = response.extras.get("msgs").and_then(|v| v.as_f64()) {
+                    self.emit_named(&format!("{family}_msgs"), MetricKind::Counter, msgs, &tags);
+                }
+                m.rate(&b.http_req_failed, response.failed(), &tags);
+            }
+        }
+    }
+
+    fn emit_named(&self, name: &str, kind: MetricKind, value: f64, tags: &Arc<Tags>) {
+        let metric = self
+            .registry
+            .get(name)
+            .map(|d| d.name)
+            .unwrap_or_else(|| Arc::from(name));
+        self.metrics.emit_value(&metric, kind, value, tags);
+    }
+}
+
+struct RequestMetricsGuard {
+    emitter: RequestMetricEmitter,
+    request: RequestMetricContext,
+    started: Instant,
+    active: bool,
+}
+
+impl RequestMetricsGuard {
+    fn new(emitter: RequestMetricEmitter, request: &PreparedRequest) -> Self {
+        emitter.metrics.begin_request();
+        RequestMetricsGuard {
+            emitter,
+            request: RequestMetricContext::from(request),
+            started: Instant::now(),
+            active: true,
+        }
+    }
+
+    fn record_completed(&mut self, response: &ProtocolResponse) {
+        if !self.active {
+            return;
+        }
+        self.emitter.emit_request_metrics(&self.request, response);
+        self.emitter.metrics.end_request();
+        self.active = false;
+    }
+
+    fn cancelled_response(&self) -> ProtocolResponse {
+        ProtocolResponse {
+            error: Some(REQUEST_CANCELLED_ERROR.to_string()),
+            url: self.request.url.clone(),
+            timings: Timings {
+                duration_ms: self.started.elapsed().as_secs_f64() * 1000.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
+
+impl Drop for RequestMetricsGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let response = self.cancelled_response();
+        self.emitter.emit_request_metrics(&self.request, &response);
+        self.emitter.metrics.end_request();
+        self.active = false;
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum PrepareError {
     #[error("data source exhausted")]
@@ -1798,6 +2159,8 @@ fn metric_family(protocol: &str) -> String {
 const FAULT_DROP_ERROR: &str = "fault injected: request dropped before send";
 /// Error message for a response discarded by `drop_mode: after_response`.
 const FAULT_DROP_RESPONSE_ERROR: &str = "fault injected: response dropped";
+/// Error message for a request future dropped by executor cancellation.
+const REQUEST_CANCELLED_ERROR: &str = "request cancelled";
 
 /// Sample the extra latency for a `faults.latency` spec from the VU's rng:
 /// `uniform(0..jitter)` or `gaussian(mean=0, std=jitter)` clamped at zero.
@@ -1828,6 +2191,8 @@ fn classify_transport_error(error: &str) -> &'static str {
     let e = error.to_ascii_lowercase();
     if e.contains("fault injected") {
         "fault_injected"
+    } else if e.contains("cancelled") || e.contains("canceled") {
+        "cancelled"
     } else if e.contains("timed out") || e.contains("timeout") {
         "timeout"
     } else if e.contains("dns") || e.contains("resolve") || e.contains("name or service") {
@@ -1910,21 +2275,6 @@ fn run_script(
     })
 }
 
-/// Replace a leading-`$` env reference in a payload magnitude with the env
-/// value, so `${payload:kind:$LOADR_SWEEP_DEPTH}` scales under `loadr sweep`.
-/// Only the magnitude (after the last `:`) is treated this way; the kind name
-/// is left untouched. Unknown env vars resolve to empty (a parse error follows,
-/// which is the honest signal that the sweep var wasn't exported).
-fn resolve_payload_env(spec: &str) -> String {
-    match spec.rsplit_once(':') {
-        Some((kind, mag)) if mag.starts_with('$') => {
-            let val = std::env::var(&mag[1..]).unwrap_or_default();
-            format!("{kind}:{val}")
-        }
-        _ => spec.to_string(),
-    }
-}
-
 fn render_template(
     runner: &FlowRunner,
     tpl: &Template,
@@ -1936,17 +2286,7 @@ fn render_template(
         match part {
             loadr_config::Part::Lit(l) => out.push_str(l),
             loadr_config::Part::Expr(expr) => {
-                if let Some(spec) = expr.strip_prefix("payload:") {
-                    // `${payload:<kind>:<magnitude>}` generates an adversarial
-                    // body at request time (never materialised into VU state).
-                    // A `$NAME` magnitude reads an environment variable, so
-                    // `loadr sweep --var depth=…` can scale the payload via the
-                    // exported `LOADR_SWEEP_DEPTH` (or any env var).
-                    let resolved = resolve_payload_env(spec);
-                    let bytes = loadr_payload::generate_str(&resolved)
-                        .map_err(|e| PrepareError::Other(e.to_string()))?;
-                    out.push_str(&String::from_utf8_lossy(&bytes));
-                } else if let Some(code) = expr.strip_prefix("js:") {
+                if let Some(code) = expr.strip_prefix("js:") {
                     let Some(vu_script) = script.as_mut() else {
                         return Err(PrepareError::Other(format!(
                             "`${{js: ...}}` needs a script engine: {expr}"
@@ -2315,6 +2655,607 @@ impl ScriptHost for HostBridge<'_> {
 }
 
 #[cfg(test)]
+mod request_metrics_tests {
+    use super::{
+        RequestMetricContext, RequestMetricEmitter, RequestMetricsGuard, REQUEST_CANCELLED_ERROR,
+    };
+    use crate::metrics::{BuiltinMetrics, MetricKind, MetricRegistry, MetricsBus, Sample, Tags};
+    use crate::protocol::{
+        GrpcRequest, PreparedRequest, ProtocolResponse, RequestOptions, Timings,
+    };
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    fn test_emitter() -> (MetricsBus, UnboundedReceiver<Sample>, RequestMetricEmitter) {
+        let registry = Arc::new(MetricRegistry::with_builtins());
+        let builtins = Arc::new(BuiltinMetrics::resolve(&registry));
+        let (metrics, receiver) = MetricsBus::new();
+        let mut base_tags = Tags::new();
+        base_tags.insert("suite".to_string(), "request_metrics".to_string());
+        let emitter = RequestMetricEmitter {
+            metrics: metrics.clone(),
+            registry,
+            builtins,
+            base_tags: Arc::new(base_tags),
+            groups: vec!["checkout".to_string(), "payment".to_string()],
+        };
+        (metrics, receiver, emitter)
+    }
+
+    fn prepared_request(protocol: &str) -> PreparedRequest {
+        PreparedRequest {
+            name: "checkout".to_string(),
+            protocol: protocol.to_string(),
+            method: "POST".to_string(),
+            url: "https://example.test/checkout".to_string(),
+            headers: vec![("authorization".to_string(), "secret".to_string())],
+            body: Bytes::from(vec![1, 2, 3, 4]),
+            timeout: Duration::from_secs(3),
+            follow_redirects: true,
+            max_redirects: 4,
+            options: RequestOptions {
+                grpc: Some(GrpcRequest {
+                    service: "checkout.Payment".into(),
+                    method: "Charge".into(),
+                    message: Some(serde_json::json!({"id": 1}).into()),
+                    messages: vec![serde_json::json!({"id": 2})].into(),
+                    metadata: vec![("trace-id".to_string(), "abc".to_string())],
+                    ..Default::default()
+                }),
+                plugin: Some(serde_json::json!({
+                    "nested": {"expensive": [1, 2, 3]}
+                })),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn drain(receiver: &mut UnboundedReceiver<Sample>) -> Vec<Sample> {
+        let mut samples = Vec::new();
+        while let Ok(sample) = receiver.try_recv() {
+            samples.push(sample);
+        }
+        samples
+    }
+
+    fn assert_metric_set(samples: &[Sample], expected: &[(&str, MetricKind, f64)]) {
+        assert_eq!(
+            samples.len(),
+            expected.len(),
+            "unexpected samples: {samples:#?}"
+        );
+        for (name, kind, value) in expected {
+            let matches: Vec<_> = samples
+                .iter()
+                .filter(|sample| sample.metric.as_ref() == *name)
+                .collect();
+            assert_eq!(matches.len(), 1, "expected one `{name}` sample");
+            assert_eq!(matches[0].kind, *kind, "kind for `{name}`");
+            assert_eq!(matches[0].value, *value, "value for `{name}`");
+        }
+    }
+
+    fn assert_tags(samples: &[Sample], protocol: &str, status: &str, error_kind: Option<&str>) {
+        for sample in samples {
+            let tags = &sample.tags;
+            assert_eq!(
+                tags.get("suite").map(String::as_str),
+                Some("request_metrics")
+            );
+            assert_eq!(
+                tags.get("group").map(String::as_str),
+                Some("::checkout::payment")
+            );
+            assert_eq!(tags.get("name").map(String::as_str), Some("checkout"));
+            assert_eq!(tags.get("method").map(String::as_str), Some("POST"));
+            assert_eq!(tags.get("status").map(String::as_str), Some(status));
+            assert_eq!(tags.get("proto").map(String::as_str), Some(protocol));
+            assert_eq!(tags.get("error_kind").map(String::as_str), error_kind);
+            assert_eq!(tags.len(), if error_kind.is_some() { 7 } else { 6 });
+        }
+    }
+
+    #[test]
+    fn completed_http_request_emits_exactly_once() {
+        let (metrics, mut receiver, emitter) = test_emitter();
+        let request = prepared_request("http");
+        let response = ProtocolResponse {
+            status: 502,
+            timings: Timings {
+                dns_ms: 1.0,
+                connect_ms: 2.0,
+                tls_ms: 3.0,
+                sending_ms: 4.0,
+                waiting_ms: 5.0,
+                receiving_ms: 6.0,
+                duration_ms: 15.0,
+                blocked_ms: 7.0,
+            },
+            bytes_sent: 8,
+            bytes_received: 9,
+            protocol_version: "HTTP/1.1".to_string(),
+            error: Some("connection reset by peer".to_string()),
+            url: request.url.clone(),
+            ..Default::default()
+        };
+
+        let mut guard = RequestMetricsGuard::new(emitter, &request);
+        assert_eq!(metrics.requests_in_flight(), 1);
+        guard.record_completed(&response);
+        guard.record_completed(&response);
+        assert_eq!(metrics.requests_in_flight(), 0);
+        drop(guard);
+
+        let samples = drain(&mut receiver);
+        assert_metric_set(
+            &samples,
+            &[
+                ("data_sent", MetricKind::Counter, 8.0),
+                ("data_received", MetricKind::Counter, 9.0),
+                ("http_reqs", MetricKind::Counter, 1.0),
+                ("http_req_duration", MetricKind::Trend, 15.0),
+                ("http_req_blocked", MetricKind::Trend, 7.0),
+                ("http_req_connecting", MetricKind::Trend, 2.0),
+                ("http_req_tls_handshaking", MetricKind::Trend, 3.0),
+                ("http_req_sending", MetricKind::Trend, 4.0),
+                ("http_req_waiting", MetricKind::Trend, 5.0),
+                ("http_req_receiving", MetricKind::Trend, 6.0),
+                ("http_req_failed", MetricKind::Rate, 1.0),
+            ],
+        );
+        assert_tags(&samples, "http", "502", Some("connection_reset"));
+    }
+
+    #[test]
+    fn graphql_request_preserves_http_and_graphql_families() {
+        let (metrics, mut receiver, emitter) = test_emitter();
+        let request = prepared_request("graphql");
+        let response = ProtocolResponse {
+            status: 200,
+            timings: Timings {
+                duration_ms: 12.0,
+                ..Default::default()
+            },
+            protocol_version: "HTTP/2".to_string(),
+            url: request.url.clone(),
+            ..Default::default()
+        };
+
+        let mut guard = RequestMetricsGuard::new(emitter, &request);
+        guard.record_completed(&response);
+        drop(guard);
+
+        let samples = drain(&mut receiver);
+        assert_eq!(metrics.requests_in_flight(), 0);
+        assert_eq!(samples.len(), 13);
+        assert_metric_set(
+            &samples,
+            &[
+                ("data_sent", MetricKind::Counter, 0.0),
+                ("data_received", MetricKind::Counter, 0.0),
+                ("http_reqs", MetricKind::Counter, 1.0),
+                ("http_req_duration", MetricKind::Trend, 12.0),
+                ("http_req_blocked", MetricKind::Trend, 0.0),
+                ("http_req_connecting", MetricKind::Trend, 0.0),
+                ("http_req_tls_handshaking", MetricKind::Trend, 0.0),
+                ("http_req_sending", MetricKind::Trend, 0.0),
+                ("http_req_waiting", MetricKind::Trend, 0.0),
+                ("http_req_receiving", MetricKind::Trend, 0.0),
+                ("http_req_failed", MetricKind::Rate, 0.0),
+                ("graphql_reqs", MetricKind::Counter, 1.0),
+                ("graphql_req_duration", MetricKind::Trend, 12.0),
+            ],
+        );
+        assert_tags(&samples, "graphql", "200", None);
+    }
+
+    #[test]
+    fn grpc_and_socket_requests_keep_builtin_families() {
+        for (protocol, version, family) in [
+            ("grpc", "grpc", "grpc"),
+            ("tcp", "tcp", "tcp"),
+            ("udp", "udp", "udp"),
+        ] {
+            let (metrics, mut receiver, emitter) = test_emitter();
+            let request = prepared_request(protocol);
+            let response = ProtocolResponse {
+                status: 0,
+                timings: Timings {
+                    duration_ms: 4.0,
+                    ..Default::default()
+                },
+                bytes_sent: 5,
+                bytes_received: 6,
+                protocol_version: version.to_string(),
+                url: request.url.clone(),
+                ..Default::default()
+            };
+
+            let mut guard = RequestMetricsGuard::new(emitter, &request);
+            guard.record_completed(&response);
+            drop(guard);
+
+            let samples = drain(&mut receiver);
+            assert_eq!(metrics.requests_in_flight(), 0);
+            assert_metric_set(
+                &samples,
+                &[
+                    ("data_sent", MetricKind::Counter, 5.0),
+                    ("data_received", MetricKind::Counter, 6.0),
+                    (&format!("{family}_reqs"), MetricKind::Counter, 1.0),
+                    (&format!("{family}_req_duration"), MetricKind::Trend, 4.0),
+                    ("http_req_failed", MetricKind::Rate, 0.0),
+                ],
+            );
+            assert_tags(&samples, protocol, "0", None);
+        }
+    }
+
+    #[test]
+    fn loaded_plugin_request_emits_family_and_extra_counters() {
+        let (metrics, mut receiver, emitter) = test_emitter();
+        let request = prepared_request("custom-db");
+        let response = ProtocolResponse {
+            status: 0,
+            timings: Timings {
+                duration_ms: 10.0,
+                ..Default::default()
+            },
+            bytes_sent: 11,
+            bytes_received: 12,
+            protocol_version: "custom-db".to_string(),
+            url: request.url.clone(),
+            extras: serde_json::json!({"docs": 13, "rows": 14, "msgs": 15}),
+            ..Default::default()
+        };
+
+        let mut guard = RequestMetricsGuard::new(emitter, &request);
+        guard.record_completed(&response);
+        drop(guard);
+
+        let samples = drain(&mut receiver);
+        assert_eq!(metrics.requests_in_flight(), 0);
+        assert_metric_set(
+            &samples,
+            &[
+                ("data_sent", MetricKind::Counter, 11.0),
+                ("data_received", MetricKind::Counter, 12.0),
+                ("custom_db_reqs", MetricKind::Counter, 1.0),
+                ("custom_db_req_duration", MetricKind::Trend, 10.0),
+                ("custom_db_docs", MetricKind::Counter, 13.0),
+                ("custom_db_rows", MetricKind::Counter, 14.0),
+                ("custom_db_msgs", MetricKind::Counter, 15.0),
+                ("http_req_failed", MetricKind::Rate, 0.0),
+            ],
+        );
+        assert_tags(&samples, "custom-db", "0", None);
+    }
+
+    #[test]
+    fn dropping_active_guard_emits_one_cancelled_request() {
+        let (metrics, mut receiver, emitter) = test_emitter();
+        let request = prepared_request("http");
+        metrics.begin_request();
+        let prior_in_flight = metrics.requests_in_flight();
+
+        let mut guard = RequestMetricsGuard::new(emitter, &request);
+        assert_eq!(metrics.requests_in_flight(), prior_in_flight + 1);
+        guard.started = Instant::now() - Duration::from_millis(25);
+        let preview = guard.cancelled_response();
+        assert_eq!(preview.url, request.url);
+        assert_eq!(preview.error.as_deref(), Some(REQUEST_CANCELLED_ERROR));
+        assert!(preview.timings.duration_ms >= 25.0);
+
+        drop(guard);
+        assert_eq!(metrics.requests_in_flight(), prior_in_flight);
+
+        let samples = drain(&mut receiver);
+        assert_eq!(samples.len(), 11);
+        let duration = samples
+            .iter()
+            .find(|sample| sample.metric.as_ref() == "http_req_duration")
+            .expect("http_req_duration");
+        assert_eq!(duration.kind, MetricKind::Trend);
+        assert!(duration.value >= preview.timings.duration_ms);
+        assert_metric_set(
+            &samples,
+            &[
+                ("data_sent", MetricKind::Counter, 0.0),
+                ("data_received", MetricKind::Counter, 0.0),
+                ("http_reqs", MetricKind::Counter, 1.0),
+                ("http_req_duration", MetricKind::Trend, duration.value),
+                ("http_req_blocked", MetricKind::Trend, 0.0),
+                ("http_req_connecting", MetricKind::Trend, 0.0),
+                ("http_req_tls_handshaking", MetricKind::Trend, 0.0),
+                ("http_req_sending", MetricKind::Trend, 0.0),
+                ("http_req_waiting", MetricKind::Trend, 0.0),
+                ("http_req_receiving", MetricKind::Trend, 0.0),
+                ("http_req_failed", MetricKind::Rate, 1.0),
+            ],
+        );
+        assert_tags(&samples, "http", "0", Some("cancelled"));
+
+        metrics.end_request();
+        assert_eq!(metrics.requests_in_flight(), 0);
+    }
+
+    #[test]
+    fn guard_retains_only_metric_context_fields() {
+        let (metrics, _receiver, emitter) = test_emitter();
+        let request = prepared_request("grpc");
+        assert!(!request.headers.is_empty());
+        assert!(request.body.is_unique());
+        assert!(request
+            .options
+            .grpc
+            .as_ref()
+            .is_some_and(|grpc| !grpc.messages.is_empty()));
+        assert!(request.options.plugin.is_some());
+
+        let guard = RequestMetricsGuard::new(emitter, &request);
+        assert!(request.body.is_unique(), "guard cloned the request body");
+
+        let RequestMetricsGuard {
+            emitter: _,
+            request: context,
+            started: _,
+            active: _,
+        } = &guard;
+        let RequestMetricContext {
+            name,
+            method,
+            protocol,
+            url,
+        } = context;
+        assert_eq!(name, &request.name);
+        assert_eq!(method, &request.method);
+        assert_eq!(protocol, &request.protocol);
+        assert_eq!(url, &request.url);
+        assert_eq!(
+            std::mem::size_of::<RequestMetricContext>(),
+            std::mem::size_of::<[String; 4]>()
+        );
+
+        drop(guard);
+        assert_eq!(metrics.requests_in_flight(), 0);
+    }
+}
+
+#[cfg(test)]
+mod grpc_template_tests {
+    use super::{CompiledGrpc, CompiledJson};
+    use crate::data::DataFeeds;
+    use crate::metrics::{MetricRegistry, MetricsBus, Tags};
+    use crate::vu::{RunContext, VuContext};
+    use indexmap::IndexMap;
+    use loadr_config::{
+        DataMode, DataSource, GrpcOptions, OnEof, PickStrategy, Template, TemplateError,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn render_legacy<F>(
+        value: &serde_json::Value,
+        resolve: &mut F,
+    ) -> Result<serde_json::Value, TemplateError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        Ok(match value {
+            serde_json::Value::String(source) => {
+                let template = Template::parse(source)?;
+                if template.is_literal() {
+                    value.clone()
+                } else {
+                    let rendered = template.render(&mut *resolve)?;
+                    if template.parts.len() == 1 {
+                        serde_json::from_str(&rendered)
+                            .unwrap_or(serde_json::Value::String(rendered))
+                    } else {
+                        serde_json::Value::String(rendered)
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| render_legacy(item, resolve))
+                    .collect::<Result<_, _>>()?,
+            ),
+            serde_json::Value::Object(fields) => {
+                let mut map = serde_json::Map::with_capacity(fields.len());
+                for (key, value) in fields {
+                    map.insert(key.clone(), render_legacy(value, resolve)?);
+                }
+                serde_json::Value::Object(map)
+            }
+            _ => value.clone(),
+        })
+    }
+
+    fn grpc_options() -> GrpcOptions {
+        GrpcOptions {
+            reflection: true,
+            service: "loadr.test.Echo".to_string(),
+            method: "UnaryEcho".to_string(),
+            ..GrpcOptions::default()
+        }
+    }
+
+    #[test]
+    fn compiled_json_matches_legacy_rendering() {
+        let input = serde_json::json!({
+            "literal": "plain",
+            "escaped_literal": "$${not-an-expression}",
+            "text": "héllo ${name}!",
+            "number": "${number}",
+            "boolean": "${boolean}",
+            "object": "${object}",
+            "array": "${array}",
+            "fallback": "${plain}",
+            "nested": [
+                {"static": [1, 2, 3]},
+                "prefix-${name}-${number}"
+            ]
+        });
+        let values = HashMap::from([
+            ("name", "世界"),
+            ("number", "42"),
+            ("boolean", "true"),
+            ("object", r#"{"inner":[1,false]}"#),
+            ("array", r#"["x",2]"#),
+            ("plain", "not json"),
+        ]);
+        let mut old_resolve = |expr: &str| values.get(expr).map(|value| (*value).to_string());
+        let expected = render_legacy(&input, &mut old_resolve).expect("legacy render");
+
+        let compiled = CompiledJson::compile(&input, "grpc message").expect("compile");
+        let mut new_resolve = |expr: &str| values.get(expr).map(|value| (*value).to_string());
+        let actual = compiled
+            .render(&mut |template| template.render(&mut new_resolve))
+            .expect("compiled render");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compiled_json_uses_real_vu_and_data_resolution() {
+        let mut variables = serde_json::Map::new();
+        variables.insert("token".to_string(), serde_json::json!("secret"));
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), serde_json::json!(7));
+        row.insert("object".to_string(), serde_json::json!({"nested": true}));
+        let mut sources = IndexMap::new();
+        sources.insert(
+            "users".to_string(),
+            DataSource::Inline {
+                rows: vec![row],
+                mode: DataMode::Shared,
+                on_eof: OnEof::Recycle,
+                pick: PickStrategy::Sequential,
+            },
+        );
+        let data = DataFeeds::load(&sources, Path::new("."), HashMap::new()).expect("data feeds");
+        let run = Arc::new(RunContext {
+            variables,
+            secrets: HashMap::new(),
+            env: HashMap::new(),
+            data,
+            registry: Arc::new(MetricRegistry::with_builtins()),
+            base_dir: ".".into(),
+            setup_data: parking_lot::RwLock::new(serde_json::Value::Null),
+        });
+        let (metrics, _rx) = MetricsBus::new();
+        let mut vu = VuContext::new(
+            9,
+            Arc::from("scenario"),
+            Arc::new(Tags::new()),
+            metrics,
+            run,
+            true,
+        );
+        vu.begin_iteration();
+
+        let input = serde_json::json!({
+            "id": "${data.users.id}",
+            "object": "${data.users.object}",
+            "token": "Bearer ${vars.token}",
+            "vu": "${vu}"
+        });
+        let compiled = CompiledJson::compile(&input, "grpc message").expect("compile");
+        let rendered = compiled
+            .render(&mut |template| {
+                template.render(|expr| vu.resolve_expr(expr).expect("resolve expression"))
+            })
+            .expect("render");
+        assert_eq!(
+            rendered,
+            serde_json::json!({
+                "id": 7,
+                "object": {"nested": true},
+                "token": "Bearer secret",
+                "vu": 9
+            })
+        );
+    }
+
+    #[test]
+    fn grpc_literal_and_dynamic_arc_identity_is_preserved() {
+        let mut literal_options = grpc_options();
+        literal_options.proto_files.push("echo.proto".into());
+        literal_options.message = Some(serde_json::json!({"message": "literal"}));
+        let literal = CompiledGrpc::compile(&literal_options, Path::new("/plans"))
+            .expect("compile literal grpc");
+        let mut never_render = |_: &Template| -> Result<String, ()> {
+            panic!("literal request must not render templates")
+        };
+        let first = literal.render(&mut never_render).expect("first literal");
+        let second = literal.render(&mut never_render).expect("second literal");
+        assert!(Arc::ptr_eq(
+            first.message.as_ref().expect("message"),
+            second.message.as_ref().expect("message")
+        ));
+        assert!(Arc::ptr_eq(&first.messages, &second.messages));
+        assert!(Arc::ptr_eq(&first.proto_files, &second.proto_files));
+        assert!(Arc::ptr_eq(&first.service, &second.service));
+        assert!(first.message_literal);
+
+        let mut streaming_options = grpc_options();
+        streaming_options.messages = vec![
+            serde_json::json!({"message": "one"}),
+            serde_json::json!({"message": "two"}),
+        ];
+        let streaming = CompiledGrpc::compile(&streaming_options, Path::new("."))
+            .expect("compile literal stream");
+        let stream_first = streaming.render(&mut never_render).expect("first stream");
+        let stream_second = streaming.render(&mut never_render).expect("second stream");
+        assert!(Arc::ptr_eq(&stream_first.messages, &stream_second.messages));
+        assert!(stream_first.message_literal);
+
+        let mut dynamic_options = grpc_options();
+        dynamic_options.message = Some(serde_json::json!({"message": "${value}"}));
+        dynamic_options
+            .metadata
+            .insert("x-value".to_string(), "Bearer ${value}".to_string());
+        let dynamic =
+            CompiledGrpc::compile(&dynamic_options, Path::new(".")).expect("compile dynamic grpc");
+        let mut render = |template: &Template| template.render(|_| Some("same".to_string()));
+        let dynamic_first = dynamic.render(&mut render).expect("first dynamic");
+        let dynamic_second = dynamic.render(&mut render).expect("second dynamic");
+        assert!(!Arc::ptr_eq(
+            dynamic_first.message.as_ref().expect("message"),
+            dynamic_second.message.as_ref().expect("message")
+        ));
+        assert!(!dynamic_first.message_literal);
+        assert_eq!(
+            dynamic_first.metadata,
+            vec![("x-value".to_string(), "Bearer same".to_string())]
+        );
+    }
+
+    #[test]
+    fn grpc_templates_fail_during_compilation() {
+        let mut message = grpc_options();
+        message.message = Some(serde_json::json!({"bad": "${unterminated"}));
+        let error = CompiledGrpc::compile(&message, Path::new("."))
+            .err()
+            .expect("invalid message template");
+        assert!(error.to_string().contains("grpc message: unterminated"));
+
+        let mut metadata = grpc_options();
+        metadata
+            .metadata
+            .insert("x-token".to_string(), "${}".to_string());
+        let error = CompiledGrpc::compile(&metadata, Path::new("."))
+            .err()
+            .expect("invalid metadata template");
+        assert!(error.to_string().contains("grpc metadata `x-token`: empty"));
+    }
+}
+
+#[cfg(test)]
 mod failure_grouping_tests {
     use super::{classify_transport_error, normalize_exception};
 
@@ -2348,6 +3289,8 @@ mod failure_grouping_tests {
             classify_transport_error("could not connect to upstream"),
             "connection"
         );
+        assert_eq!(classify_transport_error("request cancelled"), "cancelled");
+        assert_eq!(classify_transport_error("request canceled"), "cancelled");
         assert_eq!(classify_transport_error("something weird"), "transport");
     }
 

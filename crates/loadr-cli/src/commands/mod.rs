@@ -1,16 +1,5 @@
 pub mod agent;
-pub mod compare;
 pub mod controller;
-pub mod convert;
-pub mod download;
-pub mod explain;
-pub mod gen;
-pub mod history;
-pub mod payload;
 pub mod plugin;
-pub mod record;
-pub mod report;
 pub mod run;
-pub mod scenario;
-pub mod sweep;
 pub mod validate;

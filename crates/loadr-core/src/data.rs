@@ -1,13 +1,14 @@
-//! Data parameterization: CSV and inline data sources with shared or per-VU
-//! cursors and recycle/stop-at-EOF semantics.
+//! Data parameterization: CSV, inline, and plugin-backed on-demand data
+//! sources with shared or per-VU cursors and recycle/stop-at-EOF semantics.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 use loadr_config::{DataMode, DataSource, OnEof, PickStrategy};
+use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use rand::RngExt;
 
@@ -16,8 +17,53 @@ use crate::error::EngineError;
 /// One data row: column name → string value.
 pub type Row = IndexMap<String, String>;
 
+/// Identity of the caller pulling a row (used only by plugin-backed feeds).
+#[derive(Clone, Copy)]
+pub struct RowIdentity<'a> {
+    pub vu: u64,
+    /// 0-based, matches `${iteration}`.
+    pub iteration: u64,
+    pub scenario: &'a str,
+    pub request: Option<&'a str>,
+}
+
+/// Full context for one on-demand row generation (hot path).
+pub struct PluginRowCtx<'a> {
+    pub run_id: &'a str,
+    pub instance_id: &'a str,
+    pub partition_index: u64,
+    pub partition_count: u64,
+    pub source: &'a str,
+    pub vu: u64,
+    pub iteration: u64,
+    /// Monotonic per-VU, per-source counter.
+    pub seq: u64,
+    pub scenario: &'a str,
+    pub request: Option<&'a str>,
+    /// Core-supplied wall clock.
+    pub ts_ms: u64,
+}
+
+/// Outcome of one on-demand row generation.
+pub enum PluginRowResult {
+    Row(Row),
+    Exhausted,
+}
+
+/// Core-facing `data_source` plugin capability. `next_row` runs on the
+/// request hot path and is called concurrently across VU worker threads.
+pub trait DataSourcePlugin: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// One-time setup before VUs start. `source_configs` maps each
+    /// `data.<name>` backed by this plugin to its `config:` value.
+    fn init(&mut self, source_configs: &IndexMap<String, serde_json::Value>) -> Result<(), String>;
+
+    fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String>;
+}
+
 #[derive(Debug)]
-struct Feed {
+struct MemoryFeed {
     rows: Vec<Arc<Row>>,
     mode: DataMode,
     on_eof: OnEof,
@@ -25,23 +71,92 @@ struct Feed {
     shared_cursor: AtomicUsize,
 }
 
-/// Per-VU feeder state: sequential cursors and per-VU shuffle orders.
+enum Feed {
+    Memory(MemoryFeed),
+    Plugin(Arc<dyn DataSourcePlugin>),
+}
+
+impl std::fmt::Debug for Feed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Feed::Memory(feed) => feed.fmt(f),
+            Feed::Plugin(plugin) => write!(f, "Feed::Plugin({})", plugin.name()),
+        }
+    }
+}
+
+/// Per-VU feeder state: sequential cursors, per-VU shuffle orders, and
+/// plugin row sequence counters.
 #[derive(Debug, Default)]
 pub struct VuFeedState {
     cursors: HashMap<String, usize>,
     shuffles: HashMap<String, Vec<usize>>,
+    /// Source → shared counter slot, shared across parallel branches of one
+    /// VU (`fork_for_parallel`) so branches never observe the same
+    /// `(vu, source, seq)`.
+    plugin_sequences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    /// Branch-local cache of slots from `plugin_sequences`; steady-state
+    /// fetches skip the lock and key allocation.
+    local_sequences: HashMap<String, Arc<AtomicU64>>,
 }
 
 impl VuFeedState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub(crate) fn fork_for_parallel(&self) -> Self {
+        Self {
+            cursors: HashMap::new(),
+            shuffles: HashMap::new(),
+            plugin_sequences: Arc::clone(&self.plugin_sequences),
+            local_sequences: HashMap::new(),
+        }
+    }
+
+    fn next_plugin_seq(&mut self, source: &str) -> u64 {
+        // Relaxed: uniqueness needs only `fetch_add`'s atomicity; no other
+        // memory is published through the slot.
+        if let Some(slot) = self.local_sequences.get(source) {
+            return slot.fetch_add(1, Ordering::Relaxed);
+        }
+        let slot = {
+            let mut shared = self.plugin_sequences.lock();
+            match shared.get(source) {
+                Some(slot) => Arc::clone(slot),
+                None => {
+                    let slot = Arc::new(AtomicU64::new(0));
+                    shared.insert(source.to_string(), Arc::clone(&slot));
+                    slot
+                }
+            }
+        };
+        let seq = slot.fetch_add(1, Ordering::Relaxed);
+        self.local_sequences.insert(source.to_string(), slot);
+        seq
+    }
 }
 
 /// All loaded data sources for a test.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DataFeeds {
     feeds: HashMap<String, Feed>,
+    has_on_demand: bool,
+    run_id: Arc<str>,
+    instance_id: Arc<str>,
+    partition: (u64, u64),
+}
+
+impl Default for DataFeeds {
+    fn default() -> Self {
+        Self {
+            feeds: HashMap::new(),
+            has_on_demand: false,
+            run_id: Arc::from("local"),
+            instance_id: Arc::from("local"),
+            partition: (0, 1),
+        }
+    }
 }
 
 /// Signalled when a `stop`-mode source is exhausted: the VU should retire.
@@ -50,14 +165,63 @@ pub struct DataFeeds {
 pub struct EndOfData(pub String);
 
 impl DataFeeds {
-    /// Load every source declared in the plan. CSV paths resolve against `base_dir`.
+    /// Load every source declared in the plan. CSV paths resolve against
+    /// `base_dir`. `plugins` provides one loaded `data_source`-capable
+    /// plugin per name that a `type: plugin` source may reference.
     pub fn load(
         sources: &IndexMap<String, DataSource>,
         base_dir: &Path,
+        mut plugins: HashMap<String, Box<dyn DataSourcePlugin>>,
     ) -> Result<DataFeeds, EngineError> {
+        // Group plugin-backed sources by plugin name so each plugin's
+        // `init` sees all `data.*` entries it backs in one call.
+        let mut plugin_groups: IndexMap<String, IndexMap<String, serde_json::Value>> =
+            IndexMap::new();
+        for (name, source) in sources {
+            if let DataSource::Plugin {
+                source: plugin_name,
+                config,
+            } = source
+            {
+                plugin_groups
+                    .entry(plugin_name.clone())
+                    .or_default()
+                    .insert(name.clone(), config.clone());
+            }
+        }
+
+        let mut initialized: HashMap<String, Arc<dyn DataSourcePlugin>> = HashMap::new();
+        for (plugin_name, group_configs) in &plugin_groups {
+            let mut plugin = plugins.remove(plugin_name).ok_or_else(|| EngineError::Data {
+                source_name: plugin_name.clone(),
+                message: format!(
+                    "plugin `{plugin_name}` is not loaded or does not provide the data_source capability"
+                ),
+            })?;
+            plugin
+                .init(group_configs)
+                .map_err(|message| EngineError::Data {
+                    source_name: plugin_name.clone(),
+                    message,
+                })?;
+            initialized.insert(plugin_name.clone(), Arc::from(plugin));
+        }
+
+        let mut has_on_demand = false;
         let mut feeds = HashMap::new();
         for (name, source) in sources {
             let feed = match source {
+                DataSource::Plugin {
+                    source: plugin_name,
+                    ..
+                } => {
+                    has_on_demand = true;
+                    let plugin = initialized
+                        .get(plugin_name)
+                        .expect("initialized above for every referenced plugin")
+                        .clone();
+                    Feed::Plugin(plugin)
+                }
                 DataSource::Csv {
                     path,
                     mode,
@@ -186,7 +350,23 @@ impl DataFeeds {
             };
             feeds.insert(name.clone(), feed);
         }
-        Ok(DataFeeds { feeds })
+        Ok(DataFeeds {
+            feeds,
+            has_on_demand,
+            ..DataFeeds::default()
+        })
+    }
+
+    /// Set the distributed identity attached to every feeder invocation.
+    pub fn set_execution_identity(
+        &mut self,
+        run_id: Arc<str>,
+        instance_id: Arc<str>,
+        partition: (u64, u64),
+    ) {
+        self.run_id = run_id;
+        self.instance_id = instance_id;
+        self.partition = partition;
     }
 
     pub fn has_source(&self, name: &str) -> bool {
@@ -197,19 +377,62 @@ impl DataFeeds {
         self.feeds.keys().map(String::as_str).collect()
     }
 
+    /// Whether any loaded source is plugin-backed (on-demand rows).
+    pub fn has_on_demand(&self) -> bool {
+        self.has_on_demand
+    }
+
+    /// Whether `name` is a plugin-backed (on-demand) source.
+    pub fn is_on_demand(&self, name: &str) -> bool {
+        matches!(self.feeds.get(name), Some(Feed::Plugin(_)))
+    }
+
     /// Fetch the next row for `source`, honoring its mode, pick strategy and
-    /// EOF behaviour. `state` holds per-VU cursors/shuffles; `rng` drives random
-    /// and shuffle selection.
+    /// EOF behaviour (memory feeds), or invoking the backing plugin
+    /// (plugin-backed feeds). `state` holds per-VU cursors/shuffles/seq
+    /// counters; `rng` drives random and shuffle selection; `id` identifies
+    /// the calling VU/request for plugin-backed feeds.
     pub fn next_row(
         &self,
         source: &str,
         state: &mut VuFeedState,
         rng: &mut impl RngExt,
+        id: &RowIdentity<'_>,
     ) -> Result<Arc<Row>, NextRowError> {
         let feed = self
             .feeds
             .get(source)
             .ok_or_else(|| NextRowError::UnknownSource(source.to_string()))?;
+
+        let feed = match feed {
+            Feed::Plugin(plugin) => {
+                let seq = state.next_plugin_seq(source);
+                let ctx = PluginRowCtx {
+                    run_id: &self.run_id,
+                    instance_id: &self.instance_id,
+                    partition_index: self.partition.0,
+                    partition_count: self.partition.1,
+                    source,
+                    vu: id.vu,
+                    iteration: id.iteration,
+                    seq,
+                    scenario: id.scenario,
+                    request: id.request,
+                    ts_ms: crate::metrics::now_millis(),
+                };
+                return match plugin.next_row(&ctx) {
+                    Ok(PluginRowResult::Row(row)) => Ok(Arc::new(row)),
+                    Ok(PluginRowResult::Exhausted) => {
+                        Err(NextRowError::Exhausted(EndOfData(source.to_string())))
+                    }
+                    Err(message) => Err(NextRowError::Plugin {
+                        source_name: source.to_string(),
+                        message,
+                    }),
+                };
+            }
+            Feed::Memory(feed) => feed,
+        };
         let len = feed.rows.len();
 
         // Random: independent uniform pick every call; never exhausts.
@@ -251,13 +474,13 @@ impl DataFeeds {
 }
 
 fn make_feed(rows: Vec<Arc<Row>>, mode: DataMode, on_eof: OnEof, pick: PickStrategy) -> Feed {
-    Feed {
+    Feed::Memory(MemoryFeed {
         rows,
         mode,
         on_eof,
         pick,
         shared_cursor: AtomicUsize::new(0),
-    }
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,6 +489,11 @@ pub enum NextRowError {
     UnknownSource(String),
     #[error(transparent)]
     Exhausted(#[from] EndOfData),
+    #[error("data source `{source_name}`: plugin error: {message}")]
+    Plugin {
+        source_name: String,
+        message: String,
+    },
 }
 
 fn json_to_string(v: &serde_json::Value) -> String {
@@ -284,6 +512,78 @@ mod tests {
 
     fn rng() -> rand::rngs::SmallRng {
         rand::rngs::SmallRng::seed_from_u64(42)
+    }
+
+    fn id() -> RowIdentity<'static> {
+        RowIdentity {
+            vu: 1,
+            iteration: 0,
+            scenario: "s",
+            request: None,
+        }
+    }
+
+    /// Shared observability handle for [`FakePlugin`], cloned before the
+    /// plugin is boxed so tests can inspect state after `DataFeeds::load`
+    /// takes ownership.
+    #[derive(Clone, Default)]
+    struct FakeHandle {
+        calls: Arc<std::sync::atomic::AtomicU64>,
+        seen_configs: Arc<std::sync::Mutex<Option<IndexMap<String, serde_json::Value>>>>,
+    }
+
+    enum FakeMode {
+        EchoSeq,
+        AlwaysErr(String),
+        AlwaysExhausted,
+    }
+
+    struct FakePlugin {
+        name: String,
+        handle: FakeHandle,
+        mode: FakeMode,
+    }
+
+    fn fake_plugin(name: &str, mode: FakeMode) -> (FakePlugin, FakeHandle) {
+        let handle = FakeHandle::default();
+        (
+            FakePlugin {
+                name: name.to_string(),
+                handle: handle.clone(),
+                mode,
+            },
+            handle,
+        )
+    }
+
+    impl DataSourcePlugin for FakePlugin {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn init(
+            &mut self,
+            source_configs: &IndexMap<String, serde_json::Value>,
+        ) -> Result<(), String> {
+            *self.handle.seen_configs.lock().unwrap() = Some(source_configs.clone());
+            Ok(())
+        }
+
+        fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String> {
+            self.handle
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.mode {
+                FakeMode::EchoSeq => {
+                    let mut row = Row::new();
+                    row.insert("seq".to_string(), ctx.seq.to_string());
+                    row.insert("vu".to_string(), ctx.vu.to_string());
+                    Ok(PluginRowResult::Row(row))
+                }
+                FakeMode::AlwaysErr(msg) => Err(msg.clone()),
+                FakeMode::AlwaysExhausted => Ok(PluginRowResult::Exhausted),
+            }
+        }
     }
 
     fn csv_feeds(
@@ -308,7 +608,7 @@ mod tests {
                 has_header: true,
             },
         );
-        DataFeeds::load(&sources, dir).expect("load")
+        DataFeeds::load(&sources, dir, HashMap::new()).expect("load")
     }
 
     #[test]
@@ -323,8 +623,12 @@ mod tests {
         );
         let mut st = VuFeedState::new();
         let mut r = rng();
-        let r1 = feeds.next_row("users", &mut st, &mut r).expect("row");
-        let r2 = feeds.next_row("users", &mut st, &mut r).expect("row");
+        let r1 = feeds
+            .next_row("users", &mut st, &mut r, &id())
+            .expect("row");
+        let r2 = feeds
+            .next_row("users", &mut st, &mut r, &id())
+            .expect("row");
         assert_eq!(r1["user"], "u1");
         assert_eq!(r2["user"], "u2");
     }
@@ -342,9 +646,13 @@ mod tests {
         let mut st = VuFeedState::new();
         let mut r = rng();
         for _ in 0..2 {
-            feeds.next_row("users", &mut st, &mut r).expect("row");
+            feeds
+                .next_row("users", &mut st, &mut r, &id())
+                .expect("row");
         }
-        let wrapped = feeds.next_row("users", &mut st, &mut r).expect("row");
+        let wrapped = feeds
+            .next_row("users", &mut st, &mut r, &id())
+            .expect("row");
         assert_eq!(wrapped["user"], "u1");
     }
 
@@ -360,9 +668,11 @@ mod tests {
         );
         let mut st = VuFeedState::new();
         let mut r = rng();
-        feeds.next_row("users", &mut st, &mut r).expect("row");
+        feeds
+            .next_row("users", &mut st, &mut r, &id())
+            .expect("row");
         assert!(matches!(
-            feeds.next_row("users", &mut st, &mut r),
+            feeds.next_row("users", &mut st, &mut r, &id()),
             Err(NextRowError::Exhausted(_))
         ));
     }
@@ -380,15 +690,15 @@ mod tests {
         let (mut vu1, mut vu2) = (VuFeedState::new(), VuFeedState::new());
         let mut r = rng();
         assert_eq!(
-            feeds.next_row("users", &mut vu1, &mut r).unwrap()["user"],
+            feeds.next_row("users", &mut vu1, &mut r, &id()).unwrap()["user"],
             "u1"
         );
         assert_eq!(
-            feeds.next_row("users", &mut vu2, &mut r).unwrap()["user"],
+            feeds.next_row("users", &mut vu2, &mut r, &id()).unwrap()["user"],
             "u1"
         );
         assert_eq!(
-            feeds.next_row("users", &mut vu1, &mut r).unwrap()["user"],
+            feeds.next_row("users", &mut vu1, &mut r, &id()).unwrap()["user"],
             "u2"
         );
     }
@@ -408,7 +718,7 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..200 {
             let row = feeds
-                .next_row("users", &mut st, &mut r)
+                .next_row("users", &mut st, &mut r, &id())
                 .expect("random never stops");
             seen.insert(row["user"].clone());
         }
@@ -432,7 +742,9 @@ mod tests {
         let mut r = rng();
         let mut first_cycle = std::collections::BTreeSet::new();
         for _ in 0..4 {
-            let row = feeds.next_row("users", &mut st, &mut r).expect("row");
+            let row = feeds
+                .next_row("users", &mut st, &mut r, &id())
+                .expect("row");
             first_cycle.insert(row["user"].clone());
         }
         // A full cycle visits every row exactly once (just shuffled order).
@@ -457,10 +769,12 @@ mod tests {
                 pick: PickStrategy::Sequential,
             },
         );
-        let feeds = DataFeeds::load(&sources, dir.path()).expect("load");
+        let feeds = DataFeeds::load(&sources, dir.path(), HashMap::new()).expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
-        let row = feeds.next_row("items", &mut st, &mut r).expect("row");
+        let row = feeds
+            .next_row("items", &mut st, &mut r, &id())
+            .expect("row");
         assert_eq!(row["id"], "1");
         assert_eq!(row["name"], "alpha");
     }
@@ -480,10 +794,12 @@ mod tests {
                 pick: PickStrategy::Sequential,
             },
         );
-        let feeds = DataFeeds::load(&sources, Path::new(".")).expect("load");
+        let feeds = DataFeeds::load(&sources, Path::new("."), HashMap::new()).expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
-        let row = feeds.next_row("items", &mut st, &mut r).expect("row");
+        let row = feeds
+            .next_row("items", &mut st, &mut r, &id())
+            .expect("row");
         assert_eq!(row["id"], "7");
         assert_eq!(row["name"], "alpha");
     }
@@ -505,11 +821,269 @@ mod tests {
                 has_header: false,
             },
         );
-        let feeds = DataFeeds::load(&sources, dir.path()).expect("load");
+        let feeds = DataFeeds::load(&sources, dir.path(), HashMap::new()).expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
-        let row = feeds.next_row("d", &mut st, &mut r).expect("row");
+        let row = feeds.next_row("d", &mut st, &mut r, &id()).expect("row");
         assert_eq!(row["col0"], "a");
         assert_eq!(row["col1"], "b");
+    }
+
+    fn plugin_source(plugin_name: &str) -> IndexMap<String, DataSource> {
+        let mut sources = IndexMap::new();
+        sources.insert(
+            "signed".to_string(),
+            DataSource::Plugin {
+                source: plugin_name.to_string(),
+                config: serde_json::Value::Null,
+            },
+        );
+        sources
+    }
+
+    #[test]
+    fn plugin_source_seq_is_monotonic_per_vu_source() {
+        let (plugin, _handle) = fake_plugin("signer", FakeMode::EchoSeq);
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let feeds =
+            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let mut st = VuFeedState::new();
+        let mut r = rng();
+        let r1 = feeds
+            .next_row("signed", &mut st, &mut r, &id())
+            .expect("row");
+        let r2 = feeds
+            .next_row("signed", &mut st, &mut r, &id())
+            .expect("row");
+        assert_eq!(r1["seq"], "0");
+        assert_eq!(r2["seq"], "1");
+    }
+
+    #[test]
+    fn plugin_source_seq_is_shared_across_parallel_forks() {
+        let (plugin, _handle) = fake_plugin("signer", FakeMode::EchoSeq);
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let feeds =
+            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let parent = VuFeedState::new();
+        let mut branch_a = parent.fork_for_parallel();
+        let mut branch_b = parent.fork_for_parallel();
+        let mut r = rng();
+
+        let r1 = feeds
+            .next_row("signed", &mut branch_a, &mut r, &id())
+            .expect("row");
+        let r2 = feeds
+            .next_row("signed", &mut branch_b, &mut r, &id())
+            .expect("row");
+
+        assert_eq!(r1["seq"], "0");
+        assert_eq!(r2["seq"], "1");
+    }
+
+    #[test]
+    fn next_plugin_seq_counts_up_in_order() {
+        let mut st = VuFeedState::new();
+        for expected in 0..10u64 {
+            assert_eq!(st.next_plugin_seq("src"), expected);
+        }
+    }
+
+    #[test]
+    fn next_plugin_seq_sources_advance_independently() {
+        let mut st = VuFeedState::new();
+        assert_eq!(st.next_plugin_seq("a"), 0);
+        assert_eq!(st.next_plugin_seq("a"), 1);
+        assert_eq!(st.next_plugin_seq("b"), 0);
+        assert_eq!(st.next_plugin_seq("a"), 2);
+        assert_eq!(st.next_plugin_seq("b"), 1);
+    }
+
+    #[test]
+    fn next_plugin_seq_late_fork_continues_from_shared_value() {
+        let mut parent = VuFeedState::new();
+        for _ in 0..5 {
+            parent.next_plugin_seq("src");
+        }
+        let mut branch = parent.fork_for_parallel();
+        assert_eq!(branch.next_plugin_seq("src"), 5);
+        assert_eq!(parent.next_plugin_seq("src"), 6);
+    }
+
+    #[test]
+    fn next_plugin_seq_unique_across_threaded_forks() {
+        const ROUNDS: usize = 100;
+        const PER_BRANCH: u64 = 20;
+        let parent = VuFeedState::new();
+        let mut seen: Vec<u64> = Vec::new();
+        for _ in 0..ROUNDS {
+            // Fresh forks each round: both branches start with a cold
+            // local cache, so their first fetches race the shared-map
+            // slot resolution from both sides.
+            let mut a = parent.fork_for_parallel();
+            let mut b = parent.fork_for_parallel();
+            let (va, vb) = std::thread::scope(|s| {
+                let ta = s.spawn(move || {
+                    (0..PER_BRANCH)
+                        .map(|_| a.next_plugin_seq("src"))
+                        .collect::<Vec<_>>()
+                });
+                let tb = s.spawn(move || {
+                    (0..PER_BRANCH)
+                        .map(|_| b.next_plugin_seq("src"))
+                        .collect::<Vec<_>>()
+                });
+                (ta.join().expect("branch a"), tb.join().expect("branch b"))
+            });
+            seen.extend(va);
+            seen.extend(vb);
+        }
+        seen.sort_unstable();
+        let expected: Vec<u64> = (0..ROUNDS as u64 * 2 * PER_BRANCH).collect();
+        assert_eq!(seen, expected, "sequence values must be exactly 0..total");
+    }
+
+    #[test]
+    fn plugin_error_maps_to_next_row_error_plugin() {
+        let (plugin, _handle) = fake_plugin("signer", FakeMode::AlwaysErr("boom".to_string()));
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let feeds =
+            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let mut st = VuFeedState::new();
+        let mut r = rng();
+        match feeds.next_row("signed", &mut st, &mut r, &id()) {
+            Err(NextRowError::Plugin {
+                source_name,
+                message,
+            }) => {
+                assert_eq!(source_name, "signed");
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected NextRowError::Plugin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_exhausted_maps_to_next_row_error_exhausted() {
+        let (plugin, _handle) = fake_plugin("signer", FakeMode::AlwaysExhausted);
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let feeds =
+            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let mut st = VuFeedState::new();
+        let mut r = rng();
+        assert!(matches!(
+            feeds.next_row("signed", &mut st, &mut r, &id()),
+            Err(NextRowError::Exhausted(_))
+        ));
+    }
+
+    #[test]
+    fn missing_plugin_fails_at_load_naming_source() {
+        let err = DataFeeds::load(&plugin_source("signer"), Path::new("."), HashMap::new())
+            .expect_err("missing plugin should fail load");
+        match err {
+            EngineError::Data {
+                source_name,
+                message,
+            } => {
+                assert_eq!(source_name, "signer");
+                assert!(
+                    message.contains("not loaded or does not provide the data_source capability")
+                );
+            }
+            other => panic!("expected EngineError::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_init_receives_grouped_source_configs() {
+        let mut sources = IndexMap::new();
+        sources.insert(
+            "a".to_string(),
+            DataSource::Plugin {
+                source: "signer".to_string(),
+                config: serde_json::json!({"k": "a"}),
+            },
+        );
+        sources.insert(
+            "b".to_string(),
+            DataSource::Plugin {
+                source: "signer".to_string(),
+                config: serde_json::json!({"k": "b"}),
+            },
+        );
+        let (plugin, handle) = fake_plugin("signer", FakeMode::EchoSeq);
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        DataFeeds::load(&sources, Path::new("."), plugins).expect("load");
+        let configs = handle
+            .seen_configs
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("init should have been called");
+        assert_eq!(configs["a"], serde_json::json!({"k": "a"}));
+        assert_eq!(configs["b"], serde_json::json!({"k": "b"}));
+    }
+
+    #[test]
+    fn plugin_next_row_is_callable_concurrently() {
+        let (plugin, handle) = fake_plugin("signer", FakeMode::EchoSeq);
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let feeds = Arc::new(
+            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load"),
+        );
+
+        let workers: Vec<_> = (0..8u64)
+            .map(|vu| {
+                let feeds = Arc::clone(&feeds);
+                std::thread::spawn(move || {
+                    let mut st = VuFeedState::new();
+                    let mut r = rng();
+                    let id = RowIdentity {
+                        vu,
+                        iteration: 0,
+                        scenario: "s",
+                        request: None,
+                    };
+                    for _ in 0..50 {
+                        feeds.next_row("signed", &mut st, &mut r, &id).expect("row");
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("worker thread panicked");
+        }
+        assert_eq!(
+            handle.calls.load(std::sync::atomic::Ordering::SeqCst),
+            8 * 50
+        );
+    }
+
+    #[test]
+    fn has_on_demand_and_is_on_demand_flags() {
+        let (plugin, _handle) = fake_plugin("signer", FakeMode::EchoSeq);
+        let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let mut sources = plugin_source("signer");
+        sources.insert(
+            "static_rows".to_string(),
+            DataSource::Inline {
+                rows: vec![IndexMap::new()],
+                mode: DataMode::Shared,
+                on_eof: OnEof::Recycle,
+                pick: PickStrategy::Sequential,
+            },
+        );
+        let feeds = DataFeeds::load(&sources, Path::new("."), plugins).expect("load");
+        assert!(feeds.has_on_demand());
+        assert!(feeds.is_on_demand("signed"));
+        assert!(!feeds.is_on_demand("static_rows"));
     }
 }

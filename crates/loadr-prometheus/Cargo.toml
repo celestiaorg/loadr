@@ -1,0 +1,31 @@
+[package]
+name = "loadr-prometheus"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Prometheus scrape and remote-write output for loadr"
+
+[dependencies]
+loadr-core = { workspace = true }
+loadr-config = { workspace = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+snap = "1.1"
+
+[build-dependencies]
+protox = { workspace = true }
+prost-build = "0.14"
+
+[dev-dependencies]
+tokio-stream = "0.1"

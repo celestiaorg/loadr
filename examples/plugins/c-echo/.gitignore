@@ -1,5 +1,0 @@
-# Built plugin artifacts (run `make` to produce these).
-libloadr_plugin_cecho.so
-libloadr_plugin_cecho.dylib
-loadr_plugin_cecho.dll
-*.o

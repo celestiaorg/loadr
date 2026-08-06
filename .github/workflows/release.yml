@@ -11,28 +11,10 @@ name: Release
 on:
   push:
     branches: [main]
-    # Only the CLI/core train releases here. Changes confined to other trains
-    # (desktop, plugins' workflows, site, benchmarks, docs) must NOT cut a CLI
-    # release — they have their own pipelines. A push touching ANY non-ignored
-    # path (crates/**, Cargo.*, shared code) still triggers a release as normal.
+    # Documentation-only changes do not cut a binary release.
     paths-ignore:
-      - 'desktop/**'
-      - 'site/**'
-      - 'prompts/**'
-      - 'demos/**'
-      - 'benchmarks/**'
       - 'docs/**'
-      - '.github/workflows/desktop-release.yml'
-      - '.github/workflows/desktop.yml'
-      - '.github/workflows/action-selftest.yml'
-      - '.github/workflows/acceptance.yml'
-      - '.github/workflows/benchmark.yml'
       - '.github/workflows/release.yml'
-      - '.github/workflows/major-tag.yml'
-      - '.github/workflows/publish-packages.yml'
-      - 'Formula/**'
-      - 'bucket/**'
-      - 'packaging/**'
   workflow_dispatch:
 
 permissions:

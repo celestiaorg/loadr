@@ -1,9 +1,12 @@
 //! Assertion/check evaluation against protocol responses.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use loadr_config::{Condition, FailureAction};
 
 use crate::extract::xpath_eval;
-use crate::protocol::ProtocolResponse;
+use crate::protocol::{GrpcProtobufFieldCheck, ProtocolResponse};
 
 /// A compiled condition (regexes/paths parsed at plan compile time).
 #[derive(Debug)]
@@ -32,6 +35,13 @@ enum Kind {
         path: serde_json_path::JsonPath,
         equals: Option<serde_json::Value>,
         exists: bool,
+    },
+    ProtobufField {
+        id: Option<u32>,
+        field: Arc<str>,
+        equals: Option<serde_json::Value>,
+        exists: bool,
+        failure_groups: Option<BTreeMap<i64, String>>,
     },
     Xpath {
         expression: String,
@@ -67,6 +77,14 @@ pub struct ConditionResult {
     pub on_failure: FailureAction,
     /// JS conditions are deferred to the script engine.
     pub needs_js: Option<String>,
+    /// Optional bounded grouping key for a failed check sample.
+    pub failure_group: Option<ConditionFailureGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionFailureGroup {
+    pub code: Option<i64>,
+    pub label: String,
 }
 
 impl CompiledCondition {
@@ -109,6 +127,19 @@ impl CompiledCondition {
                     .map_err(|e| format!("condition `{name}`: {e}"))?,
                 equals: equals.clone(),
                 exists: exists.unwrap_or(true),
+            },
+            Condition::ProtobufField {
+                field,
+                equals,
+                exists,
+                failure_groups,
+                ..
+            } => Kind::ProtobufField {
+                id: None,
+                field: Arc::from(field.as_str()),
+                equals: equals.clone(),
+                exists: exists.unwrap_or(true),
+                failure_groups: failure_groups.clone(),
             },
             Condition::Xpath {
                 expression,
@@ -160,6 +191,7 @@ impl CompiledCondition {
             detail: None,
             on_failure: self.on_failure,
             needs_js: None,
+            failure_group: None,
         };
         let fail = |result: &mut ConditionResult, detail: String| {
             result.pass = false;
@@ -242,6 +274,60 @@ impl CompiledCondition {
                         }
                     }
                     (false, None) => {}
+                }
+            }
+            Kind::ProtobufField {
+                id, failure_groups, ..
+            } => {
+                let outcome = id.and_then(|id| {
+                    response
+                        .grpc_protobuf_outcomes
+                        .iter()
+                        .find(|outcome| outcome.id == id)
+                });
+                match outcome {
+                    Some(outcome) => {
+                        result.pass = outcome.pass;
+                        result.detail.clone_from(&outcome.detail);
+                        if !outcome.pass {
+                            result.failure_group = failure_groups.as_ref().map(|groups| {
+                                if outcome.missing {
+                                    ConditionFailureGroup {
+                                        code: None,
+                                        label: "missing".to_string(),
+                                    }
+                                } else if let Some(code) = outcome.actual_code {
+                                    match groups.get(&code) {
+                                        Some(label) => ConditionFailureGroup {
+                                            code: Some(code),
+                                            label: label.clone(),
+                                        },
+                                        None => ConditionFailureGroup {
+                                            code: None,
+                                            label: "other".to_string(),
+                                        },
+                                    }
+                                } else {
+                                    ConditionFailureGroup {
+                                        code: None,
+                                        label: "other".to_string(),
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    None => {
+                        fail(
+                            &mut result,
+                            "no protobuf response message was available".to_string(),
+                        );
+                        if failure_groups.is_some() {
+                            result.failure_group = Some(ConditionFailureGroup {
+                                code: None,
+                                label: "no_response".to_string(),
+                            });
+                        }
+                    }
                 }
             }
             Kind::Xpath {
@@ -332,6 +418,44 @@ impl CompiledCondition {
         }
         result
     }
+
+    /// Whether evaluating this condition needs the response body
+    /// materialized (used to gate gRPC's lazy decode). Negated match, not a
+    /// positive list: an unhandled future `Kind` then defaults to "reads
+    /// body", the safe choice, instead of silently skipping needed data.
+    pub fn reads_body(&self) -> bool {
+        !matches!(
+            self.kind,
+            Kind::Status { .. }
+                | Kind::ProtobufField { .. }
+                | Kind::Duration { .. }
+                | Kind::Header { .. }
+        )
+    }
+
+    /// Bind a protobuf condition to its request-local result slot and return
+    /// the handler specification. Non-protobuf conditions return `None`.
+    pub fn bind_protobuf_check(&mut self, id: u32) -> Option<GrpcProtobufFieldCheck> {
+        match &mut self.kind {
+            Kind::ProtobufField {
+                id: slot,
+                field,
+                equals,
+                exists,
+                failure_groups,
+            } => {
+                *slot = Some(id);
+                Some(GrpcProtobufFieldCheck {
+                    id,
+                    field: field.clone(),
+                    equals: equals.clone(),
+                    exists: *exists,
+                    group_failures: failure_groups.is_some(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +521,44 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_field_outcomes_use_bounded_failure_groups() {
+        let spec: Condition = serde_yaml::from_str(
+            r#"{ type: protobuf_field, name: admission, field: code, equals: 0, failure_groups: { 18: WrongShard } }"#,
+        )
+        .expect("spec");
+        let mut condition = CompiledCondition::compile(&spec).expect("compile");
+        condition.bind_protobuf_check(7).expect("protobuf check");
+
+        let mut response = response(0, "");
+        response
+            .grpc_protobuf_outcomes
+            .push(crate::protocol::GrpcProtobufFieldOutcome {
+                id: 7,
+                pass: false,
+                detail: Some("expected 0, got 18".to_string()),
+                actual_code: Some(18),
+                missing: false,
+            });
+        let result = condition.evaluate(&response);
+        assert!(!result.pass);
+        assert_eq!(
+            result.failure_group,
+            Some(ConditionFailureGroup {
+                code: Some(18),
+                label: "WrongShard".to_string(),
+            })
+        );
+
+        response.grpc_protobuf_outcomes[0].actual_code = Some(999);
+        let result = condition.evaluate(&response);
+        assert_eq!(result.failure_group.unwrap().label, "other");
+
+        response.grpc_protobuf_outcomes.clear();
+        let result = condition.evaluate(&response);
+        assert_eq!(result.failure_group.unwrap().label, "no_response");
+    }
+
+    #[test]
     fn xpath_conditions() {
         let c = compile(r#"{ type: xpath, expression: "//name", equals: alpha }"#);
         assert!(c.evaluate(&response(200, "<r><name>alpha</name></r>")).pass);
@@ -442,5 +604,23 @@ mod tests {
         let c = compile("{ type: status, equals: 200, on_failure: abort_iteration }");
         let r = c.evaluate(&response(500, ""));
         assert_eq!(r.on_failure, FailureAction::AbortIteration);
+    }
+
+    #[test]
+    fn reads_body_classifies_by_kind() {
+        // Status/duration/header never touch the body.
+        assert!(!compile("{ type: status, equals: 200 }").reads_body());
+        assert!(!compile("{ type: duration, max: 100ms }").reads_body());
+        assert!(!compile("{ type: header, header: content-type, exists: true }").reads_body());
+        assert!(!compile("{ type: protobuf_field, field: code, equals: 0 }").reads_body());
+
+        // Everything else does (including `js`, since we can't know in
+        // advance whether the expression touches `response.body`).
+        assert!(compile("{ type: body_contains, value: x }").reads_body());
+        assert!(compile(r#"{ type: body_matches, pattern: "x" }"#).reads_body());
+        assert!(compile(r#"{ type: jsonpath, expression: "$.x" }"#).reads_body());
+        assert!(compile(r#"{ type: xpath, expression: "//x" }"#).reads_body());
+        assert!(compile("{ type: size, max: 10 }").reads_body());
+        assert!(compile(r#"{ type: js, expression: "true" }"#).reads_body());
     }
 }

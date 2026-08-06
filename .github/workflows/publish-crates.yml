@@ -36,7 +36,7 @@ jobs:
         with: { egress-policy: audit }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with: { toolchain: stable, targets: wasm32-wasip2 }
+        with: { toolchain: stable }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Publish (dependency order)
         env:
@@ -51,14 +51,11 @@ jobs:
           ORDER=(
             loadr-config
             loadr-core
-            loadr-convert
-            loadr-js
-            loadr-outputs
-            loadr-plugin-api
-            loadr-protocols
-            loadr-plugin-webui
+            loadr-grpc
+            loadr-feeder-api
+            loadr-prometheus
             loadr-agent
-            loadr-browser
+            loadr-webui
             loadr-cli
           )
 

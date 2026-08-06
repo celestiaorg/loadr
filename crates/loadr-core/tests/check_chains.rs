@@ -5,6 +5,9 @@
 //! and on the run summary's `checks` (proving inline chain validation is
 //! recorded like a standalone check).
 
+#[path = "support/grpc_fixture.rs"]
+mod grpc_fixture;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,7 +26,7 @@ struct JsonHandler {
 #[async_trait]
 impl ProtocolHandler for JsonHandler {
     fn name(&self) -> &str {
-        "http"
+        "grpc"
     }
     async fn execute(
         &self,
@@ -33,7 +36,7 @@ impl ProtocolHandler for JsonHandler {
         self.urls.lock().push(request.url.clone());
         Ok(ProtocolResponse {
             status: 200,
-            protocol_version: "HTTP/1.1".into(),
+            protocol_version: "gRPC".into(),
             url: request.url.clone(),
             body: Bytes::from_static(self.body.as_bytes()),
             headers: vec![("X-Token".into(), "  raw-token  ".into())],
@@ -45,7 +48,7 @@ impl ProtocolHandler for JsonHandler {
 fn registry(handler: Arc<JsonHandler>) -> ProtocolRegistry {
     let mut reg = ProtocolRegistry::new();
     reg.register(handler);
-    reg.register_alias("https", "http");
+    reg.register_alias("grpcs", "grpc");
     reg
 }
 
@@ -63,7 +66,7 @@ async fn run_with(body: &'static str, yaml: &str) -> (loadr_core::RunResult, Arc
         body,
         urls: parking_lot::Mutex::new(Vec::new()),
     });
-    let loaded = loadr_config::load_str(yaml, &loadr_config::LoadOptions::new()).expect("parse");
+    let loaded = grpc_fixture::load(yaml);
     let engine = Engine::new(
         loaded.plan,
         std::path::PathBuf::from("."),

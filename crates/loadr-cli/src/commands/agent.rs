@@ -36,12 +36,20 @@ pub struct AgentArgs {
     /// Override the TLS server name
     #[arg(long)]
     pub tls_domain: Option<String>,
+    /// Tokio worker threads for the agent (default: number of CPUs)
+    #[arg(long, env = "LOADR_WORKER_THREADS")]
+    pub worker_threads: Option<usize>,
+    /// Directory containing locally installed feeder plugins.
+    #[arg(long, env = "LOADR_PLUGINS_DIR")]
+    pub plugins_dir: Option<PathBuf>,
 }
 
 pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = args.worker_threads {
+        builder.worker_threads(n.max(1));
+    }
+    let runtime = builder.enable_all().build()?;
     runtime.block_on(async move {
         let mut labels = HashMap::new();
         for label in &args.label {
@@ -62,22 +70,35 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
             std::env::var("HOSTNAME").unwrap_or_else(|_| "loadr-agent".to_string())
         });
 
-        // Real protocol and JS factories.
-        let protocols: loadr_agent::ProtocolFactory = Arc::new(|http_defaults, base_dir| {
-            let mut registry = loadr_protocols::builtin_registry(http_defaults, base_dir)
-                .map_err(|e| e.to_string())?;
-            // Browser protocol (headless Chrome via CDP); lazy until first use.
-            registry.register(Arc::new(
-                loadr_browser::BrowserHandler::from_config(http_defaults)
-                    .map_err(|e| e.to_string())?,
-            ));
-            Ok(registry)
+        // Every agent has the same gRPC transport surface.
+        let protocols: loadr_agent::ProtocolFactory = Arc::new(|plan, base_dir| {
+            loadr_grpc::builtin_registry(&plan.defaults.http, base_dir).map_err(|e| e.to_string())
         });
-        let script: loadr_agent::ScriptFactory = Arc::new(|js_config, base_dir| {
-            loadr_js::JsEngine::new(js_config, base_dir)
-                .map(|e| Arc::new(e) as Arc<dyn loadr_core::ScriptEngine>)
-                .map_err(|e| e.to_string())
-        });
+        // Data-source plugins declared in the plan. The controller ships no
+        // plugin binaries: they resolve on this host from LOADR_PLUGINS_DIR
+        // or ~/.loadr/plugins (or an explicit `path:` in the plan).
+        let plugins_dir = args
+            .plugins_dir
+            .clone()
+            .unwrap_or_else(loadr_feeder_api::default_plugins_dir);
+        let data_sources: loadr_agent::DataSourceFactory =
+            Arc::new(move |plugin_refs, base_dir| {
+                let mut sources: HashMap<String, Box<dyn loadr_core::DataSourcePlugin>> =
+                    HashMap::new();
+                for plugin_ref in plugin_refs {
+                    if !plugin_ref.enabled {
+                        continue;
+                    }
+                    let data_source = loadr_feeder_api::PluginRegistry::load_ref(
+                        plugin_ref,
+                        &plugins_dir,
+                        base_dir,
+                    )
+                    .map_err(|e| format!("plugin `{}`: {e}", plugin_ref.name))?;
+                    sources.insert(plugin_ref.name.clone(), data_source);
+                }
+                Ok(sources)
+            });
 
         let config = loadr_agent::AgentConfig {
             controller_addr: controller_addr.clone(),
@@ -93,7 +114,8 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
             work_dir: args.work_dir.clone(),
             deps: loadr_agent::RunnerDeps {
                 protocols,
-                script: Some(script),
+                script: None,
+                data_sources: Some(data_sources),
             },
         };
 

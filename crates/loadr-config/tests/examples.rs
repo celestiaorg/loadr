@@ -30,8 +30,5 @@ fn all_examples_validate() {
         );
         checked += 1;
     }
-    assert!(
-        checked >= 10,
-        "expected at least 10 examples, found {checked}"
-    );
+    assert_eq!(checked, 3, "expected the three focused gRPC examples");
 }

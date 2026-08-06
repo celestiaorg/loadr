@@ -1,0 +1,48 @@
+[package]
+name = "loadr-grpc"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Dynamic gRPC load generation with all four RPC call shapes"
+
+[dependencies]
+loadr-core = { workspace = true }
+loadr-config = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+pin-project-lite = { workspace = true }
+
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+prost-reflect = { workspace = true }
+protox = { workspace = true }
+# Exact-versioned addition for this crate only (matches tonic 0.14): generated
+# gRPC server-reflection client used for `reflection: true` descriptor sources.
+tonic-reflection = "0.14"
+
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+loadr-testserver = { workspace = true }
+parking_lot = { workspace = true }
+tempfile = { workspace = true }
+indexmap = { workspace = true }
+base64 = { workspace = true }

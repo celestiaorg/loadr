@@ -11,56 +11,26 @@ use crate::threshold::{MetricSelector, ThresholdExpr};
 /// Options controlling validation strictness.
 #[derive(Debug, Clone, Default)]
 pub struct ValidateOptions {
-    /// Check that referenced files (CSV data, proto files, body files, JS files)
+    /// Check that referenced CSV/JSON/protobuf and secret files
     /// exist on disk, resolving relative paths against this directory.
     pub check_files_relative_to: Option<std::path::PathBuf>,
 }
 
 /// Built-in metric names usable in thresholds besides custom metrics.
 pub const BUILTIN_METRICS: &[&str] = &[
-    "http_reqs",
-    "http_req_duration",
-    "http_req_blocked",
-    "http_req_connecting",
-    "http_req_tls_handshaking",
-    "http_req_sending",
-    "http_req_waiting",
-    "http_req_receiving",
+    "grpc_reqs",
+    "grpc_req_duration",
     "http_req_failed",
     "iterations",
     "iteration_duration",
     "dropped_iterations",
     "vus",
     "vus_max",
+    "requests_in_flight",
     "checks",
     "faults_injected",
     "data_sent",
     "data_received",
-    "ws_connecting",
-    "ws_session_duration",
-    "ws_msgs_sent",
-    "ws_msgs_received",
-    "grpc_req_duration",
-    "tcp_req_duration",
-    "udp_req_duration",
-    "graphql_req_duration",
-];
-
-const KNOWN_PROTOCOLS: &[&str] = &[
-    "http",
-    "https",
-    "ws",
-    "websocket",
-    "grpc",
-    "graphql",
-    "sse",
-    "sses",
-    "browser",
-    "tcp",
-    "udp",
-];
-const HTTP_METHODS: &[&str] = &[
-    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT",
 ];
 
 /// Validate a plan, locating diagnostics against the original source when given.
@@ -81,31 +51,14 @@ pub fn validate(plan: &TestPlan, source: Option<&str>, opts: &ValidateOptions) -
         .scenarios
         .values()
         .any(|s| s.exec.is_some() || s.flow.iter().any(step_uses_js));
-    if needs_js && plan.js.is_none() {
-        // Inline `js:` snippets work without a module, but `exec:` does not.
-        let exec_users: Vec<&str> = plan
-            .scenarios
-            .iter()
-            .filter(|(_, s)| s.exec.is_some())
-            .map(|(n, _)| n.as_str())
-            .collect();
-        if !exec_users.is_empty() {
-            ctx.error(
-                format!("scenarios.{}.exec", exec_users[0]),
-                "`exec` names a JS function, but the test has no `js:` block",
-            );
-        }
+    if needs_js {
+        ctx.error(
+            "scenarios",
+            "JavaScript steps, hooks, expressions, and conditions are not supported",
+        );
     }
-    if let Some(js) = &plan.js {
-        if js.file.is_some() && js.script.is_some() {
-            ctx.error("js", "set either `js.file` or `js.script`, not both");
-        }
-        if js.file.is_none() && js.script.is_none() {
-            ctx.warning("js", "`js:` block is empty (no `file` or `script`)");
-        }
-        if let Some(f) = &js.file {
-            ctx.check_file("js.file", f);
-        }
+    if plan.js.is_some() {
+        ctx.error("js", "JavaScript support was removed from this build");
     }
 
     // Secrets must name a source.
@@ -143,6 +96,26 @@ pub fn validate(plan: &TestPlan, source: Option<&str>, opts: &ValidateOptions) -
             DataSource::Inline { rows, .. } => {
                 if rows.is_empty() {
                     ctx.error(format!("data.{name}.rows"), "inline data has no rows");
+                }
+            }
+            DataSource::Plugin { source, .. } => {
+                if source.is_empty() {
+                    ctx.error(
+                        format!("data.{name}.source"),
+                        "plugin data source needs a `source` plugin name",
+                    );
+                } else if !ctx.plan.plugins.iter().any(|p| &p.name == source) {
+                    ctx.push(
+                        Diagnostic::error(
+                            format!("data.{name}.source"),
+                            format!(
+                                "data source references plugin `{source}` which is not listed under `plugins:`"
+                            ),
+                        )
+                        .with_suggestion(
+                            "declare the plugin under `plugins:`; it must provide the data_source capability",
+                        ),
+                    );
                 }
             }
         }
@@ -224,56 +197,10 @@ pub fn validate(plan: &TestPlan, source: Option<&str>, opts: &ValidateOptions) -
     }
 
     // Thresholds.
-    // Protocol plugins emit a `<name>_reqs` / `<name>_req_duration` /
-    // `<name>_docs` / `<name>_rows` metric family derived from the plugin
-    // handler name, so a declared plugin makes those metric names valid
-    // threshold targets (`_docs` for Mongo-style document counts, `_rows` for
-    // SQL row counts).
-    let plugin_metrics: BTreeSet<String> = plan
-        .plugins
-        .iter()
-        .flat_map(|p| {
-            [
-                format!("{}_reqs", p.name),
-                format!("{}_req_duration", p.name),
-                format!("{}_docs", p.name),
-                format!("{}_rows", p.name),
-            ]
-        })
-        .collect();
-    // Observe sources feed the run's metric space too: named external series
-    // (`as:`) and the system sampler's `<prefix>_{cpu,memory,disk_io,network}`
-    // family are valid threshold targets.
-    let observe_metrics: BTreeSet<String> = plan
-        .observe
-        .iter()
-        .flat_map(|o| match o {
-            crate::ObserveConfig::Prometheus {
-                name,
-                as_name,
-                query,
-                ..
-            } => {
-                vec![as_name
-                    .clone()
-                    .or_else(|| name.clone())
-                    .unwrap_or_else(|| query.clone())]
-            }
-            crate::ObserveConfig::System { as_prefix, .. } => {
-                let prefix = as_prefix.clone().unwrap_or_else(|| "system".to_string());
-                ["cpu", "memory", "disk_io", "network"]
-                    .iter()
-                    .map(|m| format!("{prefix}_{m}"))
-                    .collect()
-            }
-        })
-        .collect();
     let known_metrics: BTreeSet<&str> = BUILTIN_METRICS
         .iter()
         .copied()
         .chain(plan.metrics.keys().map(|s| s.as_str()))
-        .chain(plugin_metrics.iter().map(|s| s.as_str()))
-        .chain(observe_metrics.iter().map(|s| s.as_str()))
         .collect();
     for (selector_str, list) in &plan.thresholds {
         let path = format!("thresholds.{selector_str}");
@@ -322,10 +249,6 @@ pub fn validate(plan: &TestPlan, source: Option<&str>, opts: &ValidateOptions) -
                     }
                 }
             }
-            OutputConfig::Influxdb { url: u, .. } if url::Url::parse(u).is_err() => {
-                ctx.error(format!("{path}.url"), "invalid URL");
-            }
-            _ => {}
         }
     }
 
@@ -587,34 +510,42 @@ impl Ctx<'_> {
             }
         }
         if let Some(protocol) = &req.protocol {
-            if !KNOWN_PROTOCOLS.contains(&protocol.as_str())
-                && !self.plan.plugins.iter().any(|p| &p.name == protocol)
-            {
-                let mut d = Diagnostic::error(
+            if protocol != "grpc" {
+                self.error(
                     format!("{rpath}.protocol"),
-                    format!("unknown protocol `{protocol}`"),
+                    format!("only `grpc` is supported, not `{protocol}`"),
                 );
-                if let Some(s) = did_you_mean(protocol, KNOWN_PROTOCOLS.iter().copied()) {
-                    d = d.with_suggestion(s);
-                } else {
-                    d = d.with_suggestion(
-                        "built-in protocols: http, ws, grpc, graphql, tcp, udp — or list a protocol plugin under `plugins:`",
-                    );
-                }
-                self.push(d);
             }
         }
-        if let Some(m) = &req.method {
-            let upper = m.to_ascii_uppercase();
-            if !HTTP_METHODS.contains(&upper.as_str()) {
-                let mut d = Diagnostic::warning(
-                    format!("{rpath}.method"),
-                    format!("non-standard HTTP method `{m}`"),
+        if req.protocol.is_none()
+            && !req.url.starts_with("grpc://")
+            && !req.url.starts_with("grpcs://")
+        {
+            self.error(
+                format!("{rpath}.url"),
+                "gRPC request URLs must start with `grpc://` or `grpcs://`",
+            );
+        }
+        if req.grpc.is_none() {
+            self.error(format!("{rpath}.grpc"), "request needs a `grpc:` block");
+        }
+        for (field, present) in [
+            ("method", req.method.is_some()),
+            ("params", !req.params.is_empty()),
+            ("body", req.body.is_some()),
+            ("follow_redirects", req.follow_redirects.is_some()),
+            ("ws", req.ws.is_some()),
+            ("graphql", req.graphql.is_some()),
+            ("socket", req.socket.is_some()),
+            ("sse", req.sse.is_some()),
+            ("sql", req.sql.is_some()),
+            ("plugin", req.plugin.is_some()),
+        ] {
+            if present {
+                self.error(
+                    format!("{rpath}.{field}"),
+                    format!("`{field}` is not part of a gRPC request"),
                 );
-                if let Some(s) = did_you_mean(&upper, HTTP_METHODS.iter().copied()) {
-                    d = d.with_suggestion(s);
-                }
-                self.push(d);
             }
         }
         if let Some(Body::Spec(spec)) = &req.body {
@@ -666,6 +597,20 @@ impl Ctx<'_> {
                     format!("{rpath}.grpc"),
                     "set `message` (unary) or `messages` (streaming), not both",
                 );
+            }
+            if let Some(message) = &grpc.message {
+                self.check_json_templates(&format!("{rpath}.grpc.message"), message);
+            }
+            for (index, message) in grpc.messages.iter().enumerate() {
+                self.check_json_templates(&format!("{rpath}.grpc.messages[{index}]"), message);
+            }
+            for (key, value) in &grpc.metadata {
+                if let Err(error) = Template::parse(value) {
+                    self.error(format!("{rpath}.grpc.metadata.{key}"), error.to_string());
+                }
+            }
+            if grpc.channel_pool_size == Some(0) {
+                self.error(format!("{rpath}.grpc"), "`channel_pool_size` must be >= 1");
             }
         }
         if let Some(sock) = &req.socket {
@@ -726,56 +671,110 @@ impl Ctx<'_> {
             }
             declared.insert(ex.name().to_string());
         }
-        for (ci, cond) in req.assert.iter().chain(req.checks.iter()).enumerate() {
-            let cpath = format!("{rpath}.assert_or_check[{ci}]");
-            match cond {
-                Condition::BodyMatches { pattern, .. } => {
-                    if let Err(e) = regex::Regex::new(pattern) {
-                        self.error(cpath, format!("invalid regex: {e}"));
-                    }
-                }
-                Condition::Status {
-                    equals,
-                    one_of,
-                    matches,
-                    ..
-                } => {
-                    if equals.is_none() && one_of.is_none() && matches.is_none() {
-                        self.error(
-                            cpath.clone(),
-                            "status condition needs `equals`, `one_of` or `matches`",
-                        );
-                    }
-                    if let Some(m) = matches {
-                        if let Err(e) = regex::Regex::new(m) {
+        for (section, conditions) in [("assert", &req.assert), ("checks", &req.checks)] {
+            for (ci, cond) in conditions.iter().enumerate() {
+                let cpath = format!("{rpath}.{section}[{ci}]");
+                match cond {
+                    Condition::BodyMatches { pattern, .. } => {
+                        if let Err(e) = regex::Regex::new(pattern) {
                             self.error(cpath, format!("invalid regex: {e}"));
                         }
                     }
-                }
-                Condition::Jsonpath { expression, .. } => {
-                    if serde_json_path::JsonPath::parse(expression).is_err() {
-                        self.error(cpath, format!("invalid JSONPath `{expression}`"));
+                    Condition::Status {
+                        equals,
+                        one_of,
+                        matches,
+                        ..
+                    } => {
+                        if equals.is_none() && one_of.is_none() && matches.is_none() {
+                            self.error(
+                                cpath.clone(),
+                                "status condition needs `equals`, `one_of` or `matches`",
+                            );
+                        }
+                        if let Some(m) = matches {
+                            if let Err(e) = regex::Regex::new(m) {
+                                self.error(cpath, format!("invalid regex: {e}"));
+                            }
+                        }
                     }
-                }
-                Condition::Size {
-                    min, max, equals, ..
-                } => {
-                    if min.is_none() && max.is_none() && equals.is_none() {
-                        self.error(cpath, "size condition needs `min`, `max` or `equals`");
+                    Condition::Jsonpath { expression, .. } => {
+                        if serde_json_path::JsonPath::parse(expression).is_err() {
+                            self.error(cpath, format!("invalid JSONPath `{expression}`"));
+                        }
                     }
+                    Condition::ProtobufField {
+                        field,
+                        equals,
+                        exists,
+                        failure_groups,
+                        ..
+                    } => {
+                        if req.grpc.is_none() {
+                            self.error(
+                                cpath.clone(),
+                                "protobuf_field conditions require a gRPC request",
+                            );
+                        }
+                        if field.is_empty() || field.contains('.') {
+                            self.error(
+                                cpath.clone(),
+                                "protobuf_field `field` must be a non-empty top-level protobuf field name",
+                            );
+                        }
+                        if equals.is_none() && exists.is_none() {
+                            self.error(
+                                cpath.clone(),
+                                "protobuf_field condition needs `equals` or `exists`",
+                            );
+                        }
+                        if equals.is_some() && exists == &Some(false) {
+                            self.error(
+                                cpath.clone(),
+                                "protobuf_field cannot combine `equals` with `exists: false`",
+                            );
+                        }
+                        if let Some(groups) = failure_groups {
+                            if section == "assert" {
+                                self.error(
+                                    cpath.clone(),
+                                    "protobuf_field `failure_groups` is only valid under `checks`",
+                                );
+                            }
+                            if groups.is_empty() {
+                                self.error(
+                                    cpath.clone(),
+                                    "protobuf_field `failure_groups` must not be empty",
+                                );
+                            }
+                            if groups.values().any(|label| label.trim().is_empty()) {
+                                self.error(
+                                    cpath.clone(),
+                                    "protobuf_field failure-group labels must not be empty",
+                                );
+                            }
+                        }
+                    }
+                    Condition::Size {
+                        min, max, equals, ..
+                    } => {
+                        if min.is_none() && max.is_none() && equals.is_none() {
+                            self.error(cpath, "size condition needs `min`, `max` or `equals`");
+                        }
+                    }
+                    Condition::Header {
+                        equals,
+                        contains,
+                        exists,
+                        ..
+                    } if equals.is_none() && contains.is_none() && exists.is_none() => {
+                        self.error(
+                            cpath,
+                            "header condition needs `equals`, `contains` or `exists`",
+                        );
+                    }
+                    _ => {}
                 }
-                Condition::Header {
-                    equals,
-                    contains,
-                    exists,
-                    ..
-                } if equals.is_none() && contains.is_none() && exists.is_none() => {
-                    self.error(
-                        cpath,
-                        "header condition needs `equals`, `contains` or `exists`",
-                    );
-                }
-                _ => {}
             }
         }
     }
@@ -902,6 +901,27 @@ impl Ctx<'_> {
         }
     }
 
+    fn check_json_templates(&mut self, path: &str, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::String(value) => {
+                if let Err(error) = Template::parse(value) {
+                    self.error(path.to_string(), error.to_string());
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    self.check_json_templates(&format!("{path}[{index}]"), value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    self.check_json_templates(&format!("{path}.{key}"), value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Warn about references that cannot resolve at runtime.
     fn check_expr_reference(&mut self, path: &str, expr: &str, declared: &BTreeSet<String>) {
         if let Some(rest) = expr.strip_prefix("vars.") {
@@ -983,9 +1003,139 @@ scenarios:
     vus: 5
     duration: 30s
     flow:
-      - request: { url: https://example.com/ }
+      - request:
+          url: grpc://example.com:443
+          grpc: { reflection: true, service: test.Service, method: Call }
 "#;
         assert!(errors(yaml).is_empty());
+    }
+
+    #[test]
+    fn protobuf_field_check_configuration_is_backward_compatible_and_validated() {
+        let valid = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+          checks:
+            - type: protobuf_field
+              name: admission_accepted
+              field: code
+              equals: 0
+              failure_groups: { 18: WrongShard, 20: PoolAtCapacity }
+"#;
+        assert!(errors(valid).is_empty(), "{:?}", errors(valid));
+
+        let invalid = valid
+            .replace("checks:", "assert:")
+            .replace("field: code", "field: nested.code")
+            .replace("equals: 0", "exists: false");
+        let diagnostics = errors(&invalid);
+        assert!(diagnostics.iter().any(|d| d.message.contains("top-level")));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.message.contains("only valid under `checks`")));
+
+        let nongrpc = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          url: https://example.com
+          checks:
+            - { type: protobuf_field, field: code, equals: 0 }
+"#;
+        assert!(errors(nongrpc)
+            .iter()
+            .any(|d| d.message.contains("require a gRPC request")));
+    }
+
+    #[test]
+    fn grpc_message_and_metadata_templates_are_validated() {
+        let yaml = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+            message: { nested: [ok, "${unterminated"] }
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: ClientStreamEcho
+            messages: [ { message: ok }, { message: "${}" } ]
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+            metadata: { x-token: "${missing" }
+"#;
+        let diags = errors(yaml);
+        let paths: Vec<_> = diags.iter().map(|diag| diag.path.as_str()).collect();
+        assert!(
+            paths.contains(&"scenarios.s.flow[0].request.grpc.message.nested[1]"),
+            "{diags:?}"
+        );
+        assert!(
+            paths.contains(&"scenarios.s.flow[1].request.grpc.messages[1].message"),
+            "{diags:?}"
+        );
+        assert!(
+            paths.contains(&"scenarios.s.flow[2].request.grpc.metadata.x-token"),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn valid_grpc_templates_are_accepted() {
+        let yaml = r#"
+variables: { token: secret }
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+            message:
+              text: "héllo ${vars.token}"
+              escaped: "$${literal}"
+              nested: [1, true, { value: "${vu}" }]
+            metadata: { x-token: "Bearer ${vars.token}" }
+"#;
+        assert!(errors(yaml).is_empty(), "{:?}", errors(yaml));
     }
 
     #[test]
@@ -1047,7 +1197,9 @@ scenarios:
       drop_rate: 0.0
       drop_mode: after_response
     flow:
-      - request: { url: https://example.com/ }
+      - request:
+          url: grpc://example.com:443
+          grpc: { reflection: true, service: test.Service, method: Call }
 "#;
         assert!(errors(yaml).is_empty(), "{:?}", errors(yaml));
     }
@@ -1086,6 +1238,26 @@ scenarios:
       - request: { url: https://example.com/ }
 thresholds:
   faults_injected: "count<100"
+"#;
+        let diags = validate(&plan_of(yaml), Some(yaml), &ValidateOptions::default());
+        assert!(
+            diags.iter().all(|d| !d.path.starts_with("thresholds")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn requests_in_flight_is_a_known_threshold_metric() {
+        let yaml = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request: { url: https://example.com/ }
+thresholds:
+  requests_in_flight: "value<10"
 "#;
         let diags = validate(&plan_of(yaml), Some(yaml), &ValidateOptions::default());
         assert!(
@@ -1165,7 +1337,8 @@ scenarios:
     duration: 1s
     flow:
       - request:
-          url: https://example.com/
+          url: grpc://example.com:443
+          grpc: { reflection: true, service: test.Service, method: Call }
           extract:
             - chain: cheapest
               jmespath: "items[?price > `10`] | [0].name"
@@ -1173,7 +1346,12 @@ scenarios:
               transform: [trim, lowercase]
               check: { not_empty: true }
       - request:
-          url: "https://example.com/use?n=${cheapest}"
+          url: "grpc://example.com:443"
+          grpc:
+            reflection: true
+            service: test.Service
+            method: Call
+            message: { value: "${cheapest}" }
 "#;
         let plan = plan_of(yaml);
         let diags = validate(&plan, Some(yaml), &ValidateOptions::default());
@@ -1263,39 +1441,17 @@ thresholds:
 scenarios:
   s: { executor: constant-vus, vus: 1, duration: 1s, flow: [ { request: { url: https://e.com/ } } ] }
 thresholds:
-  http_req_durations: [ "p(95)<400" ]
+  grpc_req_durations: [ "p(95)<400" ]
 "#;
         let plan = plan_of(yaml);
         let diags = validate(&plan, Some(yaml), &ValidateOptions::default());
         let d = diags
             .iter()
-            .find(|d| d.severity == Severity::Warning && d.path.contains("http_req_durations"))
+            .find(|d| d.severity == Severity::Warning && d.path.contains("grpc_req_durations"))
             .expect("warning");
         assert_eq!(
             d.suggestion.as_deref(),
-            Some("did you mean `http_req_duration`?")
-        );
-    }
-
-    #[test]
-    fn plugin_family_threshold_metric_does_not_warn() {
-        // A declared protocol plugin makes `<name>_reqs`/`_req_duration`/`_docs`
-        // valid threshold targets (no "unknown metric" warning).
-        let yaml = r#"
-plugins: [ { name: mongo } ]
-scenarios:
-  s: { executor: constant-vus, vus: 1, duration: 1s, flow: [ { request: { url: "mongodb://h/db", protocol: mongo } } ] }
-thresholds:
-  mongo_req_duration: [ "p(95)<300ms" ]
-  mongo_docs: [ "count>0" ]
-"#;
-        let plan = plan_of(yaml);
-        let diags = validate(&plan, Some(yaml), &ValidateOptions::default());
-        assert!(
-            !diags
-                .iter()
-                .any(|d| d.path.contains("mongo_req_duration") || d.path.contains("mongo_docs")),
-            "plugin-family metrics must not warn: {diags:?}"
+            Some("did you mean `grpc_req_duration`?")
         );
     }
 
@@ -1314,5 +1470,57 @@ scenarios:
         };
         let diags = validate(&plan, Some(yaml), &opts);
         assert!(diags.iter().any(|d| d.message.contains("file not found")));
+    }
+
+    #[test]
+    fn plugin_data_source_needs_declared_plugin() {
+        let yaml = r#"
+data:
+  signed_tx: { type: plugin, source: tx-signer }
+scenarios:
+  s: { executor: constant-vus, vus: 1, duration: 1s, flow: [ { request: { url: https://e.com/ } } ] }
+"#;
+        let diags = errors(yaml);
+        assert!(diags.iter().any(|d| d.path == "data.signed_tx.source"
+            && d.message.contains("not listed under `plugins:`")));
+    }
+
+    #[test]
+    fn plugin_data_source_with_empty_source_name() {
+        let yaml = r#"
+data:
+  signed_tx: { type: plugin, source: "" }
+scenarios:
+  s: { executor: constant-vus, vus: 1, duration: 1s, flow: [ { request: { url: https://e.com/ } } ] }
+"#;
+        let diags = errors(yaml);
+        assert!(diags
+            .iter()
+            .any(|d| d.path == "data.signed_tx.source" && d.message.contains("needs a `source`")));
+    }
+
+    #[test]
+    fn plugin_data_source_with_declared_plugin_is_valid() {
+        let yaml = r#"
+plugins:
+  - { name: tx-signer, path: ./libtx_signer.so }
+data:
+  signed_tx: { type: plugin, source: tx-signer, config: { chain_id: testnet-1 } }
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          url: grpc://e.com:443
+          grpc:
+            reflection: true
+            service: test.Service
+            method: Call
+            message: { value: "${data.signed_tx.tx_b64}" }
+"#;
+        let diags = errors(yaml);
+        assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
     }
 }

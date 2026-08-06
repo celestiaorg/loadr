@@ -1,66 +1,40 @@
-# Feeder strategies & throttling
+# Feeder plugins and throttling
 
-Two more features borrowed from Gatling: feeder *strategies* (how rows are
-chosen) and a *throttle* (a hard request-rate ceiling).
-
-## Pick strategies
-
-Any CSV, JSON or inline data source takes a `pick` strategy alongside its
-`mode` (shared/per-VU) and `on_eof` (recycle/stop):
+Memory-backed data sources support CSV, JSON arrays, and inline rows. Native
+feeders cover values that must be generated immediately before a request, such
+as signed or timestamped transactions.
 
 ```yaml
+plugins:
+  - name: tx-signer
+    path: ../target/release/libsigned_tx_feeder.so
+    config: { seed: 7 }
+
 data:
-  users:
-    type: csv
-    path: data/users.csv
-    mode: per_vu
-    pick: shuffle       # sequential (default) | random | shuffle
-    on_eof: recycle
+  signed:
+    type: plugin
+    source: tx-signer
+    config: { chain_id: testnet }
 ```
 
-| `pick` | Behaviour |
-|---|---|
-| `sequential` | rows in file order; the cursor advances by one (default) — Gatling circular |
-| `random` | a uniformly random row every time; never exhausts (`on_eof` ignored) — Gatling random |
-| `shuffle` | the full set shuffled once per VU, then read in that order — Gatling shuffle |
-
-## JSON feeders
-
-Besides CSV and inline rows, a data source can be a JSON file — an array of
-objects, each object a row:
+Use generated fields like ordinary data:
 
 ```yaml
-data:
-  skus:
-    type: json
-    path: data/skus.json    # [ { "sku": "W-1", "name": "Widget" }, ... ]
-    pick: random
+message: { transaction: "${data.signed.tx_b64}" }
 ```
 
-Reference fields the same way: `${data.skus.sku}`.
+Each call receives run, agent instance, partition, VU, iteration, per-source
+sequence, scenario, request, and timestamp identity. `next_row` may be called
+concurrently and should avoid global locks on its hot path.
 
-## Throttling (request-rate ceiling)
+Build the reference feeder with:
 
-A scenario can cap its aggregate request rate regardless of how many VUs are
-running or how fast the target responds — Gatling's `throttle` /
-`reachRps(...)`. Iterations block before each request until a slot frees up
-(a global token-bucket limiter shared across all the scenario's VUs).
-
-```yaml
-scenarios:
-  steady:
-    executor: constant-vus
-    vus: 50
-    duration: 10m
-    throttle: { requests_per_second: 200 }   # never exceed 200 req/s in total
-    flow:
-      - request: { url: /api/items }
+```bash
+cargo build -p loadr-example-signed-tx-feeder --release
 ```
 
-This is distinct from the arrival-rate executors (which control *iteration*
-starts) and from `pacing` (which spaces iterations): `throttle` is a ceiling on
-*requests* that applies on top of whatever executor you choose. Use it to stay
-under a known rate limit, or to hold a flat load while a closed model would
-otherwise overshoot.
+Agents load feeders locally. Point each agent at the same installation root
+with `loadr agent --plugins-dir /opt/loadr/feeders ...`.
 
-See `examples/17-feeders-and-throttle.yaml`.
+`throttle: { requests_per_second: 200 }` remains available per scenario and
+caps aggregate request starts independently of the executor model.

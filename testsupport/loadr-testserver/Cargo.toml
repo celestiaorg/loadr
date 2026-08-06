@@ -4,35 +4,19 @@ version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-description = "In-process echo servers (HTTP/HTTPS, WebSocket, gRPC, TCP, UDP) for loadr integration tests"
+description = "In-process four-shape gRPC echo server for loadr integration tests"
 publish = false
 
 [dependencies]
 tokio = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true }
-bytes = { workspace = true }
-axum = { workspace = true }
-tokio-tungstenite = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 futures = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-flate2 = { workspace = true }
-cookie = { workspace = true }
-rand = { workspace = true }
 tracing = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
-base64 = { workspace = true }
 thiserror = { workspace = true }
-tower = { workspace = true }
 # Exact-versioned addition for this crate only (matches tonic 0.14).
 tonic-reflection = "0.14"
 

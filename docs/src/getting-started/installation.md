@@ -22,9 +22,8 @@ you can verify with `gh attestation verify`.
 cargo install --git https://github.com/levantar-ai/loadr loadr-cli
 ```
 
-Rust 1.85+ is required. There are **no system dependencies** — protobuf
-compilation happens in-process (protox), TLS is rustls, and the JS engine
-(QuickJS) is compiled in.
+Rust 1.85+ is required. Protobuf compilation happens in-process with protox
+and TLS uses rustls, so no system `protoc` or OpenSSL installation is needed.
 
 ## Shell completions
 

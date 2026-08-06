@@ -3,13 +3,18 @@
 //! mock protocol handler. (JS-condition while/if coverage lives in the CLI
 //! e2e suite, which wires the real QuickJS engine.)
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/grpc_fixture.rs"]
+mod grpc_fixture;
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use loadr_core::{
-    Engine, EngineOptions, PreparedRequest, ProtocolError, ProtocolHandler, ProtocolRegistry,
-    ProtocolResponse, VuContext,
+    DataSourcePlugin, Engine, EngineOptions, PluginRowCtx, PluginRowResult, PreparedRequest,
+    ProtocolError, ProtocolHandler, ProtocolRegistry, ProtocolResponse, Tags, VuContext,
 };
 
 /// A protocol handler that records every request URL and returns 200.
@@ -22,7 +27,7 @@ struct RecordingHandler {
 #[async_trait]
 impl ProtocolHandler for RecordingHandler {
     fn name(&self) -> &str {
-        "http"
+        "grpc"
     }
     async fn execute(
         &self,
@@ -33,7 +38,72 @@ impl ProtocolHandler for RecordingHandler {
         self.urls.lock().push(request.url.clone());
         Ok(ProtocolResponse {
             status: 200,
-            protocol_version: "HTTP/1.1".into(),
+            protocol_version: "gRPC".into(),
+            url: request.url.clone(),
+            ..Default::default()
+        })
+    }
+}
+
+struct BlockingHandler {
+    started: AtomicU64,
+    completed: AtomicU64,
+    released: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+impl BlockingHandler {
+    fn new() -> Arc<Self> {
+        Arc::new(BlockingHandler {
+            started: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            released: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn wait_started(&self) {
+        loop {
+            let started = self.started_notify.notified();
+            if self.started.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            started.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl ProtocolHandler for BlockingHandler {
+    fn name(&self) -> &str {
+        "grpc"
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut VuContext,
+        request: &PreparedRequest,
+    ) -> Result<ProtocolResponse, ProtocolError> {
+        self.started.fetch_add(1, Ordering::Release);
+        self.started_notify.notify_waiters();
+        loop {
+            let released = self.release_notify.notified();
+            if self.released.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(ProtocolResponse {
+            status: 200,
+            protocol_version: "gRPC".into(),
             url: request.url.clone(),
             ..Default::default()
         })
@@ -43,12 +113,56 @@ impl ProtocolHandler for RecordingHandler {
 fn registry(handler: Arc<RecordingHandler>) -> ProtocolRegistry {
     let mut reg = ProtocolRegistry::new();
     reg.register(handler);
-    reg.register_alias("https", "http");
+    reg.register_alias("grpcs", "grpc");
     reg
 }
 
+fn engine_with_handler<H>(
+    yaml: &str,
+    handler: Arc<H>,
+    snapshot_interval: Duration,
+) -> loadr_core::Engine
+where
+    H: ProtocolHandler + 'static,
+{
+    let loaded = grpc_fixture::load(yaml);
+    let mut reg = ProtocolRegistry::new();
+    reg.register(handler);
+    Engine::new(
+        loaded.plan,
+        std::path::PathBuf::from("."),
+        EngineOptions {
+            protocols: reg,
+            snapshot_interval,
+            ..Default::default()
+        },
+    )
+    .expect("engine")
+}
+
+struct SeqPlugin;
+
+impl DataSourcePlugin for SeqPlugin {
+    fn name(&self) -> &str {
+        "signer"
+    }
+
+    fn init(
+        &mut self,
+        _source_configs: &indexmap::IndexMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String> {
+        let mut row = loadr_core::data::Row::new();
+        row.insert("seq".to_string(), ctx.seq.to_string());
+        Ok(PluginRowResult::Row(row))
+    }
+}
+
 async fn run(yaml: &str, handler: Arc<RecordingHandler>) -> loadr_core::RunResult {
-    let loaded = loadr_config::load_str(yaml, &loadr_config::LoadOptions::new()).expect("parse");
+    let loaded = grpc_fixture::load(yaml);
     let engine = Engine::new(
         loaded.plan,
         std::path::PathBuf::from("."),
@@ -159,7 +273,7 @@ async fn parallel_runs_branches_concurrently() {
     #[async_trait]
     impl ProtocolHandler for SlowHandler {
         fn name(&self) -> &str {
-            "http"
+            "grpc"
         }
         async fn execute(
             &self,
@@ -170,7 +284,7 @@ async fn parallel_runs_branches_concurrently() {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(ProtocolResponse {
                 status: 200,
-                protocol_version: "HTTP/1.1".into(),
+                protocol_version: "gRPC".into(),
                 url: request.url.clone(),
                 ..Default::default()
             })
@@ -179,7 +293,7 @@ async fn parallel_runs_branches_concurrently() {
     let handler = Arc::new(SlowHandler::default());
     let mut reg = ProtocolRegistry::new();
     reg.register(handler.clone());
-    let loaded = loadr_config::load_str(
+    let loaded = grpc_fixture::load(
         r#"
 scenarios:
   s:
@@ -193,9 +307,7 @@ scenarios:
             - [ { request: { url: "http://x/b" } } ]
             - [ { request: { url: "http://x/c" } } ]
 "#,
-        &loadr_config::LoadOptions::new(),
-    )
-    .expect("parse");
+    );
     let engine = Engine::new(
         loaded.plan,
         std::path::PathBuf::from("."),
@@ -214,6 +326,57 @@ scenarios:
         elapsed < std::time::Duration::from_millis(450),
         "took {elapsed:?} (not concurrent)"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_plugin_data_source_sequences_are_unique_per_vu_source() {
+    let handler = Arc::new(RecordingHandler::default());
+    let loaded = grpc_fixture::load(
+        r#"
+plugins:
+  - name: signer
+
+data:
+  signed:
+    type: plugin
+    source: signer
+
+scenarios:
+  s:
+    executor: shared-iterations
+    vus: 1
+    iterations: 1
+    flow:
+      - parallel:
+          branches:
+            - [ { request: { url: "http://x/a/${data.signed.seq}" } } ]
+            - [ { request: { url: "http://x/b/${data.signed.seq}" } } ]
+"#,
+    );
+
+    let mut data_sources: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
+    data_sources.insert("signer".to_string(), Box::new(SeqPlugin));
+
+    let engine = Engine::new(
+        loaded.plan,
+        std::path::PathBuf::from("."),
+        EngineOptions {
+            protocols: registry(handler.clone()),
+            data_sources,
+            ..Default::default()
+        },
+    )
+    .expect("engine");
+    engine.run().await.expect("run");
+
+    let urls = handler.urls.lock();
+    assert_eq!(urls.len(), 2);
+    let mut seqs: Vec<&str> = urls
+        .iter()
+        .map(|url| url.rsplit('/').next().expect("url path segment"))
+        .collect();
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec!["0", "1"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -353,6 +516,174 @@ scenarios:
     );
 }
 
+fn assert_cancelled_request_metrics(result: &loadr_core::RunResult) {
+    let grpc_reqs = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "grpc_reqs")
+        .expect("grpc_reqs");
+    assert_eq!(grpc_reqs.agg.sum, 1.0);
+
+    let duration = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "grpc_req_duration")
+        .expect("grpc_req_duration");
+    assert_eq!(duration.agg.count, 1);
+    assert!(duration.agg.max.is_some());
+
+    let failed = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "http_req_failed")
+        .expect("canonical request failure metric");
+    assert_eq!(failed.agg.count, 1);
+    assert_eq!(failed.agg.sum, 1.0);
+
+    let cancelled = result
+        .summary
+        .snapshot
+        .series
+        .iter()
+        .find(|s| {
+            s.metric == "http_req_failed"
+                && s.tags.get("error_kind").map(String::as_str) == Some("cancelled")
+        })
+        .expect("cancelled failure series");
+    assert_eq!(cancelled.agg.count, 1);
+    assert_eq!(cancelled.agg.sum, 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_kill_records_cancelled_in_flight_request_metrics() {
+    let handler = BlockingHandler::new();
+    let engine = engine_with_handler(
+        r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 30s
+    flow:
+      - request: { url: "http://x/slow" }
+"#,
+        handler.clone(),
+        Duration::from_millis(100),
+    );
+    let handle = engine.handle();
+    let run = tokio::spawn(engine.run());
+
+    handler.wait_started().await;
+    handle.kill("test kill");
+
+    let result = match tokio::time::timeout(Duration::from_secs(5), run).await {
+        Ok(joined) => joined.expect("run task").expect("run"),
+        Err(_) => {
+            handler.release();
+            panic!("run did not finish after hard kill");
+        }
+    };
+
+    assert_eq!(handler.completed.load(Ordering::Relaxed), 0);
+    assert_cancelled_request_metrics(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_stop_deadline_records_cancelled_in_flight_request_metrics() {
+    let handler = BlockingHandler::new();
+    let engine = engine_with_handler(
+        r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 30s
+    graceful_stop: 50ms
+    flow:
+      - request: { url: "http://x/slow" }
+"#,
+        handler.clone(),
+        Duration::from_millis(100),
+    );
+    let handle = engine.handle();
+    let run = tokio::spawn(engine.run());
+
+    handler.wait_started().await;
+    handle.stop("test stop");
+
+    let result = match tokio::time::timeout(Duration::from_secs(5), run).await {
+        Ok(joined) => joined.expect("run task").expect("run"),
+        Err(_) => {
+            handler.release();
+            panic!("run did not finish after graceful stop deadline");
+        }
+    };
+
+    assert_eq!(handler.completed.load(Ordering::Relaxed), 0);
+    assert_cancelled_request_metrics(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_in_flight_gauge_tracks_active_requests() {
+    let handler = BlockingHandler::new();
+    let engine = engine_with_handler(
+        r#"
+scenarios:
+  s:
+    executor: shared-iterations
+    vus: 1
+    iterations: 1
+    flow:
+      - request: { url: "http://x/slow" }
+"#,
+        handler.clone(),
+        Duration::from_millis(50),
+    );
+    let handle = engine.handle();
+    let mut snapshots = handle.watch_snapshots();
+    let run = tokio::spawn(engine.run());
+
+    handler.wait_started().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snap = snapshots.borrow_and_update().clone();
+        let max_in_flight = snap
+            .series
+            .iter()
+            .filter(|s| s.metric == "requests_in_flight")
+            .filter_map(|s| s.agg.max)
+            .fold(0.0_f64, f64::max);
+        if max_in_flight >= 1.0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            handler.release();
+            panic!("requests_in_flight never reached 1");
+        }
+        snapshots.changed().await.expect("snapshots");
+    }
+
+    handler.release();
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run timeout")
+        .expect("run task")
+        .expect("run");
+
+    assert_eq!(handler.completed.load(Ordering::Relaxed), 1);
+    let gauge = result
+        .summary
+        .metrics
+        .iter()
+        .find(|m| m.metric == "requests_in_flight")
+        .expect("requests_in_flight");
+    assert!(gauge.agg.max.unwrap_or_default() >= 1.0);
+    assert_eq!(gauge.agg.last, Some(0.0));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn weighted_data_pick_random() {
     // `random` feeder never exhausts even with on_eof: stop.
@@ -397,7 +728,7 @@ scenarios:
       - request: { url: "http://x/ping" }
       - think_time: { type: constant, duration: 50ms }
 "#;
-    let loaded = loadr_config::load_str(yaml, &loadr_config::LoadOptions::new()).expect("parse");
+    let loaded = grpc_fixture::load(yaml);
     let engine = Engine::new(
         loaded.plan,
         std::path::PathBuf::from("."),
@@ -433,4 +764,56 @@ scenarios:
         tl.iter().any(|p| p.latency_p95.is_some()),
         "no latency percentiles recorded"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vu_gauges_include_extra_tags() {
+    use std::time::Duration;
+
+    let handler = Arc::new(RecordingHandler::default());
+    let yaml = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 2
+    duration: 1200ms
+    flow:
+      - request: { url: "http://x/ping" }
+      - think_time: { type: constant, duration: 50ms }
+"#;
+    let loaded = grpc_fixture::load(yaml);
+    let extra_tags: Tags = [("instance".to_string(), "a1".to_string())]
+        .into_iter()
+        .collect();
+    let engine = Engine::new(
+        loaded.plan,
+        std::path::PathBuf::from("."),
+        EngineOptions {
+            protocols: registry(handler),
+            extra_tags,
+            snapshot_interval: Duration::from_millis(250),
+            ..Default::default()
+        },
+    )
+    .expect("engine");
+    let result = engine.run().await.expect("run");
+
+    for metric in ["vus", "vus_max"] {
+        let series: Vec<_> = result
+            .summary
+            .snapshot
+            .series
+            .iter()
+            .filter(|s| s.metric == metric)
+            .collect();
+        assert_eq!(series.len(), 1, "expected one {metric} series");
+        assert_eq!(
+            series[0].tags.get("instance").map(String::as_str),
+            Some("a1")
+        );
+        assert!(
+            !series[0].tags.contains_key("scenario"),
+            "{metric} should stay run-scoped"
+        );
+    }
 }

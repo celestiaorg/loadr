@@ -210,7 +210,14 @@ mod tests {
         let yaml = r#"
 name: t
 scenarios:
-  s: { executor: constant-vus, vus: 1, duration: 1s, flow: [ { request: { url: https://e.com/ } } ] }
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          url: grpc://e.com:443
+          grpc: { reflection: true, service: test.Service, method: Call }
 "#;
         let loaded = load_str(yaml, &LoadOptions::new()).unwrap();
         assert_eq!(loaded.plan.name.as_deref(), Some("t"));
@@ -257,7 +264,14 @@ env:
   staging:
     defaults: { http: { base_url: https://staging.example.com } }
 scenarios:
-  s: { executor: constant-vus, vus: 1, duration: 1s, flow: [ { request: { url: / } } ] }
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          url: grpc://e.com:443
+          grpc: { reflection: true, service: test.Service, method: Call }
 "#;
         let mut opts = LoadOptions::new();
         opts.env = Some("staging".into());

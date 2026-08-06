@@ -1,6 +1,7 @@
 //! `loadr run` — standalone runs (optionally with the live web UI) and
 //! submission to a distributed controller.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,12 +53,17 @@ pub struct RunArgs {
     /// Dump full HTTP requests and responses (verbose; sets LOADR_HTTP_DEBUG).
     #[arg(long)]
     pub http_debug: bool,
+    /// Tokio worker threads for the run (default: number of CPUs)
+    #[arg(long, env = "LOADR_WORKER_THREADS")]
+    pub worker_threads: Option<usize>,
 }
 
 pub fn execute(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = args.worker_threads {
+        builder.worker_threads(n.max(1));
+    }
+    let runtime = builder.enable_all().build()?;
     runtime.block_on(async move {
         match &args.controller {
             Some(addr) => submit_remote(&args, addr).await,
@@ -66,122 +72,38 @@ pub fn execute(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
     })
 }
 
-/// Decide whether the plan needs a JS engine.
-fn plan_uses_js(plan: &loadr_config::TestPlan) -> bool {
-    if plan.js.is_some() {
-        return true;
-    }
-    fn step_uses(step: &loadr_config::Step) -> bool {
-        match step {
-            loadr_config::Step::Js(_) => true,
-            // `while`/`if` conditions are JS expressions.
-            loadr_config::Step::While(_) | loadr_config::Step::If(_) => true,
-            loadr_config::Step::Group(g) => g.steps.iter().any(step_uses),
-            loadr_config::Step::Repeat(r) => r.steps.iter().any(step_uses),
-            loadr_config::Step::Random(r) => {
-                r.choices.iter().any(|c| c.steps.iter().any(step_uses))
-            }
-            loadr_config::Step::Retry(r) => r.until.is_some() || r.steps.iter().any(step_uses),
-            loadr_config::Step::Foreach(f) => {
-                f.items
-                    .as_str()
-                    .map(|s| s.contains("${js:"))
-                    .unwrap_or(false)
-                    || f.steps.iter().any(step_uses)
-            }
-            loadr_config::Step::Switch(sw) => {
-                sw.value.contains("${js:")
-                    || sw.cases.values().any(|st| st.iter().any(step_uses))
-                    || sw.default.iter().any(step_uses)
-            }
-            loadr_config::Step::During(d) => d.steps.iter().any(step_uses),
-            loadr_config::Step::Parallel(p) => p.branches.iter().any(|b| b.iter().any(step_uses)),
-            loadr_config::Step::Rendezvous(_) => false,
-            loadr_config::Step::Request(r) => {
-                let text_has_js = |s: &str| s.contains("${js:");
-                r.url.contains("${js:")
-                    || r.headers.values().any(|v| text_has_js(v))
-                    || r.params.values().any(|v| text_has_js(v))
-                    || r.assert
-                        .iter()
-                        .chain(r.checks.iter())
-                        .any(|c| matches!(c, loadr_config::Condition::Js { .. }))
-            }
-            loadr_config::Step::ThinkTime(_) => false,
-        }
-    }
-    plan.scenarios
-        .values()
-        .any(|s| s.exec.is_some() || s.flow.iter().any(step_uses))
-}
-
-/// Build a fully wired engine for a plan (protocols, JS, outputs, plugins).
+/// Build a gRPC engine with optional on-demand feeder plugins.
 pub fn build_engine(
     plan: loadr_config::TestPlan,
     base_dir: PathBuf,
     run_id: Option<String>,
     extra_outputs: Vec<Box<dyn loadr_core::Output>>,
     plugins_dir: Option<&Path>,
-) -> anyhow::Result<(
-    loadr_core::Engine,
-    Vec<Box<dyn loadr_plugin_api::ServicePlugin>>,
-)> {
-    let mut protocols = loadr_protocols::builtin_registry(&plan.defaults.http, &base_dir)
+) -> anyhow::Result<loadr_core::Engine> {
+    let protocols = loadr_grpc::builtin_registry(&plan.defaults.http, &base_dir)
         .map_err(|e| anyhow::anyhow!("protocol setup failed: {e}"))?;
-
-    // Browser protocol lives in its own crate (pulls in headless Chrome via CDP).
-    // The handler is lazy — Chrome only launches on first `protocol: browser` use.
-    protocols.register(std::sync::Arc::new(
-        loadr_browser::BrowserHandler::from_config(&plan.defaults.http)
-            .map_err(|e| anyhow::anyhow!("browser protocol setup failed: {e}"))?,
-    ));
 
     // Plugins declared in the plan.
     let plugins_dir = plugins_dir
         .map(Path::to_path_buf)
-        .unwrap_or_else(loadr_plugin_api::default_plugins_dir);
-    let mut outputs = extra_outputs;
-    let mut services: Vec<Box<dyn loadr_plugin_api::ServicePlugin>> = Vec::new();
+        .unwrap_or_else(loadr_feeder_api::default_plugins_dir);
+    let mut data_sources: HashMap<String, Box<dyn loadr_core::DataSourcePlugin>> = HashMap::new();
     for plugin_ref in &plan.plugins {
         if !plugin_ref.enabled {
             continue;
         }
-        let loaded = loadr_plugin_api::PluginRegistry::load_ref(plugin_ref, &plugins_dir)
-            .map_err(|e| anyhow::anyhow!("plugin `{}`: {e}", plugin_ref.name))?;
-        match loaded {
-            loadr_plugin_api::LoadedPlugin::Protocol(handler) => protocols.register(handler),
-            loadr_plugin_api::LoadedPlugin::Output(output) => outputs.push(output),
-            loadr_plugin_api::LoadedPlugin::Service(service) => services.push(service),
-            loadr_plugin_api::LoadedPlugin::Extractor(_)
-            | loadr_plugin_api::LoadedPlugin::Assertion(_) => {
-                tracing::info!(
-                    plugin = %plugin_ref.name,
-                    "extractor/assertion plugin loaded (used via `type: plugin` extract/assert entries)"
-                );
-            }
-        }
+        let data_source =
+            loadr_feeder_api::PluginRegistry::load_ref(plugin_ref, &plugins_dir, &base_dir)
+                .map_err(|e| anyhow::anyhow!("plugin `{}`: {e}", plugin_ref.name))?;
+        data_sources.insert(plugin_ref.name.clone(), data_source);
     }
 
     // Built-in outputs from the plan.
+    let mut outputs = extra_outputs;
     outputs.extend(
-        loadr_outputs::build_outputs(&plan.outputs, &base_dir)
+        loadr_prometheus::build_outputs(&plan.outputs, &base_dir)
             .map_err(|e| anyhow::anyhow!("output setup failed: {e}"))?,
     );
-
-    // JS engine when needed.
-    let script: Option<Arc<dyn loadr_core::ScriptEngine>> = if plan_uses_js(&plan) {
-        let default_cfg = loadr_config::JsConfig {
-            script: Some(String::new()),
-            ..Default::default()
-        };
-        let cfg = plan.js.clone().unwrap_or(default_cfg);
-        Some(Arc::new(
-            loadr_js::JsEngine::new(&cfg, &base_dir)
-                .map_err(|e| anyhow::anyhow!("JS setup failed: {e}"))?,
-        ))
-    } else {
-        None
-    };
 
     let engine = loadr_core::Engine::new(
         plan,
@@ -189,12 +111,13 @@ pub fn build_engine(
         loadr_core::EngineOptions {
             run_id,
             protocols,
-            script,
+            script: None,
             outputs,
+            data_sources,
             ..Default::default()
         },
     )?;
-    Ok((engine, services))
+    Ok(engine)
 }
 
 async fn run_local(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
@@ -277,18 +200,12 @@ async fn run_local(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
                 .push(crate::output_flag::parse_output_flag(spec).map_err(|e| anyhow::anyhow!(e))?);
         }
         extra_outputs.extend(
-            loadr_outputs::build_outputs(&configs, &loaded.base_dir)
+            loadr_prometheus::build_outputs(&configs, &loaded.base_dir)
                 .map_err(|e| anyhow::anyhow!(e))?,
         );
     }
 
-    // Capture observe (system-metric correlation) config + thresholds before the
-    // plan is moved into the engine; collection happens post-run against the
-    // summary, and observe-metric thresholds are evaluated then too.
-    let observe_cfg = plan.observe.clone();
-    let plan_thresholds = plan.thresholds.clone();
-
-    let (engine, mut services) = build_engine(
+    let engine = build_engine(
         plan,
         loaded.base_dir.clone(),
         None,
@@ -307,12 +224,12 @@ async fn run_local(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
             summary: parking_lot::Mutex::new(None),
             started_ms: loadr_core::metrics::now_millis(),
         });
-        let config = loadr_plugin_webui::WebUiConfig {
+        let config = loadr_webui::WebUiConfig {
             bind: args.ui_bind.parse()?,
             auth: Default::default(),
             backend: backend.clone(),
         };
-        let served = loadr_plugin_webui::WebUi::serve(config).await?;
+        let served = loadr_webui::WebUi::serve(config).await?;
         eprintln!(
             "{} web UI at http://{}/ (run page: /#/runs/{})",
             "→".cyan(),
@@ -346,55 +263,13 @@ async fn run_local(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
         Some(tokio::spawn(crate::progress::show_progress(handle.clone())))
     };
 
-    // `type: system` observe sources sample local /proc live — start them now.
-    let system_samplers = loadr_outputs::observe::start_samplers(&observe_cfg);
-
-    let mut result = engine.run().await?;
+    let result = engine.run().await?;
 
     if let Some(p) = progress {
         p.abort();
         eprintln!();
     }
 
-    // Stop the system samplers and take their series (may be empty).
-    let system_series = loadr_outputs::observe::stop_samplers(system_samplers);
-
-    // observe: pull system metrics for the run window and overlay them on the
-    // timeline so the report shows load↔system correlation. Best-effort — a
-    // failing source never fails the run.
-    if !observe_cfg.is_empty() && !result.summary.timeline.is_empty() {
-        let start_ms = result.summary.started_ms as i64;
-        let end_ms = result.summary.ended_ms as i64;
-        let step = loadr_outputs::observe::step_for(&result.summary.timeline);
-        let mut series =
-            loadr_outputs::observe::collect(&observe_cfg, start_ms, end_ms, step).await;
-        series.extend(system_series);
-        if !series.is_empty() {
-            loadr_outputs::observe::attach(&mut result.summary, &series);
-            eprintln!(
-                "{} observed {} system-metric series for correlation",
-                "✓".green(),
-                series.len()
-            );
-
-            // Evaluate thresholds that target an observed metric (post-run gate
-            // on target health). Replace the engine's no-sample placeholders for
-            // those metrics, then recompute pass/fail + the exit code.
-            let observed_thresholds =
-                loadr_outputs::observe::evaluate_thresholds(&plan_thresholds, &series);
-            if !observed_thresholds.is_empty() {
-                result.summary.thresholds.retain(|t| {
-                    !observed_thresholds
-                        .iter()
-                        .any(|o| o.metric == t.metric && o.expression == t.expression)
-                });
-                result.summary.thresholds.extend(observed_thresholds);
-                result.summary.thresholds_passed =
-                    result.summary.thresholds.iter().all(|t| t.passed);
-                result.passed = result.summary.thresholds_passed;
-            }
-        }
-    }
     // A JS handleSummary() return value replaces the default console summary.
     if let Some(custom) = &result.custom_summary {
         print!("{custom}");
@@ -423,10 +298,6 @@ async fn run_local(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
         let _ = tokio::signal::ctrl_c().await;
         served.shutdown().await;
     }
-    for service in &mut services {
-        service.stop();
-    }
-
     Ok(exit_code(&result))
 }
 
@@ -496,7 +367,7 @@ async fn submit_remote(args: &RunArgs, controller: &str) -> anyhow::Result<i32> 
             .or_else(|| info["state"].as_str())
             .unwrap_or("unknown");
         match state {
-            "finished" | "failed" => {
+            "finished" | "degraded" | "aborted" | "failed" => {
                 let summary = crate::commands::controller::http_json(
                     &client,
                     http::Method::GET,
@@ -538,7 +409,7 @@ struct SingleRunBackend {
 }
 
 #[async_trait::async_trait]
-impl loadr_plugin_webui::UiBackend for SingleRunBackend {
+impl loadr_webui::UiBackend for SingleRunBackend {
     async fn start_test(
         &self,
         _name: Option<String>,
@@ -548,26 +419,49 @@ impl loadr_plugin_webui::UiBackend for SingleRunBackend {
         Err("this UI is attached to a single `loadr run` invocation; use `loadr controller` to launch tests from the UI".into())
     }
 
-    fn runs(&self) -> Vec<loadr_plugin_webui::RunInfo> {
-        let (state, passed) = match self.handle.status() {
+    fn runs(&self) -> Vec<loadr_webui::RunInfo> {
+        let (mut state, mut passed) = match self.handle.status() {
             loadr_core::RunStatus::Pending => ("pending", None),
             loadr_core::RunStatus::Running => ("running", None),
             loadr_core::RunStatus::Stopping => ("stopping", None),
             loadr_core::RunStatus::Finished { passed } => ("finished", Some(passed)),
         };
         let summary = self.summary.lock();
-        vec![loadr_plugin_webui::RunInfo {
+        if summary
+            .as_ref()
+            .is_some_and(|summary| summary.aborted.is_some())
+        {
+            state = "aborted";
+            passed = Some(false);
+        }
+        if state == "finished"
+            && summary.as_ref().is_none_or(|summary| {
+                summary.thresholds.is_empty()
+                    || summary
+                        .thresholds
+                        .iter()
+                        .any(|threshold| threshold.observed.is_none())
+            })
+        {
+            passed = None;
+        }
+        vec![loadr_webui::RunInfo {
             run_id: self.handle.run_id.to_string(),
             name: Some(self.name.clone()),
             state: state.to_string(),
             passed,
             started_ms: self.started_ms,
             ended_ms: summary.as_ref().map(|s| s.ended_ms),
+            observed_ms: loadr_core::metrics::now_millis(),
             scenarios: summary
                 .as_ref()
                 .map(|s| s.scenarios.clone())
                 .unwrap_or_default(),
             agents: Vec::new(),
+            contributing_agents: Vec::new(),
+            lost_agents: Vec::new(),
+            complete: None,
+            on_agent_loss: None,
         }]
     }
 
@@ -620,12 +514,12 @@ impl loadr_plugin_webui::UiBackend for SingleRunBackend {
         self.handle.scale(scenario, vus)
     }
 
-    fn agents(&self) -> Vec<loadr_plugin_webui::AgentView> {
+    fn agents(&self) -> Vec<loadr_webui::AgentView> {
         Vec::new()
     }
 
-    fn tests(&self) -> Vec<loadr_plugin_webui::StoredTest> {
-        vec![loadr_plugin_webui::StoredTest {
+    fn tests(&self) -> Vec<loadr_webui::StoredTest> {
+        vec![loadr_webui::StoredTest {
             name: self.name.clone(),
             yaml: self.yaml.clone(),
             updated_ms: self.started_ms,
@@ -640,7 +534,17 @@ impl loadr_plugin_webui::UiBackend for SingleRunBackend {
         Err("read-only in single-run mode".into())
     }
 
-    fn recent_logs(&self) -> Vec<loadr_plugin_webui::LogLine> {
+    fn recent_logs(&self) -> Vec<loadr_webui::LogLine> {
         Vec::new()
+    }
+
+    fn capabilities(&self) -> loadr_webui::UiCapabilities {
+        loadr_webui::UiCapabilities {
+            mode: "single_run".to_string(),
+            can_start_runs: false,
+            can_edit_tests: false,
+            logs_available: false,
+            persistent_history: false,
+        }
     }
 }

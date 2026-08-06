@@ -1,0 +1,8 @@
+[plugin]
+name = "tx-signer"
+version = "0.1.0"
+entry = "libsigned_tx_feeder.so"
+description = "Generates Ed25519-signed transaction payloads for gRPC SubmitRequest"
+
+[config]
+seed = 1

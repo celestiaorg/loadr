@@ -1,0 +1,18 @@
+[package]
+name = "loadr-feeder-api"
+description = "Stable native feeder ABI and local feeder registry for loadr"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+loadr-core = { workspace = true }
+loadr-config = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+abi_stable = { workspace = true }

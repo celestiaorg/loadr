@@ -1,7 +1,0 @@
-node_modules/
-out/
-dist/
-playwright-report/
-test-results/
-# Bundled loadr binary staged at build time (per-platform), never committed.
-resources/bin/

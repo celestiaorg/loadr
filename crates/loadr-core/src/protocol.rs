@@ -78,16 +78,64 @@ pub struct WsFrame {
 
 #[derive(Debug, Clone, Default)]
 pub struct GrpcRequest {
-    pub proto_files: Vec<std::path::PathBuf>,
-    pub proto_includes: Vec<std::path::PathBuf>,
+    pub proto_files: Arc<[std::path::PathBuf]>,
+    pub proto_includes: Arc<[std::path::PathBuf]>,
     pub reflection: bool,
-    pub service: String,
-    pub method: String,
+    pub service: Arc<str>,
+    pub method: Arc<str>,
     /// Unary request message (JSON-encoded).
-    pub message: Option<serde_json::Value>,
+    pub message: Option<Arc<serde_json::Value>>,
     /// Streaming request messages.
-    pub messages: Vec<serde_json::Value>,
+    pub messages: Arc<Vec<serde_json::Value>>,
+    /// True when the message JSON contains no template substitutions: the
+    /// `Arc`(s) above are then the compile-time values, handed out unchanged
+    /// every iteration (stable identity), so the handler may cache the
+    /// encoded body per `Arc`.
+    pub message_literal: bool,
     pub metadata: Vec<(String, String)>,
+    /// Share a fixed pool of N HTTP/2 channels across all VUs (round-robin)
+    /// instead of one connection per VU. `None` = per-VU (default).
+    pub channel_pool_size: Option<usize>,
+    /// Client transport (tonic channel vs raw hyper h2).
+    pub transport: loadr_config::GrpcTransport,
+    /// Skip building `DynamicMessage`s and JSON-converting the response:
+    /// nothing in the plan reads the body (no `extract`/`assert`/`checks`
+    /// that need it, and no script `afterRequest` hook). `false` = decode
+    /// (today's behavior), so `derive(Default)` stays safe for the many
+    /// tests that construct `GrpcRequest` directly.
+    pub discard_response_body: bool,
+    /// Decode response messages for descriptor-aware protobuf checks, but do
+    /// not pay for full DynamicMessage-to-JSON conversion. This is false for
+    /// both the status-only discard path and the existing JSON body path.
+    pub protobuf_only_response: bool,
+    /// Compiled descriptor-aware checks for this request. The Arc is owned by
+    /// the compiled plan and therefore has stable identity for the run; the
+    /// gRPC handler uses that identity to cache resolved field descriptors.
+    pub protobuf_checks: Option<Arc<Vec<GrpcProtobufFieldCheck>>>,
+}
+
+/// A descriptor-aware condition the gRPC handler evaluates directly against
+/// the last decoded response message.
+#[derive(Debug, Clone)]
+pub struct GrpcProtobufFieldCheck {
+    pub id: u32,
+    pub field: Arc<str>,
+    pub equals: Option<serde_json::Value>,
+    pub exists: bool,
+    pub group_failures: bool,
+}
+
+/// Compact outcome returned by the gRPC handler without materializing JSON.
+#[derive(Debug, Clone)]
+pub struct GrpcProtobufFieldOutcome {
+    pub id: u32,
+    pub pass: bool,
+    pub detail: Option<String>,
+    /// Numeric actual value when available, used only by bounded check-group
+    /// mappings. Values outside i64 remain ungroupable and fall into `other`.
+    pub actual_code: Option<i64>,
+    /// True when the descriptor supports presence but the field was absent.
+    pub missing: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -117,6 +165,10 @@ pub struct ProtocolResponse {
     pub url: String,
     /// Protocol-specific extras (ws message counts, grpc messages, ...).
     pub extras: serde_json::Value,
+    /// Internal descriptor-aware gRPC check outcomes. Native protocol-plugin
+    /// response ABIs intentionally do not expose this field.
+    #[doc(hidden)]
+    pub grpc_protobuf_outcomes: Vec<GrpcProtobufFieldOutcome>,
 }
 
 impl ProtocolResponse {
@@ -261,6 +313,7 @@ impl ProtocolRegistry {
             "sse" | "sses" => "sse".to_string(),
             "tcp" => "tcp".to_string(),
             "udp" => "udp".to_string(),
+            "noop" => "noop".to_string(),
             other => plugin_scheme(other).unwrap_or_else(|| "http".to_string()),
         }
     }
@@ -284,6 +337,7 @@ mod tests {
         assert_eq!(ProtocolRegistry::infer(None, "wss://x/"), "ws");
         assert_eq!(ProtocolRegistry::infer(None, "grpc://x/"), "grpc");
         assert_eq!(ProtocolRegistry::infer(None, "tcp://x:9"), "tcp");
+        assert_eq!(ProtocolRegistry::infer(None, "noop://local"), "noop");
         assert_eq!(ProtocolRegistry::infer(None, "sse://x/"), "sse");
         assert_eq!(ProtocolRegistry::infer(None, "sses://x/"), "sse");
         // Redis is a plugin now: its scheme falls back to http until the plugin

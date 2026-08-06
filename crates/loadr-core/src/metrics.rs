@@ -1,6 +1,7 @@
 //! Metric primitives: kinds, samples, the metric registry and the sample bus.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +10,20 @@ use serde::{Deserialize, Serialize};
 
 /// Sorted tag set attached to samples.
 pub type Tags = BTreeMap<String, String>;
+
+/// Whether a metric is a primary request counter for cross-protocol rollups.
+/// GraphQL also emits the underlying HTTP transport metric, so including
+/// `graphql_reqs` would count one operation twice.
+pub fn is_request_counter_metric(metric: &str) -> bool {
+    metric.ends_with("_reqs") && !matches!(metric, "graphql_reqs" | "request_reqs")
+}
+
+/// Whether a metric is a primary request-duration trend for cross-protocol
+/// rollups. See [`is_request_counter_metric`] for the GraphQL exclusion.
+pub fn is_request_duration_metric(metric: &str) -> bool {
+    metric.ends_with("_req_duration")
+        && !matches!(metric, "graphql_req_duration" | "request_duration")
+}
 
 /// The four metric kinds, matching k6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -72,6 +87,7 @@ pub const BUILTIN_METRIC_DEFS: &[(&str, MetricKind, bool)] = &[
     ("dropped_iterations", MetricKind::Counter, false),
     ("vus", MetricKind::Gauge, false),
     ("vus_max", MetricKind::Gauge, false),
+    ("requests_in_flight", MetricKind::Gauge, false),
     ("checks", MetricKind::Rate, false),
     // Script (JS) exceptions raised in hooks, exec functions, and js steps.
     // Tagged with `exception` (a normalised message) and `scenario`.
@@ -91,9 +107,25 @@ pub const BUILTIN_METRIC_DEFS: &[(&str, MetricKind, bool)] = &[
     ("tcp_req_duration", MetricKind::Trend, true),
     ("udp_reqs", MetricKind::Counter, false),
     ("udp_req_duration", MetricKind::Trend, true),
+    ("noop_reqs", MetricKind::Counter, false),
+    ("noop_req_duration", MetricKind::Trend, true),
     ("graphql_reqs", MetricKind::Counter, false),
     ("graphql_req_duration", MetricKind::Trend, true),
 ];
+
+/// Gauges whose fleet value is the sum of per-agent values (total running
+/// VUs), not last-writer-wins. Distributed merging in
+/// `Aggregator::aggregate_selector` consults this.
+pub fn is_additive_gauge(metric: &str) -> bool {
+    matches!(metric, "vus" | "vus_max")
+}
+
+/// Additive gauges that describe *currently held* capacity and therefore must
+/// be zeroed when their reporter stops (agent lost or terminal, engine
+/// shutdown) so fleet sums don't go stale. Keep this, [`is_additive_gauge`]
+/// and the engine's terminal zero (`engine.rs`) in sync when adding a live
+/// gauge.
+pub const LIVE_GAUGES: &[&str] = &["vus"];
 
 /// Registry of known metrics: built-ins, YAML custom metrics, and metrics
 /// created at runtime from JS.
@@ -183,31 +215,104 @@ pub struct Sample {
     pub timestamp_ms: u64,
 }
 
+/// Where a `MetricsBus` delivers samples.
+#[derive(Clone)]
+enum Sink {
+    /// The classic per-run channel, drained by the aggregator task.
+    Tx(tokio::sync::mpsc::UnboundedSender<Sample>),
+    /// Straight into a shard-local aggregator — no channel, no per-sample
+    /// clock read, no drain backlog. Chosen once at startup (see
+    /// `Output::wants_samples`) when nothing needs raw samples.
+    Shard {
+        shards: Arc<crate::aggregate::MetricShards>,
+        idx: usize,
+    },
+}
+
 /// Cloneable fan-in handle that VUs use to emit samples.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MetricsBus {
-    tx: tokio::sync::mpsc::UnboundedSender<Sample>,
+    sink: Sink,
+    requests_in_flight: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for MetricsBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.sink {
+            Sink::Tx(_) => f.write_str("MetricsBus::Tx"),
+            Sink::Shard { idx, .. } => f
+                .debug_struct("MetricsBus::Shard")
+                .field("idx", idx)
+                .finish(),
+        }
+    }
 }
 
 impl MetricsBus {
     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Sample>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (MetricsBus { tx }, rx)
+        (
+            MetricsBus {
+                sink: Sink::Tx(tx),
+                requests_in_flight: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// Build a bus that records straight into `shards` instead of a channel
+    /// (see `MetricShards`). Returns the root handle, pinned to shard 0 —
+    /// per-VU handles come from `for_vu`.
+    pub fn sharded(shards: Arc<crate::aggregate::MetricShards>) -> Self {
+        MetricsBus {
+            sink: Sink::Shard { shards, idx: 0 },
+            requests_in_flight: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A handle pinned to VU `vu_id`'s shard (a plain clone in channel mode).
+    /// Applied once, in `VuContext::new`, so every emit site — VUs, the JS
+    /// host, plugin protocols — is covered with no call-site changes. The
+    /// in-flight counter is shared with the parent handle either way.
+    pub fn for_vu(&self, vu_id: u64) -> Self {
+        let sink = match &self.sink {
+            Sink::Tx(tx) => Sink::Tx(tx.clone()),
+            Sink::Shard { shards, .. } => Sink::Shard {
+                shards: shards.clone(),
+                idx: (vu_id % shards.len() as u64) as usize,
+            },
+        };
+        MetricsBus {
+            sink,
+            requests_in_flight: self.requests_in_flight.clone(),
+        }
     }
 
     pub fn emit(&self, sample: Sample) {
-        // The receiver only closes at the very end of a run; late samples
-        // from draining VUs are intentionally dropped.
-        let _ = self.tx.send(sample);
+        match &self.sink {
+            // The receiver only closes at the very end of a run; late
+            // samples from draining VUs are intentionally dropped.
+            Sink::Tx(tx) => {
+                let _ = tx.send(sample);
+            }
+            Sink::Shard { shards, idx } => shards.record(*idx, &sample),
+        }
     }
 
     pub fn emit_value(&self, metric: &Arc<str>, kind: MetricKind, value: f64, tags: &Arc<Tags>) {
+        // Shard mode skips the clock read entirely: JsonOutput/CsvOutput are
+        // the only readers of `timestamp_ms`, and both force bus mode via
+        // `wants_samples`.
+        let timestamp_ms = match &self.sink {
+            Sink::Tx(_) => now_millis(),
+            Sink::Shard { .. } => 0,
+        };
         self.emit(Sample {
             metric: metric.clone(),
             kind,
             value,
             tags: tags.clone(),
-            timestamp_ms: now_millis(),
+            timestamp_ms,
         });
     }
 
@@ -225,6 +330,18 @@ impl MetricsBus {
 
     pub fn trend(&self, metric: &Arc<str>, value: f64, tags: &Arc<Tags>) {
         self.emit_value(metric, MetricKind::Trend, value, tags);
+    }
+
+    pub(crate) fn begin_request(&self) {
+        self.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn end_request(&self) {
+        self.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn requests_in_flight(&self) -> u64 {
+        self.requests_in_flight.load(Ordering::Relaxed)
     }
 }
 
@@ -250,6 +367,8 @@ pub struct BuiltinMetrics {
     pub faults_injected: Arc<str>,
     pub data_sent: Arc<str>,
     pub data_received: Arc<str>,
+    pub grpc_reqs: Arc<str>,
+    pub grpc_req_duration: Arc<str>,
 }
 
 impl BuiltinMetrics {
@@ -280,6 +399,8 @@ impl BuiltinMetrics {
             faults_injected: name("faults_injected"),
             data_sent: name("data_sent"),
             data_received: name("data_received"),
+            grpc_reqs: name("grpc_reqs"),
+            grpc_req_duration: name("grpc_req_duration"),
         }
     }
 }
@@ -295,6 +416,10 @@ mod tests {
         assert_eq!(def.kind, MetricKind::Trend);
         assert!(def.time);
         assert_eq!(reg.get("checks").map(|d| d.kind), Some(MetricKind::Rate));
+        assert_eq!(
+            reg.get("requests_in_flight").map(|d| d.kind),
+            Some(MetricKind::Gauge)
+        );
     }
 
     #[test]
@@ -323,5 +448,62 @@ mod tests {
         assert_eq!(s1.kind, MetricKind::Rate);
         let s2 = rx.recv().await.expect("sample");
         assert_eq!(s2.value, 2.0);
+    }
+
+    fn shard_idx(bus: &MetricsBus) -> usize {
+        match &bus.sink {
+            Sink::Shard { idx, .. } => *idx,
+            Sink::Tx(_) => panic!("expected a shard sink"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_bus_records_and_drains_exactly() {
+        let shards = Arc::new(crate::aggregate::MetricShards::new(4));
+        let root = MetricsBus::sharded(shards.clone());
+
+        // Same-shard pinning: VU k and VU k+4 land on the same shard (idx %
+        // len), and the root handle itself is shard 0.
+        assert_eq!(shard_idx(&root), 0);
+        for k in 0..4u64 {
+            let a = root.for_vu(k);
+            let b = root.for_vu(k + 4);
+            assert_eq!(shard_idx(&a), k as usize, "vu {k} pins to shard {k}");
+            assert_eq!(
+                shard_idx(&b),
+                k as usize,
+                "vu {} shares vu {k}'s shard",
+                k + 4
+            );
+        }
+
+        // Concurrent emits from every VU, each pinned to its own bus handle.
+        let metric: Arc<str> = Arc::from("http_reqs");
+        let tags = Arc::new(Tags::new());
+        const PER_VU: usize = 200;
+        let mut handles = Vec::new();
+        for vu_id in 0..8u64 {
+            let vu_bus = root.for_vu(vu_id);
+            let metric = metric.clone();
+            let tags = tags.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..PER_VU {
+                    vu_bus.counter(&metric, 1.0, &tags);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("vu task");
+        }
+
+        let mut target = crate::aggregate::Aggregator::new();
+        shards.drain_into(&mut target);
+        let total = target.snapshot().find("http_reqs").expect("series").agg.sum;
+        assert_eq!(total, (8 * PER_VU) as f64);
+
+        // A second drain sees nothing new: exactly-once delivery.
+        let mut target2 = crate::aggregate::Aggregator::new();
+        shards.drain_into(&mut target2);
+        assert!(target2.snapshot().find("http_reqs").is_none());
     }
 }

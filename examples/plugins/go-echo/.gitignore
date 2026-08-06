@@ -1,5 +1,0 @@
-# Built plugin artifacts (run `make` to produce these).
-libloadr_plugin_goecho.so
-libloadr_plugin_goecho.dylib
-loadr_plugin_goecho.dll
-libloadr_plugin_goecho.h

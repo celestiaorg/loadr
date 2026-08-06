@@ -1,49 +1,35 @@
-# Feeder strategies (Gatling: sequential / random / shuffle, plus JSON feeders)
-# and a global request-rate ceiling (Gatling throttle / reachRps).
-name: feeders-and-throttle
-description: random/shuffle/JSON data feeders + a hard RPS cap
-
-defaults:
-  http: { base_url: https://api.example.com }
+# CSV/JSON feeders with a gRPC request-rate ceiling.
+name: grpc-feeders-and-throttle
 
 data:
-  # Each VU shuffles the user list once, then walks it in that order.
   users:
     type: csv
     path: data/users.csv
     mode: per_vu
     pick: shuffle
     on_eof: recycle
-
-  # A uniformly random SKU every time it's referenced (never exhausts).
   skus:
     type: json
     path: data/skus.json
     pick: random
 
 scenarios:
-  steady_browse:
+  steady:
     executor: constant-vus
     vus: 50
     duration: 5m
-    # No matter how many VUs or how fast the target is, never exceed 200 req/s
-    # in aggregate — the Gatling `throttle` / `reachRps` behaviour.
     throttle: { requests_per_second: 200 }
     flow:
       - request:
-          name: login
-          method: POST
-          url: /login
-          body: { form: { user: "${data.users.username}", pass: "${data.users.password}" } }
-          extract:
-            - { type: jsonpath, name: token, expression: "$.token" }
-      - request:
-          name: product
-          url: "/products/${data.skus.sku}"
-          headers: { Authorization: "Bearer ${token}" }
-          checks: [ { type: status, equals: 200 } ]
+          name: lookup
+          url: grpc://greeter.example.com:50051
+          grpc:
+            proto_files: [protos/helloworld.proto]
+            service: helloworld.Greeter
+            method: SayHello
+            message: { name: "${data.users.username}:${data.skus.sku}" }
+          checks: [{ type: status, equals: 0 }]
 
 thresholds:
-  # With the throttle, http_reqs/s should hover at the ceiling, not above.
-  http_reqs: [ "rate<=205" ]
-  http_req_duration: [ "p(95)<400" ]
+  grpc_reqs: ["rate<=205"]
+  grpc_req_duration: ["p(95)<400"]

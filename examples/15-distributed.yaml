@@ -5,12 +5,8 @@
 #   loadr controller --bind 0.0.0.0:7625 &
 #   loadr agent --join controller-host:7625 --name agent-1 &
 #   loadr run --controller controller-host:6464 examples/15-distributed.yaml
-name: distributed
-description: 600 req/s split across the agent fleet
-
-defaults:
-  http:
-    base_url: https://api.example.com
+name: distributed-grpc
+description: 600 unary RPCs/s split across the agent fleet
 
 scenarios:
   fleet_load:
@@ -21,9 +17,14 @@ scenarios:
     max_vus: 900
     flow:
       - request:
-          name: search
-          url: "/search?q=stress"
-          checks: [ { type: status, equals: 200 } ]
+          name: say-hello
+          url: grpc://greeter.example.com:50051
+          grpc:
+            proto_files: [protos/helloworld.proto]
+            service: helloworld.Greeter
+            method: SayHello
+            message: { name: "agent-vu-${vu}" }
+          checks: [{ type: status, equals: 0 }]
 
   # Scale this one live from the web UI's run page or the controller API.
   manual_dial:
@@ -31,8 +32,15 @@ scenarios:
     max_vus: 500
     duration: 15m
     flow:
-      - request: { name: home, url: / }
+      - request:
+          name: manual-unary
+          url: grpc://greeter.example.com:50051
+          grpc:
+            proto_files: [protos/helloworld.proto]
+            service: helloworld.Greeter
+            method: SayHello
+            message: { name: "manual-${vu}" }
 
 thresholds:
-  http_req_duration: [ "p(95)<400", "p(99)<900" ]
-  http_req_failed: [ "rate<0.01" ]
+  grpc_req_duration: ["p(95)<400", "p(99)<900"]
+  http_req_failed: ["rate<0.01"]

@@ -11,7 +11,7 @@ use loadr_config::{Template, TestPlan};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::aggregate::{Aggregator, Snapshot};
+use crate::aggregate::{Aggregator, MetricShards, Snapshot};
 use crate::error::EngineError;
 use crate::executor::{partition_spec, run_scenario, ExecEnv, ScenarioRunSpec};
 use crate::flow::{FlowRunner, ScenarioProgram};
@@ -36,6 +36,8 @@ pub enum RunStatus {
 /// Options for constructing an [`Engine`].
 pub struct EngineOptions {
     pub run_id: Option<String>,
+    /// Stable identity of this load-generating process within a run.
+    pub instance_id: Option<String>,
     pub protocols: ProtocolRegistry,
     pub script: Option<Arc<dyn ScriptEngine>>,
     pub outputs: Vec<Box<dyn Output>>,
@@ -44,18 +46,23 @@ pub struct EngineOptions {
     /// Extra tags on every sample (e.g. `instance` in distributed mode).
     pub extra_tags: Tags,
     pub snapshot_interval: Duration,
+    /// Loaded `data_source`-capable plugins, keyed by the `plugins:` name
+    /// that `data.<name>.source` refers to.
+    pub data_sources: HashMap<String, Box<dyn crate::data::DataSourcePlugin>>,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         EngineOptions {
             run_id: None,
+            instance_id: None,
             protocols: ProtocolRegistry::new(),
             script: None,
             outputs: Vec::new(),
             partition: None,
             extra_tags: Tags::new(),
             snapshot_interval: Duration::from_secs(1),
+            data_sources: HashMap::new(),
         }
     }
 }
@@ -76,6 +83,7 @@ pub struct RunResult {
 pub struct RunHandle {
     pub run_id: Arc<str>,
     snapshots: watch::Receiver<Arc<Snapshot>>,
+    aggregates: watch::Receiver<Arc<Snapshot>>,
     thresholds: watch::Receiver<Arc<Vec<ThresholdStatus>>>,
     status: watch::Receiver<RunStatus>,
     soft_stop: CancellationToken,
@@ -92,6 +100,13 @@ impl RunHandle {
 
     pub fn watch_snapshots(&self) -> watch::Receiver<Arc<Snapshot>> {
         self.snapshots.clone()
+    }
+
+    /// Exact cumulative rollups for the whole run and each scenario. Unlike a
+    /// regular snapshot, tagged histograms are merged before percentiles are
+    /// calculated.
+    pub fn aggregate_snapshot(&self) -> Arc<Snapshot> {
+        self.aggregates.borrow().clone()
     }
 
     pub fn threshold_statuses(&self) -> Arc<Vec<ThresholdStatus>> {
@@ -163,11 +178,13 @@ pub struct Engine {
     script: Option<Arc<dyn ScriptEngine>>,
     outputs: Vec<Box<dyn Output>>,
     builtins: Arc<BuiltinMetrics>,
+    gauge_tags: Arc<Tags>,
     snapshot_interval: Duration,
     http_defaults: Arc<loadr_config::HttpDefaults>,
     // Handle plumbing.
     handle: RunHandle,
     snapshots_tx: watch::Sender<Arc<Snapshot>>,
+    aggregates_tx: watch::Sender<Arc<Snapshot>>,
     thresholds_tx: watch::Sender<Arc<Vec<ThresholdStatus>>>,
     status_tx: watch::Sender<RunStatus>,
     external_targets: HashMap<String, watch::Receiver<u64>>,
@@ -184,6 +201,17 @@ impl Engine {
         for (k, v) in &opts.extra_tags {
             plan.defaults.tags.insert(k.clone(), v.clone());
         }
+
+        let run_id: Arc<str> = Arc::from(
+            opts.run_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        );
+        let instance_id: Arc<str> = Arc::from(
+            opts.instance_id
+                .clone()
+                .unwrap_or_else(|| "local".to_string()),
+        );
 
         let env: HashMap<String, String> = std::env::vars().collect();
 
@@ -235,7 +263,13 @@ impl Engine {
         let builtins = Arc::new(BuiltinMetrics::resolve(&registry));
 
         // Data feeds.
-        let data = crate::data::DataFeeds::load(&plan.data, &base_dir)?;
+        let mut data = crate::data::DataFeeds::load(&plan.data, &base_dir, opts.data_sources)?;
+        data.set_execution_identity(
+            Arc::clone(&run_id),
+            instance_id,
+            opts.partition.unwrap_or((0, 1)),
+        );
+        let gauge_tags = Arc::new(plan.defaults.tags.clone());
 
         let run_ctx = Arc::new(RunContext {
             variables,
@@ -294,18 +328,15 @@ impl Engine {
             ));
         }
 
-        let run_id: Arc<str> = Arc::from(
-            opts.run_id
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-                .as_str(),
-        );
         let (snapshots_tx, snapshots_rx) = watch::channel(Arc::new(Snapshot::default()));
+        let (aggregates_tx, aggregates_rx) = watch::channel(Arc::new(Snapshot::default()));
         let (thresholds_tx, thresholds_rx) = watch::channel(Arc::new(Vec::new()));
         let (status_tx, status_rx) = watch::channel(RunStatus::Pending);
         let (pause_tx, _pause_rx) = watch::channel(false);
         let handle = RunHandle {
             run_id: run_id.clone(),
             snapshots: snapshots_rx,
+            aggregates: aggregates_rx,
             thresholds: thresholds_rx,
             status: status_rx,
             soft_stop: CancellationToken::new(),
@@ -325,10 +356,12 @@ impl Engine {
             script: opts.script,
             outputs: opts.outputs,
             builtins,
+            gauge_tags,
             snapshot_interval: opts.snapshot_interval,
             http_defaults: Arc::new(plan.defaults.http.clone()),
             handle,
             snapshots_tx,
+            aggregates_tx,
             thresholds_tx,
             status_tx,
             external_targets,
@@ -342,7 +375,31 @@ impl Engine {
     /// Run the test to completion.
     pub async fn run(mut self) -> Result<RunResult, EngineError> {
         let started_ms = crate::metrics::now_millis();
-        let (bus, samples_rx) = MetricsBus::new();
+        // Any output that consumes raw samples pins the whole run to the
+        // classic bus/channel path; otherwise VUs record straight into shard
+        // aggregators — no channel, no per-sample clock read, no end-of-run
+        // drain backlog (see `Output::wants_samples`, `MetricShards`).
+        let wants_samples = self.outputs.iter().any(|o| o.wants_samples());
+        let (bus, sample_source, shard_done) = if wants_samples {
+            let (bus, samples_rx) = MetricsBus::new();
+            (bus, SampleSource::Bus(samples_rx), None)
+        } else {
+            let shard_count = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(16);
+            let shards = Arc::new(MetricShards::new(shard_count));
+            let bus = MetricsBus::sharded(shards.clone());
+            let done = CancellationToken::new();
+            (
+                bus,
+                SampleSource::Shards {
+                    shards,
+                    done: done.clone(),
+                },
+                Some(done),
+            )
+        };
         let _ = self.status_tx.send(RunStatus::Running);
 
         // Abort channel: threshold failures, abort_test assertions.
@@ -357,15 +414,16 @@ impl Engine {
         // Aggregator task.
         let agg_task = {
             let snapshots_tx = self.snapshots_tx.clone();
+            let aggregates_tx = self.aggregates_tx.clone();
             let thresholds_tx = self.thresholds_tx.clone();
             let thresholds = std::mem::take(&mut self.thresholds);
             let abort_tx = abort_tx.clone();
             let interval = self.snapshot_interval;
             tokio::spawn(aggregator_loop(
-                samples_rx,
+                sample_source,
                 outputs,
                 thresholds,
-                snapshots_tx,
+                (snapshots_tx, aggregates_tx),
                 thresholds_tx,
                 abort_tx,
                 interval,
@@ -416,6 +474,17 @@ impl Engine {
                 }
                 Err(e) => {
                     self.handle.kill(format!("setup() failed: {e}"));
+                    // Otherwise `agg_task` never sees end-of-input: in shard
+                    // mode nothing ever cancels `done`; in bus mode `vu` and
+                    // `bus` both still hold a live sender, so `recv()` would
+                    // never return `None`. Either way `agg_task.await` below
+                    // would hang forever instead of letting this early abort
+                    // return an error.
+                    if let Some(done) = &shard_done {
+                        done.cancel();
+                    }
+                    drop(vu);
+                    drop(bus);
                     let _ = agg_task.await;
                     return Err(EngineError::Script(format!("setup() failed: {e}")));
                 }
@@ -428,15 +497,22 @@ impl Engine {
             .iter()
             .map(|_| Arc::new(AtomicU64::new(0)))
             .collect();
+        let requests_in_flight_metric = self
+            .run_ctx
+            .registry
+            .get("requests_in_flight")
+            .map(|d| d.name)
+            .unwrap_or_else(|| Arc::from("requests_in_flight"));
         let gauge_task = {
             let bus = bus.clone();
             let builtins = self.builtins.clone();
+            let requests_in_flight_metric = requests_in_flight_metric.clone();
+            let tags = self.gauge_tags.clone();
             let counters = active_counters.clone();
             let stop = self.handle.hard_stop.clone();
             let done = CancellationToken::new();
             let done_child = done.clone();
             let task = tokio::spawn(async move {
-                let tags = Arc::new(Tags::new());
                 let mut max_seen = 0u64;
                 let mut ticker = tokio::time::interval(Duration::from_secs(1));
                 loop {
@@ -449,6 +525,11 @@ impl Engine {
                     max_seen = max_seen.max(active);
                     bus.gauge(&builtins.vus, active as f64, &tags);
                     bus.gauge(&builtins.vus_max, max_seen as f64, &tags);
+                    bus.gauge(
+                        &requests_in_flight_metric,
+                        bus.requests_in_flight() as f64,
+                        &tags,
+                    );
                 }
             });
             (task, done)
@@ -544,9 +625,20 @@ impl Engine {
             }
         }
 
-        // Stop gauge reporter, close the bus, finish aggregation.
+        // Stop gauge reporter, close the bus (or shard loop), finish aggregation.
         gauge_task.1.cancel();
         let _ = gauge_task.0.await;
+        // Publish explicit terminal live-gauge values before closing the bus,
+        // so scrape-based outputs do not retain stale non-zero values.
+        bus.gauge(&self.builtins.vus, 0.0, &self.gauge_tags);
+        bus.gauge(
+            &requests_in_flight_metric,
+            bus.requests_in_flight() as f64,
+            &Arc::new(Tags::new()),
+        );
+        if let Some(done) = &shard_done {
+            done.cancel();
+        }
         drop(bus);
         let (mut aggregator, mut outputs, threshold_statuses, timeline) = agg_task
             .await
@@ -613,13 +705,27 @@ impl Engine {
     }
 }
 
-/// The aggregator loop: drains samples, snapshots once per interval, feeds
-/// outputs, and evaluates thresholds continuously.
+/// Where the aggregator gets its samples from — chosen once at startup by
+/// `Engine::run` based on `Output::wants_samples`. No hybrid mode.
+enum SampleSource {
+    /// The classic per-run channel, drained here and batched to outputs.
+    Bus(mpsc::UnboundedReceiver<Sample>),
+    /// Shard-local aggregators (see `MetricShards`), drained once per tick
+    /// instead of read sample-by-sample. `done` ends the loop: nothing else
+    /// signals completion since there's no channel to close.
+    Shards {
+        shards: Arc<MetricShards>,
+        done: CancellationToken,
+    },
+}
+
+/// The aggregator loop: drains samples (or shard deltas), snapshots once per
+/// interval, feeds outputs, and evaluates thresholds continuously.
 async fn aggregator_loop(
-    mut samples_rx: mpsc::UnboundedReceiver<Sample>,
+    source: SampleSource,
     mut outputs: Vec<Box<dyn Output>>,
     thresholds: Vec<CompiledThreshold>,
-    snapshots_tx: watch::Sender<Arc<Snapshot>>,
+    snapshot_txs: (watch::Sender<Arc<Snapshot>>, watch::Sender<Arc<Snapshot>>),
     thresholds_tx: watch::Sender<Arc<Vec<ThresholdStatus>>>,
     abort_tx: mpsc::UnboundedSender<String>,
     interval: Duration,
@@ -629,85 +735,198 @@ async fn aggregator_loop(
     Vec<ThresholdStatus>,
     Vec<TimelinePoint>,
 ) {
+    let (snapshots_tx, aggregates_tx) = snapshot_txs;
     let mut agg = Aggregator::new();
     let mut timeline: Vec<TimelinePoint> = Vec::new();
-    let mut batch: Vec<Sample> = Vec::with_capacity(1024);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut abort_sent = false;
+    // Only take/dispatch deltas when some output (e.g. the distributed
+    // agent's uplink) actually consumes them — otherwise this is wasted
+    // HDR-serialization work every tick.
+    let wants_delta = outputs.iter().any(|o| o.wants_delta());
 
-    loop {
-        tokio::select! {
-            maybe = samples_rx.recv() => {
-                match maybe {
-                    Some(sample) => {
-                        agg.record(&sample);
-                        batch.push(sample);
-                        // Opportunistically drain without yielding.
-                        while batch.len() < 8192 {
-                            match samples_rx.try_recv() {
-                                Ok(s) => {
-                                    agg.record(&s);
-                                    batch.push(s);
+    match source {
+        SampleSource::Bus(mut samples_rx) => {
+            let mut batch: Vec<Sample> = Vec::with_capacity(1024);
+            loop {
+                tokio::select! {
+                    maybe = samples_rx.recv() => {
+                        match maybe {
+                            Some(sample) => {
+                                agg.record(&sample);
+                                batch.push(sample);
+                                // Opportunistically drain without yielding.
+                                while batch.len() < 8192 {
+                                    match samples_rx.try_recv() {
+                                        Ok(s) => {
+                                            agg.record(&s);
+                                            batch.push(s);
+                                        }
+                                        Err(_) => break,
+                                    }
                                 }
-                                Err(_) => break,
+                                if batch.len() >= 8192 {
+                                    for output in &mut outputs {
+                                        output.on_samples(&batch).await;
+                                    }
+                                    batch.clear();
+                                }
                             }
+                            None => break,
                         }
-                        if batch.len() >= 8192 {
+                    }
+                    _ = ticker.tick() => {
+                        if !batch.is_empty() {
                             for output in &mut outputs {
                                 output.on_samples(&batch).await;
                             }
                             batch.clear();
                         }
+                        tick(
+                            &mut agg, &mut outputs, &thresholds, &snapshots_tx, &aggregates_tx,
+                            &thresholds_tx, &abort_tx, &mut timeline, wants_delta, &mut abort_sent,
+                        )
+                        .await;
                     }
-                    None => break,
                 }
             }
-            _ = ticker.tick() => {
-                if !batch.is_empty() {
-                    for output in &mut outputs {
-                        output.on_samples(&batch).await;
-                    }
-                    batch.clear();
-                }
-                let snapshot = Arc::new(agg.snapshot());
-                timeline.push(TimelinePoint::from_snapshot(&snapshot));
+            if !batch.is_empty() {
                 for output in &mut outputs {
-                    output.on_snapshot(&snapshot).await;
-                }
-                let _ = snapshots_tx.send(snapshot);
-                let (statuses, abort) = evaluate_all(&thresholds, &agg, agg.elapsed());
-                let _ = thresholds_tx.send(Arc::new(statuses));
-                if abort && !abort_sent {
-                    abort_sent = true;
-                    let _ = abort_tx.send("threshold crossed (abort_on_fail)".to_string());
+                    output.on_samples(&batch).await;
                 }
             }
         }
-    }
-    if !batch.is_empty() {
-        for output in &mut outputs {
-            output.on_samples(&batch).await;
+        SampleSource::Shards { shards, done } => {
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        shards.drain_into(&mut agg);
+                        tick(
+                            &mut agg, &mut outputs, &thresholds, &snapshots_tx, &aggregates_tx,
+                            &thresholds_tx, &abort_tx, &mut timeline, wants_delta, &mut abort_sent,
+                        )
+                        .await;
+                    }
+                    _ = done.cancelled() => break,
+                }
+            }
+            // Fold in anything recorded since the last tick.
+            shards.drain_into(&mut agg);
         }
     }
-    // Final threshold evaluation over the complete data.
-    let (statuses, _) = evaluate_all(&thresholds, &agg, agg.elapsed());
+
+    let last_statuses = finalize(
+        &mut agg,
+        &mut outputs,
+        &thresholds,
+        &snapshots_tx,
+        &aggregates_tx,
+        &thresholds_tx,
+        &mut timeline,
+        wants_delta,
+    )
+    .await;
+    (agg, outputs, last_statuses, timeline)
+}
+
+/// Snapshot, dispatch to outputs, evaluate thresholds — the work every
+/// snapshot tick does regardless of how samples got into `agg` (bus batches
+/// or shard drains).
+#[allow(clippy::too_many_arguments)]
+async fn tick(
+    agg: &mut Aggregator,
+    outputs: &mut [Box<dyn Output>],
+    thresholds: &[CompiledThreshold],
+    snapshots_tx: &watch::Sender<Arc<Snapshot>>,
+    aggregates_tx: &watch::Sender<Arc<Snapshot>>,
+    thresholds_tx: &watch::Sender<Arc<Vec<ThresholdStatus>>>,
+    abort_tx: &mpsc::UnboundedSender<String>,
+    timeline: &mut Vec<TimelinePoint>,
+    wants_delta: bool,
+    abort_sent: &mut bool,
+) {
+    let aggregates = Arc::new(agg.aggregate_snapshot(&[&["scenario"]]));
+    let snapshot = Arc::new(agg.snapshot());
+    timeline.push(TimelinePoint::from_snapshots(&snapshot, Some(&aggregates)));
+    for output in outputs.iter_mut() {
+        output.on_snapshot(&snapshot).await;
+    }
+    let _ = snapshots_tx.send(snapshot);
+    let _ = aggregates_tx.send(aggregates);
+    if wants_delta {
+        dispatch_delta(agg, outputs, false).await;
+    }
+    let (statuses, abort) = evaluate_all(thresholds, agg, agg.elapsed());
+    let _ = thresholds_tx.send(Arc::new(statuses));
+    if abort && !*abort_sent {
+        *abort_sent = true;
+        let _ = abort_tx.send("threshold crossed (abort_on_fail)".to_string());
+    }
+}
+
+/// End-of-run: final threshold evaluation, final snapshot (with a trailing
+/// timeline point for the residual window so short runs still produce a
+/// timeline), and final delta flush.
+#[allow(clippy::too_many_arguments)]
+async fn finalize(
+    agg: &mut Aggregator,
+    outputs: &mut [Box<dyn Output>],
+    thresholds: &[CompiledThreshold],
+    snapshots_tx: &watch::Sender<Arc<Snapshot>>,
+    aggregates_tx: &watch::Sender<Arc<Snapshot>>,
+    thresholds_tx: &watch::Sender<Arc<Vec<ThresholdStatus>>>,
+    timeline: &mut Vec<TimelinePoint>,
+    wants_delta: bool,
+) -> Vec<ThresholdStatus> {
+    let (statuses, _) = evaluate_all(thresholds, agg, agg.elapsed());
     let _ = thresholds_tx.send(Arc::new(statuses.clone()));
-    let last_statuses = statuses;
+    let final_aggregates = Arc::new(agg.aggregate_snapshot(&[&["scenario"]]));
     let final_snapshot = Arc::new(agg.snapshot());
-    // Capture a trailing point for the residual window since the last tick so
-    // short runs (shorter than one interval) still produce a timeline, and the
-    // tail of every run is represented.
     if final_snapshot.interval_secs > 0.0
         && final_snapshot
             .series
             .iter()
             .any(|s| s.interval_count > 0 || s.metric == "vus")
     {
-        timeline.push(TimelinePoint::from_snapshot(&final_snapshot));
+        timeline.push(TimelinePoint::from_snapshots(
+            &final_snapshot,
+            Some(&final_aggregates),
+        ));
     }
     let _ = snapshots_tx.send(final_snapshot);
-    (agg, outputs, last_statuses, timeline)
+    let _ = aggregates_tx.send(final_aggregates);
+    if wants_delta {
+        // Final flush: the run is ending, so block until it's accepted
+        // (matches the pre-existing blocking final-flush behavior) rather
+        // than restoring on a rejection nobody will retry.
+        dispatch_delta(agg, outputs, true).await;
+    }
+    statuses
+}
+
+/// Drain a delta and hand it to every output that opted in via
+/// `wants_delta`. If any of them rejects it (e.g. a congested channel),
+/// restore it into the aggregator so the next `take_delta` retries it
+/// together with anything recorded meanwhile.
+/// The drained delta is shared by every `wants_delta` output and restored
+/// if ANY refuses — with more than one delta consumer an accepting output
+/// would see that data again next tick, so this path assumes a single
+/// consumer (the agent uplink).
+async fn dispatch_delta(agg: &mut Aggregator, outputs: &mut [Box<dyn Output>], last: bool) {
+    let delta = agg.take_delta();
+    if delta.series.is_empty() {
+        return;
+    }
+    let mut all_accepted = true;
+    for output in outputs.iter_mut() {
+        if output.wants_delta() && !output.on_delta(&delta, last).await {
+            all_accepted = false;
+        }
+    }
+    if !all_accepted {
+        agg.restore_delta(&delta);
+    }
 }
 
 fn resolve_static_value(

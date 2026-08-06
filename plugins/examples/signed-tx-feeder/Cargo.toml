@@ -1,0 +1,20 @@
+[package]
+name = "loadr-example-signed-tx-feeder"
+description = "Reference native feeder that generates Ed25519-signed transaction bytes"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "signed_tx_feeder"
+crate-type = ["cdylib"]
+
+[dependencies]
+loadr-feeder-api = { path = "../../../crates/loadr-feeder-api" }
+abi_stable = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }

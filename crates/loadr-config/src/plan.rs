@@ -64,11 +64,6 @@ pub struct TestPlan {
     /// Metric outputs/exporters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<OutputConfig>,
-    /// System-metric collectors pulled in for load↔system correlation (the
-    /// inverse of `outputs`): foreign metrics are normalized and overlaid on the
-    /// run timeline. See the `observe` design RFC.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observe: Vec<ObserveConfig>,
     /// Plugins to load for this test.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginRef>,
@@ -1246,6 +1241,32 @@ pub struct GrpcOptions {
     /// gRPC metadata (in addition to request `headers`).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub metadata: IndexMap<String, String>,
+    /// Share a fixed pool of N HTTP/2 channels across all VUs for this endpoint,
+    /// round-robined (vs. the default: one connection per VU). Recommended for
+    /// high-concurrency runs against a single endpoint. Must be >= 1 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_pool_size: Option<usize>,
+    /// Client transport: `channel` (default) or `raw`. The `LOADR_GRPC_TRANSPORT`
+    /// env var overrides this for whole-fleet A/B runs.
+    #[serde(default, skip_serializing_if = "GrpcTransport::is_default")]
+    pub transport: GrpcTransport,
+}
+
+/// Client transport driving gRPC calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcTransport {
+    /// tonic `Channel`: a tower::buffer queue plus a worker task per channel.
+    #[default]
+    Channel,
+    /// Direct hyper HTTP/2 driven from the VU task (experimental perf path).
+    Raw,
+}
+
+impl GrpcTransport {
+    fn is_default(&self) -> bool {
+        *self == GrpcTransport::Channel
+    }
 }
 
 /// GraphQL request options.
@@ -1645,6 +1666,30 @@ pub enum Condition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_failure: Option<FailureAction>,
     },
+    /// Descriptor-aware assertion over a top-level protobuf response field.
+    /// Unlike JSONPath, this observes proto3 implicit defaults and explicit
+    /// presence without converting the response message to JSON.
+    ProtobufField {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Exact field name from the response message's `.proto` definition.
+        field: String,
+        /// Expected scalar value. Type compatibility is checked against the
+        /// response descriptor when the gRPC call is resolved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        equals: Option<serde_json::Value>,
+        /// Require/forbid protobuf presence (default: require). Implicit
+        /// proto3 scalars are always semantically present with their default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exists: Option<bool>,
+        /// Optional bounded semantic-failure grouping. Only listed numeric
+        /// values receive their own group; all other values collapse to
+        /// `other` rather than creating an unbounded metric series.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_groups: Option<BTreeMap<i64, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_failure: Option<FailureAction>,
+    },
     /// Body contains a substring.
     BodyContains {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1746,6 +1791,7 @@ impl Condition {
             | Condition::BodyContains { name, .. }
             | Condition::BodyMatches { name, .. }
             | Condition::Jsonpath { name, .. }
+            | Condition::ProtobufField { name, .. }
             | Condition::Xpath { name, .. }
             | Condition::Duration { name, .. }
             | Condition::Size { name, .. }
@@ -1781,6 +1827,7 @@ impl Condition {
             }
             Condition::BodyMatches { pattern, .. } => format!("body matches /{pattern}/"),
             Condition::Jsonpath { expression, .. } => format!("jsonpath {expression}"),
+            Condition::ProtobufField { field, .. } => format!("protobuf field {field}"),
             Condition::Xpath { expression, .. } => format!("xpath {expression}"),
             Condition::Duration { max, .. } => format!("duration < {max}"),
             Condition::Size { .. } => "body size".to_string(),
@@ -1795,6 +1842,7 @@ impl Condition {
             | Condition::BodyContains { on_failure, .. }
             | Condition::BodyMatches { on_failure, .. }
             | Condition::Jsonpath { on_failure, .. }
+            | Condition::ProtobufField { on_failure, .. }
             | Condition::Xpath { on_failure, .. }
             | Condition::Duration { on_failure, .. }
             | Condition::Size { on_failure, .. }
@@ -1946,6 +1994,18 @@ pub enum DataSource {
         #[serde(default)]
         pick: PickStrategy,
     },
+    /// Rows generated on demand by a `data_source`-capable plugin listed
+    /// under `plugins:`. Rows are per-request: each request preparation
+    /// pulls a fresh row; a plugin that reports exhaustion retires the VU
+    /// (like `on_eof: stop`). No `mode`/`on_eof`/`pick` — those describe
+    /// stored-row iteration, which doesn't apply here.
+    Plugin {
+        /// Plugin name (a `plugins:` entry) that generates the rows.
+        source: String,
+        /// Source-level config passed to the plugin at init.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        config: serde_json::Value,
+    },
 }
 
 /// Where a secret's value comes from.
@@ -2004,10 +2064,6 @@ pub struct JsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputConfig {
-    /// Newline-delimited JSON samples + periodic aggregates.
-    Json { path: PathBuf },
-    /// CSV samples.
-    Csv { path: PathBuf },
     /// Prometheus: optional scrape endpoint and/or remote-write push.
     Prometheus {
         /// Scrape endpoint listen address, e.g. `127.0.0.1:9091`.
@@ -2019,97 +2075,12 @@ pub enum OutputConfig {
         /// Push interval (default `5s`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interval: Option<Dur>,
+        /// Keep a standalone scrape endpoint alive for this long after
+        /// completion so Prometheus can collect the terminal snapshot.
+        /// Delays run exit by as much; disabled by default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_scrape_grace: Option<Dur>,
     },
-    /// InfluxDB line protocol over HTTP.
-    Influxdb {
-        /// e.g. `http://influxdb:8086`.
-        url: String,
-        /// Database (v1) or bucket (v2).
-        database: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        organization: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        interval: Option<Dur>,
-    },
-    /// OpenTelemetry metrics (OTLP).
-    Otlp {
-        /// e.g. `http://otel-collector:4317` (gRPC) or `:4318` (HTTP).
-        endpoint: String,
-        #[serde(default)]
-        protocol: OtlpProtocol,
-        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-        headers: IndexMap<String, String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        interval: Option<Dur>,
-    },
-    /// StatsD over UDP.
-    Statsd {
-        /// e.g. `127.0.0.1:8125`.
-        address: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prefix: Option<String>,
-    },
-    /// An output provided by a plugin.
-    Plugin {
-        /// Plugin name (must be listed under `plugins:` or installed).
-        name: String,
-        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-        config: serde_json::Value,
-    },
-}
-
-/// System-metric collector configuration — the inverse of [`OutputConfig`].
-/// Each entry pulls foreign metrics in for the run window so they can be
-/// correlated with (and overlaid on) the load metrics. `type`-discriminated so
-/// new collectors slot in without breaking existing plans.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ObserveConfig {
-    /// Query a Prometheus server with a PromQL expression as a range query over
-    /// the run window.
-    Prometheus {
-        /// Human label for this series (shown in logs/legend if `as` is unset).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        /// Prometheus base URL, e.g. `http://prometheus:9090`.
-        source: String,
-        /// PromQL expression, evaluated as a range query.
-        query: String,
-        /// Canonical metric name shown in the report (default: `name`, else query).
-        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
-        as_name: Option<String>,
-        /// Unit hint for axis formatting: `ratio | percent | bytes | count | seconds`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        unit: Option<String>,
-        /// Optional bearer token (use `${env.VAR}`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-    },
-    /// Sample the local host's CPU / memory / disk / network from `/proc`,
-    /// live on the load timeline. Linux-only; other platforms log a warning
-    /// and produce no series.
-    System {
-        /// Metrics to sample: `cpu | memory | disk | network` (default: all).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        metrics: Vec<String>,
-        /// Sampling interval (default `1s`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        interval: Option<Dur>,
-        /// Series name prefix (default `system`, giving `system_cpu`, …).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        as_prefix: Option<String>,
-    },
-}
-
-/// OTLP transport.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum OtlpProtocol {
-    #[default]
-    Grpc,
-    Http,
 }
 
 /// Reference to a plugin to load.
@@ -2211,7 +2182,6 @@ thresholds:
   checks: "rate>0.99"
 
 outputs:
-  - { type: json, path: results.jsonl }
   - { type: prometheus, listen: 127.0.0.1:9091 }
 
 plugins:
@@ -2285,6 +2255,37 @@ plugins:
             .executor_spec()
             .unwrap_err()
             .contains("`max_vus` cannot be less"));
+    }
+
+    #[test]
+    fn protobuf_field_condition_round_trips() {
+        let yaml = r#"
+type: protobuf_field
+name: admission_accepted
+field: code
+equals: 0
+failure_groups:
+  18: WrongShard
+  20: PoolAtCapacity
+"#;
+        let condition: Condition = serde_yaml::from_str(yaml).expect("parse condition");
+        match &condition {
+            Condition::ProtobufField {
+                name,
+                field,
+                equals,
+                failure_groups,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("admission_accepted"));
+                assert_eq!(field, "code");
+                assert_eq!(equals.as_ref(), Some(&serde_json::json!(0)));
+                assert_eq!(failure_groups.as_ref().unwrap()[&18], "WrongShard");
+            }
+            other => panic!("expected protobuf condition, got {other:?}"),
+        }
+        let encoded = serde_yaml::to_string(&condition).expect("serialize condition");
+        let _: Condition = serde_yaml::from_str(&encoded).expect("reparse condition");
     }
 
     #[test]
@@ -2379,5 +2380,35 @@ flow:
         let c: Condition =
             serde_yaml::from_str("{ type: duration, max: 500ms, name: fast }").unwrap();
         assert_eq!(c.display_name(), "fast");
+    }
+
+    #[test]
+    fn plugin_data_source_round_trips() {
+        let ds: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer, config: { chain_id: t-1 } }")
+                .expect("parse");
+        match &ds {
+            DataSource::Plugin { source, config } => {
+                assert_eq!(source, "tx-signer");
+                assert_eq!(config["chain_id"], "t-1");
+            }
+            other => panic!("expected DataSource::Plugin, got {other:?}"),
+        }
+        let yaml = serde_yaml::to_string(&ds).expect("serialize");
+        let back: DataSource = serde_yaml::from_str(&yaml).expect("reparse");
+        assert!(matches!(back, DataSource::Plugin { .. }));
+    }
+
+    #[test]
+    fn plugin_data_source_config_defaults_to_null() {
+        let ds: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer }").expect("parse");
+        match &ds {
+            DataSource::Plugin { source, config } => {
+                assert_eq!(source, "tx-signer");
+                assert!(config.is_null());
+            }
+            other => panic!("expected DataSource::Plugin, got {other:?}"),
+        }
     }
 }

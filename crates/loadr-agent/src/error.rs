@@ -25,4 +25,6 @@ pub enum AgentError {
     UnknownRun(String),
     #[error("engine error: {0}")]
     Engine(String),
+    #[error("control command failed: {0}")]
+    Control(String),
 }

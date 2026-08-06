@@ -1,9 +1,0 @@
-# Scrape the loadr Prometheus endpoint (loadr.yaml -> outputs: prometheus :9091).
-# loadr runs on the host; the container reaches it via host.docker.internal.
-global:
-  scrape_interval: 5s
-
-scrape_configs:
-  - job_name: loadr
-    static_configs:
-      - targets: ["host.docker.internal:9091"]

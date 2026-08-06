@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use loadr_config::ExecutorSpec;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch, Semaphore, TryAcquireError};
 use tokio_util::sync::CancellationToken;
 
 use crate::flow::{FlowRunner, IterationOutcome};
@@ -608,9 +608,149 @@ impl RateSchedule {
     }
 }
 
-/// Open-model executors: a dispatcher starts iterations on schedule via a pool
-/// of workers, growing the pool to `max_vus` and recording dropped iterations
-/// when starved.
+/// Arrival dispatch tick. Arrivals due within one tick are released as a
+/// single burst, so the tick bounds both scheduling precision and burst size
+/// (e.g. at 150k/s a 5ms tick wakes ~750 workers back-to-back). It also
+/// bounds how long a published arrival stays claimable before it is recorded
+/// as dropped (see [`ArrivalGate`]). Tunable via `LOADR_DISPATCH_TICK_US`;
+/// 1000 is recommended above ~50k/s per process.
+fn dispatch_tick() -> Duration {
+    static TICK: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TICK.get_or_init(|| {
+        let us = std::env::var("LOADR_DISPATCH_TICK_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000)
+            .clamp(250, 1_000_000);
+        Duration::from_micros(us)
+    })
+}
+
+/// Shared hand-off state between the arrival dispatcher and its workers.
+///
+/// Published arrivals are semaphore permits: `publish` adds one permit per
+/// whole arrival due this tick, and tokio's fair semaphore hands permits to
+/// FIFO-parked workers first — waking exactly as many workers as there are
+/// arrivals, never the whole pool (the broadcast over-waking measured in
+/// goals/perf-round-two/dispatcher-ab/results.md). A permit already assigned
+/// to a parked worker counts as claimed: it escapes tick expiry and runs
+/// when that worker is polled — except across closure, where the worker
+/// observes `Closed` instead and the permit is returned for the post-join
+/// sweep. Conservation: every permit is consumed exactly once, by a worker's
+/// `forget` (runs) or a dispatcher sweep (dropped).
+struct ArrivalGate {
+    /// Permits = published-but-unclaimed arrivals. Closing the semaphore
+    /// linearizes shutdown: every `Claimed` happens strictly before
+    /// `close()` (tokio checks the closed bit before assigned permits).
+    budget: Semaphore,
+    /// Workers currently parked in `claim_parked` (sizes pool growth).
+    parked: AtomicU64,
+    /// Cancelled at closure so waiters not blocked on the semaphore — the
+    /// paused branch — still observe shutdown promptly instead of sleeping
+    /// out the grace period.
+    closed: CancellationToken,
+}
+
+enum Claim {
+    Claimed,
+    Empty,
+    Closed,
+}
+
+struct ParkGuard<'a>(&'a ArrivalGate);
+
+impl Drop for ParkGuard<'_> {
+    fn drop(&mut self) {
+        self.0.parked.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ArrivalGate {
+    fn new() -> Self {
+        Self {
+            budget: Semaphore::new(0),
+            parked: AtomicU64::new(0),
+            closed: CancellationToken::new(),
+        }
+    }
+
+    /// Claim one published arrival without waiting.
+    fn try_claim(&self) -> Claim {
+        match self.budget.try_acquire() {
+            Ok(permit) => {
+                permit.forget();
+                Claim::Claimed
+            }
+            Err(TryAcquireError::NoPermits) => Claim::Empty,
+            Err(TryAcquireError::Closed) => Claim::Closed,
+        }
+    }
+
+    /// Park until an arrival is assigned to this worker (fair FIFO order)
+    /// or dispatch closes. `true` = claimed exactly one arrival.
+    async fn claim_parked(&self) -> bool {
+        match self.budget.acquire().await {
+            Ok(permit) => {
+                permit.forget();
+                true
+            }
+            Err(_) => false, // closed
+        }
+    }
+
+    /// Count this worker as parked for the dispatcher's growth sizing until
+    /// the guard drops.
+    fn park(&self) -> ParkGuard<'_> {
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        ParkGuard(self)
+    }
+
+    /// Publish a batch of whole arrivals. Permits go to parked workers
+    /// first (waking exactly the assignees); leftovers pool up for running
+    /// workers' `try_claim`. A fresh batch is claimable until `now + tick`;
+    /// while an earlier batch's expiry is still pending (burst ticks), new
+    /// arrivals share it rather than extending older work indefinitely.
+    fn publish(&self, due: u64, expiry: &mut Option<Instant>, now: Instant, tick: Duration) {
+        self.budget.add_permits(due as usize);
+        expiry.get_or_insert(now + tick);
+    }
+
+    /// Expire the active batch once wall time reaches its deadline,
+    /// returning the unclaimed remainder. Driven only by the dispatcher's
+    /// tick — never by ticker-event count (`Burst` delivers several events
+    /// back-to-back after a stall) and never from claims.
+    fn expire_due(&self, expiry: &mut Option<Instant>, now: Instant) -> u64 {
+        match *expiry {
+            Some(at) if now >= at => {
+                *expiry = None;
+                self.take_unclaimed()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Sweep all unassigned permits in one CAS (permits already assigned to
+    /// parked workers are claimed and not sweepable — see type docs).
+    fn take_unclaimed(&self) -> u64 {
+        self.budget.forget_permits(Semaphore::MAX_PERMITS) as u64
+    }
+
+    /// Close dispatch: no claim can start afterwards. Returns the pool
+    /// remainder for drop accounting; the caller must sweep once more after
+    /// joining workers to collect permits surrendered by parked workers'
+    /// cancelled acquires.
+    fn close(&self) -> u64 {
+        self.budget.close();
+        self.closed.cancel();
+        self.take_unclaimed()
+    }
+}
+
+/// Open-model executors: workers claim scheduled arrivals as semaphore
+/// permits from a shared tick-bounded budget (see [`ArrivalGate`]); the
+/// dispatcher publishes each tick's batch — waking exactly the workers that
+/// receive one — grows the pool to `max_vus`, and records arrivals nobody
+/// claimed within one dispatch interval as dropped iterations.
 async fn run_arrival_rate(
     spec: &ScenarioRunSpec,
     env: &ExecEnv,
@@ -628,103 +768,189 @@ async fn run_arrival_rate(
         spec.graceful_stop,
     );
 
-    // Idle workers park a oneshot here; the dispatcher fires it to start an iteration.
-    let (idle_tx, mut idle_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+    let gate = Arc::new(ArrivalGate::new());
     let mut worker_handles = Vec::new();
-    let spawn_worker =
-        |run_first: bool,
-         env: ExecEnv,
-         cancel: CancellationToken,
-         idle_tx: mpsc::UnboundedSender<oneshot::Sender<()>>| {
-            tokio::spawn(async move {
-                let mut worker = env.new_worker();
-                env.active_vus.fetch_add(1, Ordering::Relaxed);
-                let mut first = run_first;
-                loop {
-                    if !first {
-                        let (tx, rx) = oneshot::channel();
-                        if idle_tx.send(tx).is_err() {
-                            break;
+    // Workers claim arrivals themselves; newly spawned workers take the same
+    // claim path (no implicit first iteration). A claim flows unconditionally
+    // into the iteration: any check between claim and run would leak budget.
+    let spawn_worker = |env: ExecEnv, cancel: CancellationToken, gate: Arc<ArrivalGate>| {
+        tokio::spawn(async move {
+            let mut worker = env.new_worker();
+            env.active_vus.fetch_add(1, Ordering::Relaxed);
+            'live: loop {
+                // Re-check pause before every claim. A permit assigned just
+                // as pause flips runs one extra iteration — bounded by one
+                // tick's batch, same class as the pre-claim race of the
+                // broadcast design. The closed arm keeps a run that ends
+                // while paused from sleeping out the grace period.
+                if *env.pause.borrow() {
+                    tokio::select! {
+                        _ = gate.closed.cancelled() => break,
+                        ok = env.wait_unpaused(&cancel) => {
+                            if !ok {
+                                break;
+                            }
                         }
+                    }
+                    continue;
+                }
+                match gate.try_claim() {
+                    Claim::Claimed => {
+                        if !env.run_one(&mut worker, &cancel).await {
+                            break 'live;
+                        }
+                    }
+                    Claim::Closed => break,
+                    Claim::Empty => {
+                        let parked = gate.park();
                         tokio::select! {
                             _ = cancel.cancelled() => break,
-                            r = rx => { if r.is_err() { break; } }
+                            got = gate.claim_parked() => {
+                                drop(parked);
+                                if !got {
+                                    break; // closed while parked
+                                }
+                                if !env.run_one(&mut worker, &cancel).await {
+                                    break 'live;
+                                }
+                            }
                         }
                     }
-                    first = false;
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    if !env.run_one(&mut worker, &cancel).await {
-                        break;
-                    }
                 }
-                env.active_vus.fetch_sub(1, Ordering::Relaxed);
-            })
-        };
+            }
+            env.active_vus.fetch_sub(1, Ordering::Relaxed);
+        })
+    };
 
     for _ in 0..pre_allocated {
         worker_handles.push(spawn_worker(
-            false,
             env.clone(),
             scenario_cancel.clone(),
-            idle_tx.clone(),
+            gate.clone(),
         ));
     }
     let mut allocated = pre_allocated;
 
     let dropped_metric = &env.builtins.dropped_iterations;
     let scenario_tags = env.runner.program.tags.clone();
+    let record_dropped = |n: u64| {
+        if n > 0 {
+            env.metrics
+                .counter(dropped_metric, n as f64, &scenario_tags);
+        }
+    };
+
     let started = Instant::now();
     let mut emitted: f64 = 0.0; // fractional iterations owed
-    let mut ticker = tokio::time::interval(Duration::from_millis(5));
+    let tick = dispatch_tick();
+    let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    let deadline = tokio::time::sleep_until(soft_deadline.into());
+    tokio::pin!(deadline);
     let mut last = Instant::now();
+    // Wall-clock deadline of the active batch; enforced on dispatcher wakes.
+    let mut expiry: Option<Instant> = None;
+    // Distinguishes reaching the schedule's natural end from stop/cancel:
+    // only a natural end drains the final flushed batch before closing.
+    let mut natural_end = false;
 
     loop {
-        tokio::select! {
+        let deadline_elapsed = tokio::select! {
             _ = scenario_cancel.cancelled() => break,
             _ = env.soft_stop.cancelled() => break,
-            _ = ticker.tick() => {}
-        }
-        let now = Instant::now();
-        if now >= soft_deadline {
-            break;
-        }
+            _ = ticker.tick() => false,
+            _ = &mut deadline => true,
+        };
+        // A configurable tick may be as long as (or longer than) the whole
+        // schedule. Credit and publish the interval ending at the deadline
+        // before exiting, with the deadline itself as a wake-up so the flush
+        // is not late; every path below breaks once the deadline elapsed, so
+        // the completed sleep is never polled again.
+        let now = Instant::now().min(soft_deadline);
+        let deadline_elapsed = deadline_elapsed || now >= soft_deadline;
+        record_dropped(gate.expire_due(&mut expiry, now));
         if *env.pause.borrow() {
+            // Paused ticks publish nothing and expire what was already
+            // published, so resume starts with no claimable backlog.
+            // Workers stay parked until the next productive broadcast.
+            if expiry.take().is_some() {
+                record_dropped(gate.take_unclaimed());
+            }
             last = now;
+            if deadline_elapsed {
+                natural_end = true;
+                break;
+            }
             continue;
         }
         let dt = (now - last).as_secs_f64();
         last = now;
         emitted += schedule.rate_at(started.elapsed()) * dt;
-        while emitted >= 1.0 {
-            emitted -= 1.0;
-            match idle_rx.try_recv() {
-                Ok(tx) => {
-                    let _ = tx.send(());
-                }
-                Err(_) => {
-                    if allocated < max_vus {
-                        allocated += 1;
-                        worker_handles.push(spawn_worker(
-                            true,
-                            env.clone(),
-                            scenario_cancel.clone(),
-                            idle_tx.clone(),
-                        ));
-                    } else {
-                        env.metrics.counter(dropped_metric, 1.0, &scenario_tags);
-                    }
-                }
+        let due = emitted as u64;
+        if due == 0 {
+            if deadline_elapsed {
+                natural_end = true;
+                break;
             }
+            continue;
+        }
+        emitted -= due as f64;
+        // Grow for arrivals the parked workers can't absorb, up to max_vus.
+        // Workers waiting out a pause are not counted, so the first tick
+        // after a resume may over-spawn slightly — capped by max_vus.
+        let parked = gate.parked.load(Ordering::SeqCst);
+        let grow = due
+            .saturating_sub(parked)
+            .min(max_vus.saturating_sub(allocated));
+        for _ in 0..grow {
+            worker_handles.push(spawn_worker(
+                env.clone(),
+                scenario_cancel.clone(),
+                gate.clone(),
+            ));
+        }
+        allocated += grow;
+        gate.publish(due, &mut expiry, now, tick);
+        if deadline_elapsed {
+            natural_end = true;
+            break;
         }
     }
-    drop(idle_tx);
-    // Allow in-flight iterations their graceful stop, then cancel.
+    // A natural end flushes the final partial interval above, but closing in
+    // the same poll would drop all of it: closure fails the acquires of
+    // permits tokio has already assigned to parked workers (the closed bit
+    // wins — see ArrivalGate), before those workers ever run. Let the active
+    // batch live out its claim window instead: ticks keep driving expiry, so
+    // this waits at most one dispatch interval, and stop/cancel (including
+    // the graceful-stop watchdog) still exits immediately.
+    if natural_end {
+        while expiry.is_some() {
+            tokio::select! {
+                _ = scenario_cancel.cancelled() => break,
+                _ = env.soft_stop.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            if *env.pause.borrow() {
+                if expiry.take().is_some() {
+                    record_dropped(gate.take_unclaimed());
+                }
+                break;
+            }
+            record_dropped(gate.expire_due(&mut expiry, Instant::now()));
+        }
+    }
+    // Deadline, soft stop, or cancellation: unclaimed budget is dropped, and
+    // closing releases parked and paused workers immediately (idle workers
+    // must not wait out the grace period) while in-flight iterations finish
+    // under the graceful window armed above.
+    record_dropped(gate.close());
     for h in worker_handles {
         let _ = h.await;
     }
+    // Permits that were assigned to parked workers at closure return to the
+    // pool only as their acquire futures drop during the join; sweep them so
+    // published = completed + dropped stays exact.
+    record_dropped(gate.take_unclaimed());
     scenario_cancel.cancel();
 }
 
@@ -930,6 +1156,156 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[test]
+    fn gate_claims_are_exact_and_never_underflow() {
+        let gate = ArrivalGate::new();
+        assert!(matches!(gate.try_claim(), Claim::Empty));
+        let mut expiry = None;
+        gate.publish(3, &mut expiry, Instant::now(), Duration::from_millis(5));
+        for _ in 0..3 {
+            assert!(matches!(gate.try_claim(), Claim::Claimed));
+        }
+        assert!(matches!(gate.try_claim(), Claim::Empty));
+    }
+
+    #[test]
+    fn gate_concurrent_claims_match_budget_exactly() {
+        let gate = Arc::new(ArrivalGate::new());
+        let mut expiry = None;
+        gate.publish(1000, &mut expiry, Instant::now(), Duration::from_millis(5));
+        let claimed = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (gate, claimed) = (gate.clone(), claimed.clone());
+                std::thread::spawn(move || {
+                    while matches!(gate.try_claim(), Claim::Claimed) {
+                        claimed.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(claimed.load(Ordering::SeqCst), 1000);
+        assert!(matches!(gate.try_claim(), Claim::Empty));
+    }
+
+    #[test]
+    fn gate_expiry_accounting_is_exact() {
+        let gate = ArrivalGate::new();
+        let tick = Duration::from_millis(5);
+        let t0 = Instant::now();
+        let mut expiry = None;
+        assert_eq!(gate.expire_due(&mut expiry, t0), 0); // nothing active
+
+        gate.publish(3, &mut expiry, t0, tick);
+        assert_eq!(expiry, Some(t0 + tick));
+        gate.publish(2, &mut expiry, t0 + tick / 2, tick); // burst batch
+        assert_eq!(expiry, Some(t0 + tick)); // shares, never extends
+
+        assert!(matches!(gate.try_claim(), Claim::Claimed));
+        assert_eq!(
+            gate.expire_due(&mut expiry, t0 + tick - Duration::from_micros(1)),
+            0
+        );
+        // 5 published = 1 claimed + 4 dropped.
+        assert_eq!(gate.expire_due(&mut expiry, t0 + tick), 4);
+        assert_eq!(expiry, None);
+        assert!(matches!(gate.try_claim(), Claim::Empty));
+
+        gate.publish(1, &mut expiry, t0 + tick * 2, tick); // fresh window afterwards
+        assert_eq!(expiry, Some(t0 + tick * 3));
+    }
+
+    #[test]
+    fn gate_close_returns_unclaimed_and_blocks_claims() {
+        let gate = ArrivalGate::new();
+        let mut expiry = None;
+        gate.publish(5, &mut expiry, Instant::now(), Duration::from_millis(5));
+        assert!(matches!(gate.try_claim(), Claim::Claimed));
+        assert!(matches!(gate.try_claim(), Claim::Claimed));
+        assert_eq!(gate.close(), 3);
+        assert!(matches!(gate.try_claim(), Claim::Closed)); // Closed, not Empty
+        assert_eq!(gate.take_unclaimed(), 0);
+    }
+
+    /// Drives the real worker loop shape (hot try_claim, park, select with a
+    /// cancel arm) against publishes that feed tokio's assign-on-add path:
+    /// every published permit must be claimed or swept — none may vanish into
+    /// a waiter node. Odd reps cancel before close to race the Acquire-drop
+    /// permit-return path; the post-join sweep is what keeps the identity
+    /// exact (assigned permits return to the pool only as workers' futures
+    /// drop during join).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate_assign_race_loses_no_permits() {
+        for rep in 0..200u32 {
+            let gate = Arc::new(ArrivalGate::new());
+            let cancel = CancellationToken::new();
+            let claimed = Arc::new(AtomicU64::new(0));
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let (gate, cancel, claimed) = (gate.clone(), cancel.clone(), claimed.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            match gate.try_claim() {
+                                Claim::Claimed => {
+                                    claimed.fetch_add(1, Ordering::SeqCst);
+                                    tokio::task::yield_now().await;
+                                }
+                                Claim::Closed => break,
+                                Claim::Empty => {
+                                    let parked = gate.park();
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => break,
+                                        got = gate.claim_parked() => {
+                                            drop(parked);
+                                            if !got {
+                                                break; // closed while parked
+                                            }
+                                            claimed.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            // Wait until all four are parked so publishes exercise the
+            // assign-to-waiter path, not just the pool. `parked` rises just
+            // before the acquire's first poll, so add one scheduler beat.
+            while gate.parked.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+            tokio::task::yield_now().await;
+            let mut expiry = None;
+            let mut published = 0u64;
+            for i in 0..50u64 {
+                let due = 1 + (i % 3); // < worker count: batches feed waiters
+                gate.publish(due, &mut expiry, Instant::now(), Duration::from_secs(3600));
+                published += due;
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await; // let claimers drain
+            if rep % 2 == 1 {
+                cancel.cancel(); // race the cancel-arm permit-return path
+            }
+            let mut dropped = gate.close();
+            let joined = tokio::time::timeout(Duration::from_secs(5), async {
+                for w in workers {
+                    w.await.unwrap();
+                }
+            })
+            .await;
+            assert!(joined.is_ok(), "a worker slept through close");
+            dropped += gate.take_unclaimed(); // post-join sweep — load-bearing
+            assert_eq!(claimed.load(Ordering::SeqCst) + dropped, published);
+            assert_eq!(gate.parked.load(Ordering::SeqCst), 0);
+            assert!(matches!(gate.try_claim(), Claim::Closed));
         }
     }
 }
