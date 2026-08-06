@@ -1,6 +1,7 @@
 //! Metric primitives: kinds, samples, the metric registry and the sample bus.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +11,23 @@ use serde::{Deserialize, Serialize};
 
 /// Sorted tag set attached to samples.
 pub type Tags = BTreeMap<String, String>;
+
+#[derive(Clone)]
+pub(crate) struct CachedTags {
+    pub(crate) tags: Arc<Tags>,
+    pub(crate) hash: u64,
+}
+
+impl CachedTags {
+    pub(crate) fn new(tags: Arc<Tags>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        tags.hash(&mut hasher);
+        CachedTags {
+            tags,
+            hash: hasher.finish(),
+        }
+    }
+}
 
 /// The four metric kinds, matching k6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -246,12 +264,10 @@ impl MetricsBus {
     pub fn for_vu(&self, vu_id: u64) -> Self {
         let sink = match &self.sink {
             Sink::Tx(tx) => Sink::Tx(tx.clone()),
-            Sink::Shard { shards, .. } => {
-                Sink::Shard {
-                    shards: shards.clone(),
-                    idx: (vu_id % shards.len() as u64) as usize,
-                }
-            }
+            Sink::Shard { shards, .. } => Sink::Shard {
+                shards: shards.clone(),
+                idx: (vu_id % shards.len() as u64) as usize,
+            },
         };
         MetricsBus {
             sink,
@@ -285,6 +301,38 @@ impl MetricsBus {
             tags: tags.clone(),
             timestamp_ms,
         });
+    }
+
+    pub(crate) fn emit_cached(
+        &self,
+        metric: &Arc<str>,
+        kind: MetricKind,
+        value: f64,
+        tags: &CachedTags,
+    ) {
+        match &self.sink {
+            Sink::Tx(_) => self.emit_value(metric, kind, value, &tags.tags),
+            Sink::Shard { shards, idx } => shards.record_cached(*idx, metric, kind, value, tags),
+        }
+    }
+
+    pub(crate) fn emit_cached_values(
+        &self,
+        values: &[(&Arc<str>, MetricKind, f64)],
+        tags: &CachedTags,
+    ) {
+        match &self.sink {
+            Sink::Tx(_) => {
+                for &(metric, kind, value) in values {
+                    self.emit_value(metric, kind, value, &tags.tags);
+                }
+            }
+            Sink::Shard { shards, idx } => {
+                for &(metric, kind, value) in values {
+                    shards.record_cached(*idx, metric, kind, value, tags);
+                }
+            }
+        }
     }
 
     pub fn counter(&self, metric: &Arc<str>, value: f64, tags: &Arc<Tags>) {
@@ -419,6 +467,57 @@ mod tests {
         assert_eq!(s1.kind, MetricKind::Rate);
         let s2 = rx.recv().await.expect("sample");
         assert_eq!(s2.value, 2.0);
+    }
+
+    #[tokio::test]
+    async fn cached_values_preserve_channel_samples() {
+        let (bus, mut rx) = MetricsBus::new();
+        let counter: Arc<str> = Arc::from("batch_counter");
+        let trend: Arc<str> = Arc::from("batch_trend");
+        let tags = CachedTags::new(Arc::new(Tags::from([(
+            "status".to_string(),
+            "0".to_string(),
+        )])));
+        bus.emit_cached_values(
+            &[
+                (&counter, MetricKind::Counter, 1.0),
+                (&trend, MetricKind::Trend, 2.0),
+            ],
+            &tags,
+        );
+        let first = rx.recv().await.expect("counter");
+        let second = rx.recv().await.expect("trend");
+        assert_eq!(
+            (first.metric.as_ref(), first.kind, first.value),
+            ("batch_counter", MetricKind::Counter, 1.0)
+        );
+        assert_eq!(
+            (second.metric.as_ref(), second.kind, second.value),
+            ("batch_trend", MetricKind::Trend, 2.0)
+        );
+        assert!(Arc::ptr_eq(&first.tags, &second.tags));
+    }
+
+    #[test]
+    fn cached_values_record_all_sharded_values() {
+        let shards = Arc::new(crate::aggregate::MetricShards::new(1));
+        let bus = MetricsBus::sharded(shards.clone());
+        let counter: Arc<str> = Arc::from("batch_counter");
+        let trend: Arc<str> = Arc::from("batch_trend");
+        let tags = CachedTags::new(Arc::new(Tags::new()));
+        bus.emit_cached_values(
+            &[
+                (&counter, MetricKind::Counter, 3.0),
+                (&trend, MetricKind::Trend, 4.0),
+            ],
+            &tags,
+        );
+        let mut aggregate = crate::aggregate::Aggregator::new();
+        shards.drain_into(&mut aggregate);
+        let snapshot = aggregate.snapshot();
+        assert_eq!(snapshot.find("batch_counter").unwrap().agg.sum, 3.0);
+        let average = snapshot.find("batch_trend").unwrap().agg.avg.unwrap();
+        assert!((average - 4.0).abs() < 0.01);
     }
 
     fn shard_idx(bus: &MetricsBus) -> usize {

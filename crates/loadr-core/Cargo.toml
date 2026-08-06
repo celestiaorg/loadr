@@ -29,6 +29,7 @@ csv = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 indexmap = { workspace = true }
+itoa = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
@@ -43,4 +44,3 @@ loadr-config = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-

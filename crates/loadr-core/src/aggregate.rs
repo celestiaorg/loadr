@@ -5,6 +5,7 @@
 //! aggregation merges histograms — percentiles are computed only after merging.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,15 +14,31 @@ use hdrhistogram::Histogram;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::{now_millis, MetricKind, Sample, Tags};
+use crate::metrics::{now_millis, CachedTags, MetricKind, Sample, Tags};
 
 /// Trend values are stored ×1000 in the histogram (3 decimal places).
 const TREND_SCALE: f64 = 1000.0;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 struct SeriesKey {
     metric: Arc<str>,
     tags: Arc<Tags>,
+    tags_hash: u64,
+}
+
+impl PartialEq for SeriesKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.metric == other.metric && self.tags == other.tags
+    }
+}
+
+impl Eq for SeriesKey {}
+
+impl Hash for SeriesKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.metric.hash(state);
+        self.tags_hash.hash(state);
+    }
 }
 
 #[derive(Debug)]
@@ -326,17 +343,26 @@ impl Aggregator {
     }
 
     pub fn record(&mut self, sample: &Sample) {
+        let tags = CachedTags::new(sample.tags.clone());
+        self.record_cached(&sample.metric, sample.kind, sample.value, &tags);
+    }
+
+    pub(crate) fn record_cached(
+        &mut self,
+        metric: &Arc<str>,
+        kind: MetricKind,
+        value: f64,
+        tags: &CachedTags,
+    ) {
         self.seq += 1;
         let key = SeriesKey {
-            metric: sample.metric.clone(),
-            tags: sample.tags.clone(),
+            metric: metric.clone(),
+            tags: tags.tags.clone(),
+            tags_hash: tags.hash,
         };
         let seq = self.seq;
-        let series = self
-            .series
-            .entry(key)
-            .or_insert_with(|| Series::new(sample.kind));
-        series.record(sample.value, seq);
+        let series = self.series.entry(key).or_insert_with(|| Series::new(kind));
+        series.record(value, seq);
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -652,9 +678,11 @@ impl Aggregator {
     /// current value rather than draining it.
     pub fn restore_delta(&mut self, delta: &MetricsDelta) {
         for sd in &delta.series {
+            let tags = CachedTags::new(Arc::new(sd.tags.clone()));
             let key = SeriesKey {
                 metric: Arc::from(sd.metric.as_str()),
-                tags: Arc::new(sd.tags.clone()),
+                tags: tags.tags,
+                tags_hash: tags.hash,
             };
             // The series was created by the very `record`s this delta was
             // drained from, so it must already exist.
@@ -695,9 +723,11 @@ impl Aggregator {
         self.seq += 1;
         let seq = self.seq;
         for sd in &delta.series {
+            let tags = CachedTags::new(Arc::new(sd.tags.clone()));
             let key = SeriesKey {
                 metric: Arc::from(sd.metric.as_str()),
-                tags: Arc::new(sd.tags.clone()),
+                tags: tags.tags,
+                tags_hash: tags.hash,
             };
             let series = self
                 .series
@@ -811,6 +841,19 @@ impl MetricShards {
         self.shards[idx % self.shards.len()].lock().record(sample);
     }
 
+    pub(crate) fn record_cached(
+        &self,
+        idx: usize,
+        metric: &Arc<str>,
+        kind: MetricKind,
+        value: f64,
+        tags: &CachedTags,
+    ) {
+        self.shards[idx % self.shards.len()]
+            .lock()
+            .record_cached(metric, kind, value, tags);
+    }
+
     /// Drain every shard's delta into `target` — one `take_delta` +
     /// `merge_delta` per shard.
     pub fn drain_into(&self, target: &mut Aggregator) {
@@ -869,6 +912,23 @@ mod tests {
         assert_eq!(snap.find("reqs").unwrap().agg.sum, 3.0);
         let rate = snap.find("ok").unwrap().agg.rate.unwrap();
         assert!((rate - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cached_tag_hash_collision_keeps_series_distinct() {
+        let metric: Arc<str> = Arc::from("reqs");
+        let left = CachedTags {
+            tags: Arc::new(Tags::from([("status".to_string(), "0".to_string())])),
+            hash: 7,
+        };
+        let right = CachedTags {
+            tags: Arc::new(Tags::from([("status".to_string(), "13".to_string())])),
+            hash: 7,
+        };
+        let mut agg = Aggregator::new();
+        agg.record_cached(&metric, MetricKind::Counter, 1.0, &left);
+        agg.record_cached(&metric, MetricKind::Counter, 1.0, &right);
+        assert_eq!(agg.snapshot().series.len(), 2);
     }
 
     #[test]

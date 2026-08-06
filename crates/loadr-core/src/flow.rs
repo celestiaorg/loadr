@@ -12,7 +12,7 @@ use loadr_config::{
 use crate::conditions::{CompiledCondition, ConditionResult};
 use crate::error::EngineError;
 use crate::extract::{CompiledExtractor, ExtractError};
-use crate::metrics::{BuiltinMetrics, MetricKind, MetricRegistry, MetricsBus, Tags};
+use crate::metrics::{BuiltinMetrics, CachedTags, MetricKind, MetricRegistry, MetricsBus, Tags};
 use crate::pacing::sample_think_time;
 use crate::protocol::{
     GrpcRequest, PreparedRequest, ProtocolRegistry, ProtocolResponse, RequestOptions,
@@ -583,11 +583,16 @@ impl FlowRunner {
             }
         }
 
-        let tags = vu.sample_tags(&[]);
-        vu.metrics.counter(&self.builtins.iterations, 1.0, &tags);
-        vu.metrics.trend(
-            &self.builtins.iteration_duration,
-            started.elapsed().as_secs_f64() * 1000.0,
+        let tags = vu.cached_sample_tags(&[]);
+        vu.metrics.emit_cached_values(
+            &[
+                (&self.builtins.iterations, MetricKind::Counter, 1.0),
+                (
+                    &self.builtins.iteration_duration,
+                    MetricKind::Trend,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                ),
+            ],
             &tags,
         );
         outcome
@@ -1115,7 +1120,7 @@ impl FlowRunner {
         };
 
         // 4. Metrics.
-        metrics_guard.record_completed(&response);
+        metrics_guard.record_completed(&response, vu);
 
         // 5. Extraction (classic extractors and fused chains).
         let mut chain_flow = RequestFlow::Continue;
@@ -1126,8 +1131,9 @@ impl FlowRunner {
                     // A chain with a `check:` records a sample to the `checks`
                     // metric on success, mirroring the standalone `checks:`.
                     if extractor.is_chain_with_check() {
-                        let tags = vu.sample_tags(&[("check", extractor.name())]);
-                        vu.metrics.rate(&self.builtins.checks, true, &tags);
+                        let tags = vu.cached_sample_tags(&[("check", extractor.name())]);
+                        vu.metrics
+                            .emit_cached(&self.builtins.checks, MetricKind::Rate, 1.0, &tags);
                     }
                     vu.vars.insert(extractor.name().to_string(), value);
                 }
@@ -1139,8 +1145,13 @@ impl FlowRunner {
                     // Inline chain validation failed: record a failed check,
                     // mark the request failed and honour `on_failure`.
                     tracing::debug!(request = %prepared.name, chain = %name, %detail, "chain check failed");
-                    let check_tags = vu.sample_tags(&[("check", name.as_str())]);
-                    vu.metrics.rate(&self.builtins.checks, false, &check_tags);
+                    let check_tags = vu.cached_sample_tags(&[("check", name.as_str())]);
+                    vu.metrics.emit_cached(
+                        &self.builtins.checks,
+                        MetricKind::Rate,
+                        0.0,
+                        &check_tags,
+                    );
                     extraction_failed = true;
                     match on_failure {
                         FailureAction::Continue => {}
@@ -1215,8 +1226,13 @@ impl FlowRunner {
         }
         for condition in &req.checks {
             let result = self.eval_condition(condition, &response, vu, script);
-            let tags = vu.sample_tags(&[("check", &result.name)]);
-            vu.metrics.rate(&self.builtins.checks, result.pass, &tags);
+            let tags = vu.cached_sample_tags(&[("check", &result.name)]);
+            vu.metrics.emit_cached(
+                &self.builtins.checks,
+                MetricKind::Rate,
+                if result.pass { 1.0 } else { 0.0 },
+                &tags,
+            );
         }
         // Record whether this request failed, so `retry` can react to it.
         vu.last_request_failed = response.failed() || assert_failed || extraction_failed;
@@ -1666,60 +1682,74 @@ impl RequestMetricEmitter {
     }
 
     /// Emit the standard metric families for a completed or cancelled request.
-    fn emit_request_metrics(&self, request: &RequestMetricContext, response: &ProtocolResponse) {
+    fn emit_request_metrics(
+        &self,
+        request: &RequestMetricContext,
+        response: &ProtocolResponse,
+        tags: &CachedTags,
+    ) {
         let b = &self.builtins;
-        let status = response.status.to_string();
-        // Transport errors get a coarse `error_kind` tag so the UI can group
-        // failures by cause (timeout / connection / dns / tls / ...).
-        let error_kind = response
-            .error
-            .as_deref()
-            .map(classify_transport_error)
-            .unwrap_or("");
-        let mut tag_pairs: Vec<(&str, &str)> = vec![
-            ("name", &request.name),
-            ("method", &request.method),
-            ("status", &status),
-            ("proto", &request.protocol),
-        ];
-        if !error_kind.is_empty() {
-            tag_pairs.push(("error_kind", error_kind));
-        }
-        let tags = self.sample_tags(&tag_pairs);
         let m = &self.metrics;
         let t = &response.timings;
 
-        m.counter(&b.data_sent, response.bytes_sent as f64, &tags);
-        m.counter(&b.data_received, response.bytes_received as f64, &tags);
+        if request.protocol == "grpc" {
+            m.emit_cached_values(
+                &[
+                    (
+                        &b.data_sent,
+                        MetricKind::Counter,
+                        response.bytes_sent as f64,
+                    ),
+                    (
+                        &b.data_received,
+                        MetricKind::Counter,
+                        response.bytes_received as f64,
+                    ),
+                    (&b.grpc_reqs, MetricKind::Counter, 1.0),
+                    (&b.grpc_req_duration, MetricKind::Trend, t.duration_ms),
+                    (
+                        &b.http_req_failed,
+                        MetricKind::Rate,
+                        if response.failed() { 1.0 } else { 0.0 },
+                    ),
+                ],
+                tags,
+            );
+            return;
+        }
+
+        let tags = &tags.tags;
+        m.counter(&b.data_sent, response.bytes_sent as f64, tags);
+        m.counter(&b.data_received, response.bytes_received as f64, tags);
 
         match request.protocol.as_str() {
             "http" | "graphql" => {
-                m.counter(&b.http_reqs, 1.0, &tags);
-                m.trend(&b.http_req_duration, t.duration_ms, &tags);
-                m.trend(&b.http_req_blocked, t.blocked_ms, &tags);
-                m.trend(&b.http_req_connecting, t.connect_ms, &tags);
-                m.trend(&b.http_req_tls_handshaking, t.tls_ms, &tags);
-                m.trend(&b.http_req_sending, t.sending_ms, &tags);
-                m.trend(&b.http_req_waiting, t.waiting_ms, &tags);
-                m.trend(&b.http_req_receiving, t.receiving_ms, &tags);
-                m.rate(&b.http_req_failed, response.failed(), &tags);
+                m.counter(&b.http_reqs, 1.0, tags);
+                m.trend(&b.http_req_duration, t.duration_ms, tags);
+                m.trend(&b.http_req_blocked, t.blocked_ms, tags);
+                m.trend(&b.http_req_connecting, t.connect_ms, tags);
+                m.trend(&b.http_req_tls_handshaking, t.tls_ms, tags);
+                m.trend(&b.http_req_sending, t.sending_ms, tags);
+                m.trend(&b.http_req_waiting, t.waiting_ms, tags);
+                m.trend(&b.http_req_receiving, t.receiving_ms, tags);
+                m.rate(&b.http_req_failed, response.failed(), tags);
                 if request.protocol == "graphql" {
-                    self.emit_named("graphql_reqs", MetricKind::Counter, 1.0, &tags);
+                    self.emit_named("graphql_reqs", MetricKind::Counter, 1.0, tags);
                     self.emit_named(
                         "graphql_req_duration",
                         MetricKind::Trend,
                         t.duration_ms,
-                        &tags,
+                        tags,
                     );
                 }
             }
             "ws" => {
-                self.emit_named("ws_connecting", MetricKind::Trend, t.blocked_ms, &tags);
+                self.emit_named("ws_connecting", MetricKind::Trend, t.blocked_ms, tags);
                 self.emit_named(
                     "ws_session_duration",
                     MetricKind::Trend,
                     t.duration_ms,
-                    &tags,
+                    tags,
                 );
                 let sent = response
                     .extras
@@ -1731,19 +1761,11 @@ impl RequestMetricEmitter {
                     .get("msgs_received")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
-                self.emit_named("ws_msgs_sent", MetricKind::Counter, sent, &tags);
-                self.emit_named("ws_msgs_received", MetricKind::Counter, received, &tags);
-                m.rate(&b.http_req_failed, response.error.is_some(), &tags);
+                self.emit_named("ws_msgs_sent", MetricKind::Counter, sent, tags);
+                self.emit_named("ws_msgs_received", MetricKind::Counter, received, tags);
+                m.rate(&b.http_req_failed, response.error.is_some(), tags);
             }
-            // gRPC is the highest-rate protocol here: use the pre-interned
-            // names (like HTTP above) instead of the per-request
-            // `format!` + registry lookup of the generic arm. gRPC responses
-            // never carry docs/rows/msgs extras, so those probes are skipped.
-            "grpc" => {
-                m.counter(&b.grpc_reqs, 1.0, &tags);
-                m.trend(&b.grpc_req_duration, t.duration_ms, &tags);
-                m.rate(&b.http_req_failed, response.failed(), &tags);
-            }
+            "grpc" => unreachable!(),
             other => {
                 // tcp/udp built-ins keep their own family name. The
                 // `sse`/`browser` built-ins historically share the generic
@@ -1759,12 +1781,12 @@ impl RequestMetricEmitter {
                     "sse" | "browser" => "plugin".to_string(),
                     name => metric_family(name),
                 };
-                self.emit_named(&format!("{family}_reqs"), MetricKind::Counter, 1.0, &tags);
+                self.emit_named(&format!("{family}_reqs"), MetricKind::Counter, 1.0, tags);
                 self.emit_named(
                     &format!("{family}_req_duration"),
                     MetricKind::Trend,
                     t.duration_ms,
-                    &tags,
+                    tags,
                 );
                 // Plugin protocols may report a count of affected/returned
                 // records: `extras.docs` (e.g. Mongo documents) is surfaced as
@@ -1772,15 +1794,15 @@ impl RequestMetricEmitter {
                 // affected) as `<family>_rows`, and `extras.msgs` (e.g. Kafka
                 // messages produced or fetched) as `<family>_msgs`.
                 if let Some(docs) = response.extras.get("docs").and_then(|v| v.as_f64()) {
-                    self.emit_named(&format!("{family}_docs"), MetricKind::Counter, docs, &tags);
+                    self.emit_named(&format!("{family}_docs"), MetricKind::Counter, docs, tags);
                 }
                 if let Some(rows) = response.extras.get("rows").and_then(|v| v.as_f64()) {
-                    self.emit_named(&format!("{family}_rows"), MetricKind::Counter, rows, &tags);
+                    self.emit_named(&format!("{family}_rows"), MetricKind::Counter, rows, tags);
                 }
                 if let Some(msgs) = response.extras.get("msgs").and_then(|v| v.as_f64()) {
-                    self.emit_named(&format!("{family}_msgs"), MetricKind::Counter, msgs, &tags);
+                    self.emit_named(&format!("{family}_msgs"), MetricKind::Counter, msgs, tags);
                 }
-                m.rate(&b.http_req_failed, response.failed(), &tags);
+                m.rate(&b.http_req_failed, response.failed(), tags);
             }
         }
     }
@@ -1792,6 +1814,36 @@ impl RequestMetricEmitter {
             .map(|d| d.name)
             .unwrap_or_else(|| Arc::from(name));
         self.metrics.emit_value(&metric, kind, value, tags);
+    }
+}
+
+fn request_tags(
+    vu: &mut VuContext,
+    request: &RequestMetricContext,
+    response: &ProtocolResponse,
+) -> CachedTags {
+    let mut status = itoa::Buffer::new();
+    let status = status.format(response.status);
+    let error_kind = response
+        .error
+        .as_deref()
+        .map(classify_transport_error)
+        .unwrap_or("");
+    if error_kind.is_empty() {
+        vu.cached_sample_tags(&[
+            ("name", &request.name),
+            ("method", &request.method),
+            ("status", status),
+            ("proto", &request.protocol),
+        ])
+    } else {
+        vu.cached_sample_tags(&[
+            ("name", &request.name),
+            ("method", &request.method),
+            ("status", status),
+            ("proto", &request.protocol),
+            ("error_kind", error_kind),
+        ])
     }
 }
 
@@ -1813,11 +1865,13 @@ impl RequestMetricsGuard {
         }
     }
 
-    fn record_completed(&mut self, response: &ProtocolResponse) {
+    fn record_completed(&mut self, response: &ProtocolResponse, vu: &mut VuContext) {
         if !self.active {
             return;
         }
-        self.emitter.emit_request_metrics(&self.request, response);
+        let tags = request_tags(vu, &self.request, response);
+        self.emitter
+            .emit_request_metrics(&self.request, response, &tags);
         self.emitter.metrics.end_request();
         self.active = false;
     }
@@ -1841,7 +1895,21 @@ impl Drop for RequestMetricsGuard {
             return;
         }
         let response = self.cancelled_response();
-        self.emitter.emit_request_metrics(&self.request, &response);
+        let status = response.status.to_string();
+        let error_kind = response
+            .error
+            .as_deref()
+            .map(classify_transport_error)
+            .unwrap_or("");
+        let tags = CachedTags::new(self.emitter.sample_tags(&[
+            ("name", &self.request.name),
+            ("method", &self.request.method),
+            ("status", &status),
+            ("proto", &self.request.protocol),
+            ("error_kind", error_kind),
+        ]));
+        self.emitter
+            .emit_request_metrics(&self.request, &response, &tags);
         self.emitter.metrics.end_request();
         self.active = false;
     }
@@ -2449,29 +2517,49 @@ mod request_metrics_tests {
     use super::{
         RequestMetricContext, RequestMetricEmitter, RequestMetricsGuard, REQUEST_CANCELLED_ERROR,
     };
+    use crate::data::DataFeeds;
     use crate::metrics::{BuiltinMetrics, MetricKind, MetricRegistry, MetricsBus, Sample, Tags};
     use crate::protocol::{
         GrpcRequest, PreparedRequest, ProtocolResponse, RequestOptions, Timings,
     };
+    use crate::vu::{RunContext, VuContext};
     use bytes::Bytes;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    fn test_emitter() -> (MetricsBus, UnboundedReceiver<Sample>, RequestMetricEmitter) {
+    fn test_emitter() -> (
+        MetricsBus,
+        UnboundedReceiver<Sample>,
+        RequestMetricEmitter,
+        VuContext,
+    ) {
         let registry = Arc::new(MetricRegistry::with_builtins());
         let builtins = Arc::new(BuiltinMetrics::resolve(&registry));
         let (metrics, receiver) = MetricsBus::new();
         let mut base_tags = Tags::new();
         base_tags.insert("suite".to_string(), "request_metrics".to_string());
-        let emitter = RequestMetricEmitter {
-            metrics: metrics.clone(),
+        let run = Arc::new(RunContext {
+            variables: serde_json::Map::new(),
+            secrets: HashMap::new(),
+            env: HashMap::new(),
+            data: DataFeeds::default(),
             registry,
-            builtins,
-            base_tags: Arc::new(base_tags),
-            groups: vec!["checkout".to_string(), "payment".to_string()],
-        };
-        (metrics, receiver, emitter)
+            base_dir: ".".into(),
+            setup_data: parking_lot::RwLock::new(serde_json::Value::Null),
+        });
+        let mut vu = VuContext::new(
+            1,
+            Arc::from("test"),
+            Arc::new(base_tags),
+            metrics.clone(),
+            run,
+            true,
+        );
+        vu.groups = vec!["checkout".to_string(), "payment".to_string()];
+        let emitter = RequestMetricEmitter::from_vu(&vu, builtins);
+        (metrics, receiver, emitter, vu)
     }
 
     fn prepared_request(protocol: &str) -> PreparedRequest {
@@ -2549,7 +2637,7 @@ mod request_metrics_tests {
 
     #[test]
     fn completed_http_request_emits_exactly_once() {
-        let (metrics, mut receiver, emitter) = test_emitter();
+        let (metrics, mut receiver, emitter, mut vu) = test_emitter();
         let request = prepared_request("http");
         let response = ProtocolResponse {
             status: 502,
@@ -2573,8 +2661,8 @@ mod request_metrics_tests {
 
         let mut guard = RequestMetricsGuard::new(emitter, &request);
         assert_eq!(metrics.requests_in_flight(), 1);
-        guard.record_completed(&response);
-        guard.record_completed(&response);
+        guard.record_completed(&response, &mut vu);
+        guard.record_completed(&response, &mut vu);
         assert_eq!(metrics.requests_in_flight(), 0);
         drop(guard);
 
@@ -2600,7 +2688,7 @@ mod request_metrics_tests {
 
     #[test]
     fn graphql_request_preserves_http_and_graphql_families() {
-        let (metrics, mut receiver, emitter) = test_emitter();
+        let (metrics, mut receiver, emitter, mut vu) = test_emitter();
         let request = prepared_request("graphql");
         let response = ProtocolResponse {
             status: 200,
@@ -2614,7 +2702,7 @@ mod request_metrics_tests {
         };
 
         let mut guard = RequestMetricsGuard::new(emitter, &request);
-        guard.record_completed(&response);
+        guard.record_completed(&response, &mut vu);
         drop(guard);
 
         let samples = drain(&mut receiver);
@@ -2648,7 +2736,7 @@ mod request_metrics_tests {
             ("tcp", "tcp", "tcp"),
             ("udp", "udp", "udp"),
         ] {
-            let (metrics, mut receiver, emitter) = test_emitter();
+            let (metrics, mut receiver, emitter, mut vu) = test_emitter();
             let request = prepared_request(protocol);
             let response = ProtocolResponse {
                 status: 0,
@@ -2664,7 +2752,7 @@ mod request_metrics_tests {
             };
 
             let mut guard = RequestMetricsGuard::new(emitter, &request);
-            guard.record_completed(&response);
+            guard.record_completed(&response, &mut vu);
             drop(guard);
 
             let samples = drain(&mut receiver);
@@ -2685,7 +2773,7 @@ mod request_metrics_tests {
 
     #[test]
     fn loaded_plugin_request_emits_family_and_extra_counters() {
-        let (metrics, mut receiver, emitter) = test_emitter();
+        let (metrics, mut receiver, emitter, mut vu) = test_emitter();
         let request = prepared_request("custom-db");
         let response = ProtocolResponse {
             status: 0,
@@ -2702,7 +2790,7 @@ mod request_metrics_tests {
         };
 
         let mut guard = RequestMetricsGuard::new(emitter, &request);
-        guard.record_completed(&response);
+        guard.record_completed(&response, &mut vu);
         drop(guard);
 
         let samples = drain(&mut receiver);
@@ -2725,7 +2813,7 @@ mod request_metrics_tests {
 
     #[test]
     fn dropping_active_guard_emits_one_cancelled_request() {
-        let (metrics, mut receiver, emitter) = test_emitter();
+        let (metrics, mut receiver, emitter, _vu) = test_emitter();
         let request = prepared_request("http");
         metrics.begin_request();
         let prior_in_flight = metrics.requests_in_flight();
@@ -2773,7 +2861,7 @@ mod request_metrics_tests {
 
     #[test]
     fn guard_retains_only_metric_context_fields() {
-        let (metrics, _receiver, emitter) = test_emitter();
+        let (metrics, _receiver, emitter, _vu) = test_emitter();
         let request = prepared_request("grpc");
         assert!(!request.headers.is_empty());
         assert!(request.body.is_unique());

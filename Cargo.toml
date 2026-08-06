@@ -165,6 +165,7 @@ crossbeam-channel = "0.5"
 serde_path_to_error = "0.1"
 strsim = "0.11"
 indexmap = { version = "2", features = ["serde"] }
+itoa = "1"
 glob = "0.3"
 
 [profile.release]

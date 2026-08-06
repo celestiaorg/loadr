@@ -2910,6 +2910,7 @@ dependencies = [
  "hdrhistogram",
  "humantime",
  "indexmap",
+ "itoa",
  "jmespath",
  "loadr-config",
  "loadr-payload",
