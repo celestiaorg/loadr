@@ -10,7 +10,13 @@ use rand::SeedableRng;
 
 use crate::cookies::CookieJar;
 use crate::data::{DataFeeds, NextRowError, RowIdentity};
-use crate::metrics::{MetricRegistry, MetricsBus, Tags};
+use crate::metrics::{CachedTags, MetricRegistry, MetricsBus, Tags};
+
+struct TagCacheEntry {
+    groups: Vec<String>,
+    extras: Vec<(String, String)>,
+    tags: CachedTags,
+}
 
 /// Type-keyed storage protocol handlers use for per-VU state
 /// (connection pools, gRPC channels, ...).
@@ -62,6 +68,8 @@ pub struct VuContext {
     pub iteration: u64,
     /// Tags applied to every sample this VU emits (scenario + global tags).
     pub base_tags: Arc<Tags>,
+    base_cached_tags: CachedTags,
+    tag_cache: Vec<TagCacheEntry>,
     /// Group stack (innermost last); rendered into the `group` tag as `::a::b`.
     pub groups: Vec<String>,
     /// Per-VU variables: extracted values, JS-set values.
@@ -91,11 +99,14 @@ impl VuContext {
         run: Arc<RunContext>,
         cookies_auto: bool,
     ) -> Self {
+        let base_cached_tags = CachedTags::new(base_tags.clone());
         VuContext {
             vu_id,
             scenario,
             iteration: 0,
             base_tags,
+            base_cached_tags,
+            tag_cache: Vec::new(),
             groups: Vec::new(),
             vars: serde_json::Map::new(),
             cookies: CookieJar::new(cookies_auto),
@@ -126,6 +137,37 @@ impl VuContext {
             tags.insert((*k).to_string(), (*v).to_string());
         }
         Arc::new(tags)
+    }
+
+    pub(crate) fn cached_sample_tags(&mut self, extras: &[(&str, &str)]) -> CachedTags {
+        if extras.is_empty() && self.groups.is_empty() {
+            return self.base_cached_tags.clone();
+        }
+        if let Some(entry) = self.tag_cache.iter().find(|entry| {
+            entry.groups == self.groups
+                && entry.extras.len() == extras.len()
+                && entry.extras.iter().zip(extras).all(
+                    |((cached_key, cached_value), (key, value))| {
+                        cached_key == key && cached_value == value
+                    },
+                )
+        }) {
+            return entry.tags.clone();
+        }
+
+        let tags = CachedTags::new(self.sample_tags(extras));
+        if self.tag_cache.len() >= 64 {
+            self.tag_cache.clear();
+        }
+        self.tag_cache.push(TagCacheEntry {
+            groups: self.groups.clone(),
+            extras: extras
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            tags: tags.clone(),
+        });
+        tags
     }
 
     /// Begin a new iteration: bump the counter, clear per-iteration row cache.
@@ -310,6 +352,25 @@ mod tests {
         let tags = vu.sample_tags(&[("name", "pay")]);
         assert_eq!(tags.get("group").unwrap(), "::checkout::payment");
         assert_eq!(tags.get("name").unwrap(), "pay");
+    }
+
+    #[test]
+    fn cached_tags_reuse_arc_and_distinguish_context() {
+        let mut vu = vu();
+        let first = vu.cached_sample_tags(&[("status", "0")]);
+        let again = vu.cached_sample_tags(&[("status", "0")]);
+        assert!(Arc::ptr_eq(&first.tags, &again.tags));
+        assert_eq!(first.hash, again.hash);
+
+        let failed = vu.cached_sample_tags(&[("status", "13")]);
+        assert!(!Arc::ptr_eq(&first.tags, &failed.tags));
+
+        vu.groups.push("checkout".to_string());
+        let grouped = vu.cached_sample_tags(&[("status", "0")]);
+        assert_eq!(grouped.tags.get("group").unwrap(), "::checkout");
+        vu.groups.pop();
+        let ungrouped = vu.cached_sample_tags(&[("status", "0")]);
+        assert!(Arc::ptr_eq(&first.tags, &ungrouped.tags));
     }
 
     #[test]
