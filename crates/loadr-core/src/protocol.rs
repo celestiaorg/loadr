@@ -92,6 +92,7 @@ pub struct GrpcRequest {
     /// every iteration (stable identity), so the handler may cache the
     /// encoded body per `Arc`.
     pub message_literal: bool,
+    pub binary_fields: Vec<GrpcBinaryField>,
     pub metadata: Vec<(String, String)>,
     /// Share a fixed pool of N HTTP/2 channels across all VUs (round-robin)
     /// instead of one connection per VU. `None` = per-VU (default).
@@ -112,6 +113,13 @@ pub struct GrpcRequest {
     /// the compiled plan and therefore has stable identity for the run; the
     /// gRPC handler uses that identity to cache resolved field descriptors.
     pub protobuf_checks: Option<Arc<Vec<GrpcProtobufFieldCheck>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrpcBinaryField {
+    pub message_index: usize,
+    pub name: String,
+    pub value: Bytes,
 }
 
 /// A descriptor-aware condition the gRPC handler evaluates directly against

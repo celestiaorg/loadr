@@ -247,6 +247,31 @@ impl CompiledJson {
             }
         })
     }
+
+    fn render_grpc_message<F, E>(
+        &self,
+        message_index: usize,
+        render_template: &mut F,
+    ) -> Result<serde_json::Value, E>
+    where
+        F: FnMut(&Template, Option<(usize, &str)>) -> Result<String, E>,
+    {
+        let Self::Object(fields) = self else {
+            return self.render(&mut |template| render_template(template, None));
+        };
+        let mut map = serde_json::Map::with_capacity(fields.len());
+        for (key, value) in fields {
+            let value = match value {
+                Self::Splice(template) => {
+                    let rendered = render_template(template, Some((message_index, key)))?;
+                    serde_json::from_str(&rendered).unwrap_or(serde_json::Value::String(rendered))
+                }
+                _ => value.render(&mut |template| render_template(template, None))?,
+            };
+            map.insert(key.clone(), value);
+        }
+        Ok(serde_json::Value::Object(map))
+    }
 }
 
 enum CompiledGrpcValue {
@@ -266,13 +291,19 @@ impl CompiledGrpcValue {
         matches!(self, Self::Literal(_))
     }
 
-    fn render<F, E>(&self, render_template: &mut F) -> Result<Arc<serde_json::Value>, E>
+    fn render_with_targets<F, E>(
+        &self,
+        message_index: usize,
+        render_template: &mut F,
+    ) -> Result<Arc<serde_json::Value>, E>
     where
-        F: FnMut(&Template) -> Result<String, E>,
+        F: FnMut(&Template, Option<(usize, &str)>) -> Result<String, E>,
     {
         match self {
             Self::Literal(value) => Ok(value.clone()),
-            Self::Dynamic(value) => value.render(render_template).map(Arc::new),
+            Self::Dynamic(value) => value
+                .render_grpc_message(message_index, render_template)
+                .map(Arc::new),
         }
     }
 }
@@ -306,15 +337,19 @@ impl CompiledGrpcValues {
         matches!(self, Self::Literal(_))
     }
 
-    fn render<F, E>(&self, render_template: &mut F) -> Result<Arc<Vec<serde_json::Value>>, E>
+    fn render_with_targets<F, E>(
+        &self,
+        render_template: &mut F,
+    ) -> Result<Arc<Vec<serde_json::Value>>, E>
     where
-        F: FnMut(&Template) -> Result<String, E>,
+        F: FnMut(&Template, Option<(usize, &str)>) -> Result<String, E>,
     {
         match self {
             Self::Literal(values) => Ok(values.clone()),
             Self::Dynamic(values) => values
                 .iter()
-                .map(|value| value.render(render_template))
+                .enumerate()
+                .map(|(index, value)| value.render_grpc_message(index, render_template))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Arc::new),
         }
@@ -383,16 +418,24 @@ impl CompiledGrpc {
         })
     }
 
+    #[cfg(test)]
     fn render<F, E>(&self, render_template: &mut F) -> Result<GrpcRequest, E>
     where
         F: FnMut(&Template) -> Result<String, E>,
     {
+        self.render_with_targets(&mut |template, _| render_template(template))
+    }
+
+    fn render_with_targets<F, E>(&self, render_template: &mut F) -> Result<GrpcRequest, E>
+    where
+        F: FnMut(&Template, Option<(usize, &str)>) -> Result<String, E>,
+    {
         let message = self
             .message
             .as_ref()
-            .map(|message| message.render(render_template))
+            .map(|message| message.render_with_targets(0, render_template))
             .transpose()?;
-        let messages = self.messages.render(render_template)?;
+        let messages = self.messages.render_with_targets(render_template)?;
         let message_literal = if self.messages.is_empty() {
             self.message
                 .as_ref()
@@ -403,7 +446,7 @@ impl CompiledGrpc {
         let metadata = self
             .metadata
             .iter()
-            .map(|(key, value)| Ok((key.clone(), render_template(value)?)))
+            .map(|(key, value)| Ok((key.clone(), render_template(value, None)?)))
             .collect::<Result<_, E>>()?;
         Ok(GrpcRequest {
             proto_files: self.proto_files.clone(),
@@ -1762,8 +1805,31 @@ impl FlowRunner {
             });
         }
         if let Some(grpc) = &req.grpc {
-            let mut rendered =
-                grpc.render(&mut |template| render_template(self, template, vu, script))?;
+            let mut binary_fields = Vec::new();
+            let mut rendered = grpc.render_with_targets(&mut |template, target| {
+                if let (Some((message_index, name)), [loadr_config::Part::Expr(expr)]) =
+                    (target, template.parts.as_slice())
+                {
+                    match vu.resolve_data_bytes(expr) {
+                        Ok(Some(value)) => {
+                            binary_fields.push(crate::protocol::GrpcBinaryField {
+                                message_index,
+                                name: name.to_string(),
+                                value,
+                            });
+                            return Ok(String::new());
+                        }
+                        Ok(None) => {}
+                        Err(crate::data::NextRowError::Exhausted(_)) => {
+                            return Err(PrepareError::DataExhausted)
+                        }
+                        Err(error) => return Err(PrepareError::Other(error.to_string())),
+                    }
+                }
+                render_template(self, template, vu, script)
+            })?;
+            rendered.message_literal &= binary_fields.is_empty();
+            rendered.binary_fields = binary_fields;
             let has_after_request = script
                 .as_ref()
                 .is_some_and(|s| s.has_function("afterRequest"));

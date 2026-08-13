@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use ed25519_dalek::Verifier;
 use indexmap::IndexMap;
 
@@ -391,10 +390,7 @@ fn data_source_adapter_signs_rows_and_signature_verifies() {
     };
     assert_eq!(row.get("nonce").map(String::as_str), Some("3:5"));
 
-    let tx_b64 = row.get("tx_b64").expect("tx_b64 present");
-    let tx = base64::engine::general_purpose::STANDARD
-        .decode(tx_b64)
-        .expect("valid base64");
+    let tx = row.get_bytes("tx").expect("tx present");
     assert!(
         tx.len() > 64,
         "tx must be the signed message plus a 64-byte signature"
