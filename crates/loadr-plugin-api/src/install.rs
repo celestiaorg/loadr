@@ -498,10 +498,10 @@ mod tests {
                 "x86_64-pc-windows-msvc": { "url": "https://example.test/mongo-x86_64-pc-windows-msvc.zip", "sha256": "bb", "entry": "loadr_plugin_mongo.dll" }
               }
             },
-            "2.0.0": {
-              "min_loadr_abi": "2.0",
+            "3.0.0": {
+              "min_loadr_abi": "3.0",
               "artifacts": {
-                "x86_64-unknown-linux-gnu": { "url": "https://example.test/mongo-2-x86_64-unknown-linux-gnu.tar.gz", "sha256": "cc", "entry": "libloadr_plugin_mongo.so" }
+                "x86_64-unknown-linux-gnu": { "url": "https://example.test/mongo-3-x86_64-unknown-linux-gnu.tar.gz", "sha256": "cc", "entry": "libloadr_plugin_mongo.so" }
               }
             }
           }
@@ -548,9 +548,9 @@ mod tests {
     #[test]
     fn resolve_abi_mismatch_is_clear() {
         let idx = PluginIndex::parse(INDEX.as_bytes()).unwrap();
-        // 2.0.0 needs ABI >= 2 but the host provides 1.
+        // 3.0.0 needs ABI >= 3 but the host provides 2.
         let e = idx
-            .resolve("mongo", Some("2.0.0"), "x86_64-unknown-linux-gnu")
+            .resolve("mongo", Some("3.0.0"), "x86_64-unknown-linux-gnu")
             .expect_err("abi too new");
         assert!(e.to_string().contains("ABI"), "{e}");
     }
@@ -567,7 +567,8 @@ mod tests {
     fn abi_compatible_major_gate() {
         assert!(abi_compatible("1.0").unwrap());
         assert!(abi_compatible("1.5").unwrap());
-        assert!(!abi_compatible("2.0").unwrap());
+        assert!(abi_compatible("2.0").unwrap());
+        assert!(!abi_compatible("3.0").unwrap());
         assert!(abi_compatible("malformed").is_err());
     }
 
