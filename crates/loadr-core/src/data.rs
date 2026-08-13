@@ -2,10 +2,12 @@
 //! sources with shared or per-VU cursors and recycle/stop-at-EOF semantics.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use indexmap::IndexMap;
 use loadr_config::{DataMode, DataSource, OnEof, PickStrategy};
 use parking_lot::Mutex;
@@ -14,8 +16,51 @@ use rand::RngExt;
 
 use crate::error::EngineError;
 
-/// One data row: column name → string value.
-pub type Row = IndexMap<String, String>;
+/// One data row. Existing sources use the string map; native v2 plugins may
+/// additionally attach byte values for exact gRPC placeholders.
+#[derive(Clone, Debug, Default)]
+pub struct Row {
+    strings: IndexMap<String, String>,
+    bytes: IndexMap<String, Bytes>,
+}
+
+impl Row {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert_bytes(&mut self, name: String, value: Bytes) {
+        self.strings.shift_remove(&name);
+        self.bytes.insert(name, value);
+    }
+
+    pub fn get_bytes(&self, name: &str) -> Option<&Bytes> {
+        self.bytes.get(name)
+    }
+}
+
+impl Deref for Row {
+    type Target = IndexMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.strings
+    }
+}
+
+impl DerefMut for Row {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.strings
+    }
+}
+
+impl FromIterator<(String, String)> for Row {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        Row {
+            strings: iter.into_iter().collect(),
+            bytes: IndexMap::new(),
+        }
+    }
+}
 
 /// Identity of the caller pulling a row (used only by plugin-backed feeds).
 #[derive(Clone, Copy)]
@@ -458,6 +503,8 @@ pub enum NextRowError {
         source_name: String,
         message: String,
     },
+    #[error("binary data value `{0}` is only valid as an exact gRPC message placeholder")]
+    BinaryInText(String),
 }
 
 fn json_to_string(v: &serde_json::Value) -> String {

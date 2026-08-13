@@ -1,12 +1,9 @@
 //! Stable FFI surface for native dynamic-library plugins, built on
 //! [`abi_stable`].
 //!
-//! Design note: all rich data (samples, snapshots, summaries, requests,
-//! responses, configs) crosses the FFI boundary as JSON in [`RString`]s. This
-//! keeps the ABI tiny and forward-compatible — adding a field to a payload is
-//! never an ABI break. The marshalling cost is irrelevant at plugin-boundary
-//! call rates (per flush batch / per snapshot / per request) compared to the
-//! cost of an unstable `repr(Rust)` boundary.
+//! Design note: most rich data crosses the FFI boundary as JSON in
+//! [`RString`]s. Data sources also have a typed hot-path method so byte buffers
+//! do not require base64 encoding.
 
 // `#[sabi_trait]` expands to impls inside functions (abi_stable 0.11 predates
 // the `non_local_definitions` lint); harmless here.
@@ -17,12 +14,12 @@ use abi_stable::{
     library::RootModule,
     package_version_strings, sabi_trait,
     sabi_types::VersionStrings,
-    std_types::{RBox, ROption, RResult, RString},
+    std_types::{RBox, ROption, RResult, RStr, RString, RVec},
     StableAbi,
 };
 
 /// Bumped whenever the FFI surface changes incompatibly. Checked on load.
-pub const LOADR_PLUGIN_ABI_VERSION: u32 = 1;
+pub const LOADR_PLUGIN_ABI_VERSION: u32 = 2;
 
 /// A metrics output plugin. JSON payloads mirror `loadr_core` types:
 /// `on_samples` receives `Vec<Sample>`, `on_snapshot` a `Snapshot`,
@@ -79,9 +76,35 @@ pub trait FfiDataSource: Send + Sync {
     ///   "sources": {"<data name>": <data.<name>.config>, ...}}`
     fn init(&mut self, init_json: RString) -> RResult<(), RString>;
 
-    /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
-    /// Returns `{"row": {"col": <scalar>, ...}}` or `{"exhausted": true}`.
-    fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
+    /// Returns `RNone` when the source is exhausted.
+    #[sabi(last_prefix_field)]
+    fn next_row(&self, ctx: FfiRowCtx<'_>) -> RResult<ROption<RVec<FfiField>>, RString>;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, StableAbi)]
+pub struct FfiRowCtx<'a> {
+    pub source: RStr<'a>,
+    pub vu: u64,
+    pub iteration: u64,
+    pub seq: u64,
+    pub scenario: RStr<'a>,
+    pub request: ROption<RStr<'a>>,
+    pub ts_ms: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, StableAbi)]
+pub struct FfiField {
+    pub name: RString,
+    pub value: FfiValue,
+}
+
+#[repr(C)]
+#[derive(Debug, StableAbi)]
+pub enum FfiValue {
+    String(RString),
+    Bytes(RVec<u8>),
 }
 
 /// Boxed trait objects as they cross the FFI boundary.
@@ -108,7 +131,7 @@ pub struct PluginMod {
     #[sabi(last_prefix_field)]
     pub make_service: ROption<extern "C" fn() -> FfiServiceBox>,
     /// Suffix field: plugins compiled before it existed still load; the
-    /// accessor then returns `RNone`. Not an ABI break — version stays 1.
+    /// accessor then returns `RNone`.
     #[sabi(missing_field(default))]
     pub make_data_source: ROption<extern "C" fn() -> FfiDataSourceBox>,
 }

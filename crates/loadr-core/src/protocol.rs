@@ -87,7 +87,15 @@ pub struct GrpcRequest {
     pub message: Option<serde_json::Value>,
     /// Streaming request messages.
     pub messages: Vec<serde_json::Value>,
+    pub binary_fields: Vec<GrpcBinaryField>,
     pub metadata: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrpcBinaryField {
+    pub message_index: usize,
+    pub name: String,
+    pub value: Bytes,
 }
 
 #[derive(Debug, Clone, Default)]

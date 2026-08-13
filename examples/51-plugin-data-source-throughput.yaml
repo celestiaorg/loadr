@@ -29,7 +29,7 @@ scenarios:
           protocol: noop
           url: noop://local
           method: POST
-          body: "${data.signed_tx.tx_b64}"
+          body: "${data.signed_tx.nonce}"
 
 thresholds:
   noop_reqs: [ "count>0" ]

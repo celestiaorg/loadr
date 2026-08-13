@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use abi_stable::library::lib_header_from_path;
-use abi_stable::std_types::{ROption, RResult, RString};
+use abi_stable::std_types::{ROption, RResult, RStr, RString};
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -24,8 +24,8 @@ use loadr_core::{
 };
 
 use crate::abi::{
-    FfiDataSourceBox, FfiOutputBox, FfiProtocolBox, FfiServiceBox, PluginModRef,
-    LOADR_PLUGIN_ABI_VERSION,
+    FfiDataSourceBox, FfiOutputBox, FfiProtocolBox, FfiRowCtx, FfiServiceBox, FfiValue,
+    PluginModRef, LOADR_PLUGIN_ABI_VERSION,
 };
 use crate::error::PluginError;
 use crate::traits::ServicePlugin;
@@ -387,28 +387,6 @@ struct FfiDataSourceInit<'a> {
     sources: &'a IndexMap<String, serde_json::Value>,
 }
 
-/// JSON payload handed to [`crate::abi::FfiDataSource::next_row`].
-#[derive(Serialize)]
-struct FfiRowCtx<'a> {
-    source: &'a str,
-    vu: u64,
-    iteration: u64,
-    seq: u64,
-    scenario: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request: Option<&'a str>,
-    ts_ms: u64,
-}
-
-/// JSON response from [`crate::abi::FfiDataSource::next_row`].
-#[derive(Default, Deserialize)]
-struct FfiRowResponse {
-    #[serde(default)]
-    row: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default)]
-    exhausted: bool,
-}
-
 /// Bridges an FFI data-source plugin to `loadr_core::data::DataSourcePlugin`.
 pub struct NativeDataSourceAdapter {
     name: String,
@@ -455,32 +433,32 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
 
     fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String> {
         let ffi_ctx = FfiRowCtx {
-            source: ctx.source,
+            source: RStr::from(ctx.source),
             vu: ctx.vu,
             iteration: ctx.iteration,
             seq: ctx.seq,
-            scenario: ctx.scenario,
-            request: ctx.request,
+            scenario: RStr::from(ctx.scenario),
+            request: ctx.request.map(RStr::from).into(),
             ts_ms: ctx.ts_ms,
         };
-        let json = serde_json::to_string(&ffi_ctx)
-            .map_err(|e| format!("cannot encode row context: {e}"))?;
-        let response_json = match self.inner.next_row(RString::from(json)) {
-            RResult::ROk(s) => s,
-            RResult::RErr(e) => return Err(e.into_string()),
-        };
-        let response: FfiRowResponse = serde_json::from_str(response_json.as_str())
-            .map_err(|e| format!("invalid row JSON: {e}"))?;
-        if response.exhausted {
-            return Ok(PluginRowResult::Exhausted);
+        match self.inner.next_row(ffi_ctx) {
+            RResult::ROk(ROption::RSome(fields)) => {
+                let mut row = Row::new();
+                for field in fields {
+                    let name = field.name.into_string();
+                    match field.value {
+                        FfiValue::String(value) => {
+                            row.insert(name, value.into_string());
+                        }
+                        FfiValue::Bytes(value) => {
+                            row.insert_bytes(name, Bytes::from_owner(value));
+                        }
+                    }
+                }
+                Ok(PluginRowResult::Row(row))
+            }
+            RResult::ROk(ROption::RNone) => Ok(PluginRowResult::Exhausted),
+            RResult::RErr(error) => Err(error.into_string()),
         }
-        let row_obj = response
-            .row
-            .ok_or_else(|| "plugin returned neither `row` nor `exhausted`".to_string())?;
-        let row: Row = row_obj
-            .iter()
-            .map(|(k, v)| (k.clone(), loadr_core::vu::json_to_string(v)))
-            .collect();
-        Ok(PluginRowResult::Row(row))
     }
 }

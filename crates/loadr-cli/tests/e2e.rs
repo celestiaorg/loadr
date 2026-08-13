@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_loadr");
 
@@ -616,7 +616,7 @@ scenarios:
             reflection: true
             service: loadr.test.Echo
             method: UnaryEcho
-            message: {{ message: "sig", payload: "${{data.signed_tx.tx_b64}}" }}
+            message: {{ message: "sig", payload: "${{data.signed_tx.tx}}" }}
           checks:
             - {{ type: status, equals: 0 }}
 "#,
@@ -668,6 +668,96 @@ scenarios:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn plugin_data_source_grpc_perf_smoke() {
+    let server = loadr_testserver::GrpcEchoServer::spawn()
+        .await
+        .expect("grpc server");
+    let plugin_path = build_native_plugin(
+        "loadr-plugin-example-native-data-source",
+        "native_data_source",
+    );
+    let vus = std::env::var("LOADR_PERF_VUS").unwrap_or_else(|_| "32".to_string());
+    let duration = std::env::var("LOADR_PERF_DURATION").unwrap_or_else(|_| "5s".to_string());
+    let dir = tempfile::tempdir().expect("tmp");
+    let yaml = format!(
+        r#"
+name: e2e-plugin-data-source-grpc-perf
+plugins:
+  - name: tx-signer
+    path: {plugin_path}
+    config: {{ seed: 1 }}
+data:
+  signed_tx:
+    type: plugin
+    source: tx-signer
+    config: {{ chain_id: perf }}
+scenarios:
+  submit:
+    executor: constant-vus
+    vus: {vus}
+    duration: {duration}
+    flow:
+      - request:
+          name: submit tx
+          protocol: grpc
+          url: grpc://{addr}
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+            message: {{ message: "sig", payload: "${{data.signed_tx.tx}}" }}
+"#,
+        plugin_path = plugin_path.display(),
+        addr = server.addr,
+    );
+    let test = write_test(dir.path(), "t.yaml", &yaml);
+    let summary_path = dir.path().join("summary.json");
+
+    let start = Instant::now();
+    let output = Command::new(BIN)
+        .args([
+            "run",
+            "--quiet",
+            "--summary-export",
+            summary_path.to_str().expect("path"),
+            test.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run loadr");
+    let elapsed = start.elapsed().as_secs_f64();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected success.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_path).expect("summary file"))
+            .expect("summary json");
+    let metric = |name: &str| {
+        summary["metrics"]
+            .as_array()
+            .expect("metrics")
+            .iter()
+            .find(|metric| metric["metric"] == name)
+            .unwrap_or_else(|| panic!("missing metric {name}: {summary}"))
+    };
+    let grpc_reqs = metric("grpc_reqs")["agg"]["sum"]
+        .as_f64()
+        .expect("grpc_reqs sum");
+    let failed = metric("http_req_failed")["agg"]["rate"]
+        .as_f64()
+        .expect("http_req_failed rate");
+    assert_eq!(failed, 0.0, "expected zero failed requests: {summary}");
+    println!(
+        "plugin_data_source_grpc_perf_smoke: vus={vus} duration={duration} requests={grpc_reqs:.0} wall={elapsed:.3}s throughput={:.0} req/s",
+        grpc_reqs / elapsed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_data_source_runs_at_fixed_count_against_noop() {
     let plugin_path = build_native_plugin(
         "loadr-plugin-example-native-data-source",
@@ -697,7 +787,7 @@ scenarios:
           protocol: noop
           url: noop://local
           method: POST
-          body: "${{data.signed_tx.tx_b64}}"
+          body: "${{data.signed_tx.nonce}}"
 thresholds:
   noop_reqs: [ "count==12" ]
   http_req_failed: [ "rate==0" ]

@@ -19,7 +19,9 @@ use loadr_core::protocol::{
 };
 use loadr_core::vu::VuContext;
 use prost::Message as _;
-use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, Kind, MethodDescriptor, ReflectMessage, Value,
+};
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::metadata::{MetadataKey, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
@@ -401,6 +403,15 @@ impl ProtocolHandler for GrpcHandler {
                 messages.push(message);
             }
         }
+        for field in &grpc.binary_fields {
+            let message = messages.get_mut(field.message_index).ok_or_else(|| {
+                ProtocolError::InvalidRequest(format!(
+                    "binary field targets missing gRPC message {}",
+                    field.message_index
+                ))
+            })?;
+            set_binary_field(message, &field.name, field.value.clone())?;
+        }
         let bytes_sent: u64 = messages.iter().map(|m| m.encoded_len() as u64 + 5).sum();
 
         let path = http::uri::PathAndQuery::try_from(format!(
@@ -471,6 +482,35 @@ impl ProtocolHandler for GrpcHandler {
             }
         }
     }
+}
+
+fn set_binary_field(
+    message: &mut DynamicMessage,
+    name: &str,
+    value: bytes::Bytes,
+) -> Result<(), ProtocolError> {
+    let descriptor = message.descriptor();
+    let field = descriptor
+        .get_field_by_json_name(name)
+        .or_else(|| descriptor.get_field_by_name(name))
+        .ok_or_else(|| {
+            ProtocolError::InvalidRequest(format!(
+                "field `{name}` does not exist on `{}`",
+                descriptor.full_name()
+            ))
+        })?;
+    if field.is_list() || field.is_map() {
+        return Err(ProtocolError::InvalidRequest(format!(
+            "binary field `{name}` must be singular"
+        )));
+    }
+    if !matches!(field.kind(), Kind::Bytes) {
+        return Err(ProtocolError::InvalidRequest(format!(
+            "binary placeholder targets non-bytes field `{name}`"
+        )));
+    }
+    message.set_field(&field, Value::Bytes(value));
+    Ok(())
 }
 
 fn grpc_error_response(message: String, start: Instant, url: &str) -> ProtocolResponse {

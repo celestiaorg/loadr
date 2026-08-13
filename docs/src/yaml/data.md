@@ -84,7 +84,7 @@ scenarios:
             service: mempool.Submitter
             method: Submit
             message:
-              tx: "${data.signed_tx.tx_b64}"   # bytes field <- base64 string
+              tx: "${data.signed_tx.tx}"
           checks:
             - { type: status, equals: 0 }
 ```

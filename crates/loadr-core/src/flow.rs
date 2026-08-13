@@ -1614,6 +1614,7 @@ impl FlowRunner {
             });
         }
         if let Some(grpc) = &req.grpc {
+            let mut binary_fields = Vec::new();
             options.grpc = Some(GrpcRequest {
                 proto_files: grpc.proto_files.clone(),
                 proto_includes: grpc.proto_includes.clone(),
@@ -1623,13 +1624,19 @@ impl FlowRunner {
                 message: grpc
                     .message
                     .as_ref()
-                    .map(|m| render_json(self, m, vu, script))
+                    .map(|message| {
+                        render_grpc_message(self, message, 0, vu, script, &mut binary_fields)
+                    })
                     .transpose()?,
                 messages: grpc
                     .messages
                     .iter()
-                    .map(|m| render_json(self, m, vu, script))
+                    .enumerate()
+                    .map(|(index, message)| {
+                        render_grpc_message(self, message, index, vu, script, &mut binary_fields)
+                    })
                     .collect::<Result<_, _>>()?,
+                binary_fields,
                 metadata: grpc
                     .metadata
                     .iter()
@@ -2033,6 +2040,47 @@ fn render_json(
         }
         other => other.clone(),
     })
+}
+
+fn render_grpc_message(
+    runner: &FlowRunner,
+    message: &serde_json::Value,
+    message_index: usize,
+    vu: &mut VuContext,
+    script: &mut Option<Box<dyn VuScript>>,
+    binary_fields: &mut Vec<crate::protocol::GrpcBinaryField>,
+) -> Result<serde_json::Value, PrepareError> {
+    let mut message = message.clone();
+    let serde_json::Value::Object(fields) = &mut message else {
+        return render_json(runner, &message, vu, script);
+    };
+    for (name, value) in fields {
+        let serde_json::Value::String(source) = value else {
+            continue;
+        };
+        let Ok(template) = Template::parse(source) else {
+            continue;
+        };
+        let [loadr_config::Part::Expr(expr)] = template.parts.as_slice() else {
+            continue;
+        };
+        let bytes = match vu.resolve_data_bytes(expr) {
+            Ok(value) => value,
+            Err(crate::data::NextRowError::Exhausted(_)) => {
+                return Err(PrepareError::DataExhausted)
+            }
+            Err(error) => return Err(PrepareError::Other(error.to_string())),
+        };
+        if let Some(bytes) = bytes {
+            binary_fields.push(crate::protocol::GrpcBinaryField {
+                message_index,
+                name: name.clone(),
+                value: bytes,
+            });
+            *value = serde_json::Value::String(String::new());
+        }
+    }
+    render_json(runner, &message, vu, script)
 }
 
 fn apply_request_overrides(

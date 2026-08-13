@@ -1397,7 +1397,7 @@ scenarios:
     vus: 1
     duration: 1s
     flow:
-      - request: { url: "https://e.com/${data.signed_tx.tx_b64}" }
+      - request: { url: "https://e.com/${data.signed_tx.nonce}" }
 "#;
         let diags = errors(yaml);
         assert!(diags.is_empty(), "expected no errors, got: {diags:?}");

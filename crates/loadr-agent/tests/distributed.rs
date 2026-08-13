@@ -90,7 +90,7 @@ impl loadr_core::DataSourcePlugin for MockDataSource {
         _ctx: &loadr_core::PluginRowCtx<'_>,
     ) -> Result<loadr_core::PluginRowResult, String> {
         let n = self.rows.fetch_add(1, Ordering::Relaxed);
-        let mut row = indexmap::IndexMap::new();
+        let mut row = loadr_core::data::Row::new();
         row.insert("tick".to_string(), n.to_string());
         Ok(loadr_core::PluginRowResult::Row(row))
     }

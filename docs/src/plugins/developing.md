@@ -317,9 +317,10 @@ A data-source plugin implements `FfiDataSource` and exports it via
 
 ```rust
 use loadr_plugin_api::abi::{
-    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, PluginMod, LOADR_PLUGIN_ABI_VERSION,
+    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, FfiField, FfiRowCtx, FfiValue,
+    PluginMod, LOADR_PLUGIN_ABI_VERSION,
 };
-use abi_stable::std_types::{RString, RResult::{ROk, RErr}, ROption::{RNone, RSome}};
+use abi_stable::std_types::{ROption, ROption::{RNone, RSome}, RResult, RResult::ROk, RString, RVec};
 
 #[derive(Default)]
 struct MySource { /* signing key, per-source config, ... */ }
@@ -334,10 +335,11 @@ impl FfiDataSource for MySource {
     }
 
     /// Called concurrently from VU worker threads, once per request.
-    fn next_row(&self, ctx_json: RString) -> RResult<RString, RString> {
-        // parse {"source","vu","iteration","seq","scenario","request"?,"ts_ms"}
-        // return {"row": {"col": "value", ...}} or {"exhausted": true}
-        ROk(RString::from(r#"{"row":{"col":"value"}}"#))
+    fn next_row(&self, ctx: FfiRowCtx<'_>) -> RResult<ROption<RVec<FfiField>>, RString> {
+        ROk(RSome(RVec::from(vec![FfiField {
+            name: "nonce".into(),
+            value: FfiValue::String(format!("{}:{}", ctx.vu, ctx.seq).into()),
+        }])))
     }
 }
 
@@ -374,7 +376,7 @@ Key facts that shape the design:
   `[plugin]` — informational only. The host's authoritative check is
   whether `make_data_source` is present in the loaded module.
 
-### Init / row JSON contracts
+### Init and row contracts
 
 ```jsonc
 // init_json (host -> plugin, once before VUs start)
@@ -383,29 +385,15 @@ Key facts that shape the design:
   "sources": { "signed_tx": { "chain_id": "testnet-1" } }  // one entry per data.<name> backed by this plugin
 }
 
-// ctx_json (host -> plugin, per next_row call)
-{
-  "source": "signed_tx", "vu": 3, "iteration": 0, "seq": 5,
-  "scenario": "submit", "request": "submit tx", "ts_ms": 1700000000000
-}
-
-// row response (plugin -> host)
-{ "row": { "tx_b64": "...", "nonce": "3:5" } }
-// or, when the generator is exhausted (retires the VU, like `on_eof: stop`):
-{ "exhausted": true }
 ```
 
-`seq` is a monotonic counter per (VU, source) — combine it with `vu` for
-lock-free uniqueness across VUs with no shared state on your side. `request`
-is the name of the request currently being prepared, or absent when the row
-is fetched outside request preparation (e.g. from a JS step). Row values
-cross as JSON scalars; strings map straight through, and a `bytes` protobuf
-field expects base64 (`prost-reflect` decodes it automatically).
+`FfiRowCtx` carries `source`, `vu`, `iteration`, `seq`, `scenario`, optional `request`, and `ts_ms` directly across the ABI on every call. `seq` is monotonic per (VU, source), so combining it with `vu` provides lock-free uniqueness across VUs.
+
+Return `RSome(fields)` for a row and `RNone` when the generator is exhausted. `FfiValue::String` participates in normal interpolation; `FfiValue::Bytes` can replace an exact top-level singular protobuf `bytes` field such as `tx: "${data.signed_tx.tx}"` without base64 encoding.
 
 ### Testing
 
-- Unit-test `init`/`next_row` by building the JSON payloads above and
-  asserting on the response — no host needed.
+- Unit-test `init` with the JSON payload above and call `next_row` with an `FfiRowCtx`, asserting on the returned typed fields — no host needed.
 - Load the built artifact with `loadr_plugin_api::NativePlugin::load(...)`
   and drive it through `make_data_source(config)` — see
   `crates/loadr-plugin-api/tests/native_plugins.rs` for the reference tests

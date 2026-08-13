@@ -10,8 +10,8 @@ use loadr_config::{HttpDefaults, HttpVersionPref, TlsConfig};
 use loadr_core::data::DataFeeds;
 use loadr_core::metrics::{MetricRegistry, MetricsBus, Tags};
 use loadr_core::protocol::{
-    GrpcRequest, PreparedRequest, ProtocolHandler, RequestOptions, SocketRequest, WsFrame,
-    WsRequest,
+    GrpcBinaryField, GrpcRequest, PreparedRequest, ProtocolHandler, RequestOptions, SocketRequest,
+    WsFrame, WsRequest,
 };
 use loadr_core::vu::{RunContext, VuContext};
 use loadr_protocols::{
@@ -508,6 +508,58 @@ async fn grpc_unary_via_reflection() {
     );
     let json: serde_json::Value = serde_json::from_slice(&response.body).expect("json body");
     assert_eq!(json["message"], "reflected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_binary_field_uses_raw_bytes() {
+    let server = GrpcEchoServer::spawn().await.expect("grpc server");
+    let handler = GrpcHandler::new(&HttpDefaults::default(), Path::new(".")).expect("handler");
+    let mut vu = vu();
+    let request = grpc_request(
+        &format!("grpc://{}", server.addr),
+        GrpcRequest {
+            reflection: true,
+            service: "loadr.test.Echo".to_string(),
+            method: "UnaryEcho".to_string(),
+            message: Some(serde_json::json!({"message": "raw", "payload": ""})),
+            binary_fields: vec![GrpcBinaryField {
+                message_index: 0,
+                name: "payload".to_string(),
+                value: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            }],
+            ..Default::default()
+        },
+    );
+    let response = handler.execute(&mut vu, &request).await.expect("response");
+    let json: serde_json::Value = serde_json::from_slice(&response.body).expect("json body");
+    assert_eq!(json["payload"], "3q2+7w==");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_binary_field_rejects_non_bytes_target() {
+    let server = GrpcEchoServer::spawn().await.expect("grpc server");
+    let handler = GrpcHandler::new(&HttpDefaults::default(), Path::new(".")).expect("handler");
+    let mut vu = vu();
+    let request = grpc_request(
+        &format!("grpc://{}", server.addr),
+        GrpcRequest {
+            reflection: true,
+            service: "loadr.test.Echo".to_string(),
+            method: "UnaryEcho".to_string(),
+            message: Some(serde_json::json!({"message": ""})),
+            binary_fields: vec![GrpcBinaryField {
+                message_index: 0,
+                name: "message".to_string(),
+                value: Bytes::from_static(b"raw"),
+            }],
+            ..Default::default()
+        },
+    );
+    let error = handler
+        .execute(&mut vu, &request)
+        .await
+        .expect_err("string field must reject bytes");
+    assert!(error.to_string().contains("non-bytes field `message`"));
 }
 
 // ---------------------------------------------------------------------------

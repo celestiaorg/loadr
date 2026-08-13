@@ -3197,7 +3197,6 @@ name = "loadr-plugin-example-native-data-source"
 version = "1.0.0"
 dependencies = [
  "abi_stable",
- "base64 0.22.1",
  "ed25519-dalek",
  "loadr-plugin-api",
  "serde",

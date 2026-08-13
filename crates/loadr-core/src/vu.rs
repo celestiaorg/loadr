@@ -186,6 +186,9 @@ impl VuContext {
                 None => return Ok(None),
             };
             let row = self.data_row(source)?;
+            if row.get_bytes(column).is_some() {
+                return Err(NextRowError::BinaryInText(expr.to_string()));
+            }
             return Ok(row.get(column).cloned());
         }
         // Built-ins.
@@ -203,6 +206,19 @@ impl VuContext {
             return Ok(Some(json_to_string(v)));
         }
         Ok(None)
+    }
+
+    pub(crate) fn resolve_data_bytes(
+        &mut self,
+        expr: &str,
+    ) -> Result<Option<bytes::Bytes>, NextRowError> {
+        let Some(rest) = expr.strip_prefix("data.") else {
+            return Ok(None);
+        };
+        let Some((source, column)) = rest.split_once('.') else {
+            return Ok(None);
+        };
+        Ok(self.data_row(source)?.get_bytes(column).cloned())
     }
 }
 
@@ -360,6 +376,7 @@ mod tests {
             ));
             let mut row = crate::data::Row::new();
             row.insert("n".to_string(), n.to_string());
+            row.insert_bytes("tx".to_string(), bytes::Bytes::from_static(b"raw"));
             Ok(crate::data::PluginRowResult::Row(row))
         }
     }
@@ -432,6 +449,18 @@ mod tests {
         let a = vu.resolve_expr("data.signed.n").unwrap().unwrap();
         let b = vu.resolve_expr("data.signed.n").unwrap().unwrap();
         assert_eq!(a, b, "same request sees the same plugin row");
+    }
+
+    #[test]
+    fn binary_plugin_value_is_not_text() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit");
+        assert!(matches!(
+            vu.resolve_expr("data.signed.tx"),
+            Err(crate::data::NextRowError::BinaryInText(_))
+        ));
     }
 
     #[test]

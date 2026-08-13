@@ -11,7 +11,7 @@ plugins without a backend becoming the bottleneck.
     protocol: noop
     url: noop://local
     method: POST
-    body: "${data.signed_tx.tx_b64}"
+    body: "${data.signed_tx.nonce}"
 ```
 
 `noop://` URLs infer the protocol automatically, so `protocol: noop` is

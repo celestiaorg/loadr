@@ -6,23 +6,23 @@
 //! time-sensitive payload.
 //!
 //! Wire payload layout (signed message, then the 64-byte signature appended):
-//! `chain_id bytes || vu (u64 LE) || seq (u64 LE) || ts_ms (u64 LE) || signature`,
-//! base64-encoded as `tx_b64`. Uniqueness comes from the core-supplied
-//! `(vu, seq)` pair -- no locks needed on the hot path.
+//! `chain_id bytes || vu (u64 LE) || seq (u64 LE) || ts_ms (u64 LE) || signature`.
+//! The row returns those bytes directly as `tx`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use abi_stable::std_types::{
+    ROption,
     ROption::{RNone, RSome},
     RResult,
     RResult::{RErr, ROk},
-    RString,
+    RString, RVec,
 };
-use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use loadr_plugin_api::abi::{
-    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, PluginMod, LOADR_PLUGIN_ABI_VERSION,
+    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, FfiField, FfiRowCtx, FfiValue, PluginMod,
+    LOADR_PLUGIN_ABI_VERSION,
 };
 use serde::Deserialize;
 
@@ -48,15 +48,6 @@ struct TxSigner {
 struct InitPayload {
     plugin_config: serde_json::Value,
     sources: HashMap<String, serde_json::Value>,
-}
-
-/// `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
-#[derive(Deserialize)]
-struct RowCtx {
-    source: String,
-    vu: u64,
-    seq: u64,
-    ts_ms: u64,
 }
 
 /// Decode an even-length hex string. No external `hex` crate needed for
@@ -131,15 +122,11 @@ impl FfiDataSource for TxSigner {
         ROk(())
     }
 
-    fn next_row(&self, ctx_json: RString) -> RResult<RString, RString> {
-        let ctx: RowCtx = match serde_json::from_str(ctx_json.as_str()) {
-            Ok(c) => c,
-            Err(e) => return RErr(RString::from(format!("invalid row context JSON: {e}"))),
-        };
+    fn next_row(&self, ctx: FfiRowCtx<'_>) -> RResult<ROption<RVec<FfiField>>, RString> {
         let Some(signing_key) = &self.signing_key else {
             return RErr(RString::from("plugin not initialized"));
         };
-        let Some(state) = self.sources.get(&ctx.source) else {
+        let Some(state) = self.sources.get(ctx.source.as_str()) else {
             return RErr(RString::from(format!(
                 "unknown data source `{}`",
                 ctx.source
@@ -149,24 +136,29 @@ impl FfiDataSource for TxSigner {
         if let Some(limit) = state.limit {
             let generated = state.generated.fetch_add(1, Ordering::SeqCst);
             if generated >= limit {
-                return ROk(RString::from(r#"{"exhausted":true}"#));
+                return ROk(RNone);
             }
         }
 
-        let mut message = Vec::with_capacity(state.chain_id.len() + 24);
-        message.extend_from_slice(state.chain_id.as_bytes());
-        message.extend_from_slice(&ctx.vu.to_le_bytes());
-        message.extend_from_slice(&ctx.seq.to_le_bytes());
-        message.extend_from_slice(&ctx.ts_ms.to_le_bytes());
-
-        let signature = signing_key.sign(&message);
-        let mut tx = message;
+        let mut tx = Vec::with_capacity(state.chain_id.len() + 24 + 64);
+        tx.extend_from_slice(state.chain_id.as_bytes());
+        tx.extend_from_slice(&ctx.vu.to_le_bytes());
+        tx.extend_from_slice(&ctx.seq.to_le_bytes());
+        tx.extend_from_slice(&ctx.ts_ms.to_le_bytes());
+        let signature = signing_key.sign(&tx);
         tx.extend_from_slice(&signature.to_bytes());
-        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx);
         let nonce = format!("{}:{}", ctx.vu, ctx.seq);
 
-        let row = serde_json::json!({"row": {"tx_b64": tx_b64, "nonce": nonce}});
-        ROk(RString::from(row.to_string()))
+        ROk(RSome(RVec::from(vec![
+            FfiField {
+                name: "tx".into(),
+                value: FfiValue::Bytes(RVec::from(tx)),
+            },
+            FfiField {
+                name: "nonce".into(),
+                value: FfiValue::String(nonce.into()),
+            },
+        ])))
     }
 }
 
