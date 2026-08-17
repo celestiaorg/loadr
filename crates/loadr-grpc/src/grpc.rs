@@ -1121,6 +1121,20 @@ impl ProtocolHandler for GrpcHandler {
                 .map(|message| message.as_ref())
                 .collect()
         };
+        // Only client/bidi streaming consumes more than one frame; the other
+        // shapes take `.next()` and drop the rest, which would silently
+        // discard (and, for a generator feeder, burn) every frame after the
+        // first. The shape comes from the descriptor, so config validation
+        // cannot catch this.
+        if !cached.shape.0 && raw.len() > 1 {
+            return Err(ProtocolError::InvalidRequest(format!(
+                "`{}/{}` is not client-streaming: it accepts one message, but {} were built \
+                 (check `messages`/`stream_repeat`)",
+                grpc.service,
+                grpc.method,
+                raw.len()
+            )));
+        }
         let literal_key = if grpc.message_literal {
             if !grpc.messages.is_empty() {
                 Some(Arc::as_ptr(&grpc.messages) as usize)
