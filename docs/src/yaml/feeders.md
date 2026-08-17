@@ -27,6 +27,14 @@ Each call receives run, agent instance, partition, VU, iteration, per-source
 sequence, scenario, request, and timestamp identity. `next_row` may be called
 concurrently and should avoid global locks on its hot path.
 
+A row is fetched once per request, and once per frame of a streaming request —
+so a `messages` list of length L with `stream_repeat: N` pulls `N × L` rows and
+every frame carries a distinct payload. Derive uniqueness from `seq`: `ts_ms`
+is millisecond-granular and frames of one request share it. Those `N × L` rows
+are consumed all-or-nothing; if the source reports `exhausted` partway, the
+whole request is abandoned and the already-generated rows are discarded, so
+size any generator limit as a multiple of `N × L`.
+
 Build the reference feeder with:
 
 ```bash

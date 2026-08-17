@@ -612,6 +612,15 @@ impl Ctx<'_> {
             if grpc.channel_pool_size == Some(0) {
                 self.error(format!("{rpath}.grpc"), "`channel_pool_size` must be >= 1");
             }
+            if grpc.stream_repeat == Some(0) {
+                self.error(format!("{rpath}.grpc"), "`stream_repeat` must be >= 1");
+            }
+            if grpc.stream_repeat.is_some() && grpc.messages.is_empty() {
+                self.error(
+                    format!("{rpath}.grpc"),
+                    "`stream_repeat` needs `messages` (it repeats the streamed frames)",
+                );
+            }
         }
         if let Some(sock) = &req.socket {
             if sock.send_text.is_some() && sock.send_hex.is_some() {
@@ -1109,6 +1118,52 @@ scenarios:
         assert!(
             paths.contains(&"scenarios.s.flow[2].request.grpc.metadata.x-token"),
             "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn stream_repeat_is_validated() {
+        let yaml = r#"
+scenarios:
+  s:
+    executor: constant-vus
+    vus: 1
+    duration: 1s
+    flow:
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: ClientStreamEcho
+            messages: [ { message: ok } ]
+            stream_repeat: 0
+      - request:
+          protocol: grpc
+          url: grpc://127.0.0.1:50051
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+            message: { message: ok }
+            stream_repeat: 4
+"#;
+        let messages: Vec<_> = errors(yaml)
+            .iter()
+            .map(|diag| diag.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("`stream_repeat` must be >= 1")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("`stream_repeat` needs `messages`")),
+            "{messages:?}"
         );
     }
 
