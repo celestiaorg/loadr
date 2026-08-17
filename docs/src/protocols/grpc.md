@@ -95,6 +95,23 @@ grpc:
   messages: [ { v: 1 }, { v: 2 }, { v: 3 } ]
 ```
 
+`stream_repeat: N` sends the `messages` list N times, one frame per copy —
+useful when frames should differ only by generated data:
+
+```yaml
+grpc:
+  service: mempool.Submitter
+  method: SubmitStream
+  stream_repeat: 32
+  messages: [ { tx: "${data.signed.tx_b64}" } ]   # 32 frames, 32 distinct rows
+```
+
+Every frame re-fetches plugin-backed (`type: plugin`) data sources, so each
+copy carries a fresh row; fields *within* one frame always come from the same
+row. CSV, JSON, and inline sources keep their per-iteration value across all
+frames. Building more frames than a non-client-streaming method accepts is an
+error rather than a silent truncation.
+
 The response body is the (last) response message rendered as JSON, so
 `jsonpath` extraction/assertions work naturally. `extras.message_count` holds
 the number of streamed responses.

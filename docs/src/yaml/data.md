@@ -111,6 +111,16 @@ iteration — or a retried request — gets a fresh one. This matters for a flow
 that sends two signed submissions per iteration: they must not reuse the
 same signature.
 
+Within a gRPC streaming request, freshness is **per frame**: each entry of
+`messages` (and each `stream_repeat` copy of it) pulls its own row, so a list
+of length L with `stream_repeat: N` consumes `N × L` rows and every frame
+carries a distinct payload. Fields inside one frame still share a row, so a
+signature and its nonce always agree. Derive uniqueness from `seq` — `ts_ms`
+is millisecond-granular and frames of one request share it. Those `N × L` rows
+are consumed all-or-nothing: if the source reports exhaustion partway, the
+request is abandoned and the rows already generated are discarded, so size any
+generator limit as a multiple of `N × L`.
+
 **Exhaustion retires the VU**, the same as `on_eof: stop` for a finite CSV.
 **Plugin errors count as failed requests** (tagged `error:prepare` on
 `http_req_failed`) and the run continues — a transient signing failure does

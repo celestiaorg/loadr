@@ -185,13 +185,24 @@ impl VuContext {
             return;
         }
         self.current_request = Some(name.to_string());
+        self.begin_message();
+    }
+
+    /// Begin one message of a multi-message request (a gRPC streaming frame):
+    /// evict plugin-backed rows so every frame renders a fresh row. A no-op
+    /// when the run has no on-demand sources.
+    pub fn begin_message(&mut self) {
+        if !self.run.data.has_on_demand() {
+            return;
+        }
         let data = &self.run.data;
         self.current_rows.retain(|src, _| !data.is_on_demand(src));
     }
 
     /// The data row for `source` in the current iteration (fetched once),
-    /// or the current request if `source` is plugin-backed (fetched once
-    /// per request; see [`VuContext::begin_request`]).
+    /// or the current request if `source` is plugin-backed (fetched once per
+    /// request, and once per streamed frame within it; see
+    /// [`VuContext::begin_request`] and [`VuContext::begin_message`]).
     pub fn data_row(&mut self, source: &str) -> Result<Arc<crate::data::Row>, NextRowError> {
         if let Some(row) = self.current_rows.get(source) {
             return Ok(row.clone());
@@ -509,6 +520,33 @@ mod tests {
         vu.begin_request("submit 2");
         let b = vu.resolve_expr("data.signed.n").unwrap().unwrap();
         assert_ne!(a, b, "a new request pulls a fresh plugin row");
+    }
+
+    #[test]
+    fn plugin_row_is_fresh_for_each_streamed_message() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit");
+        let a = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        vu.begin_message();
+        let b = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        vu.begin_message();
+        let c = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        assert_ne!(a, b, "each streamed frame pulls a fresh plugin row");
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn memory_feeds_unaffected_by_message_eviction() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit");
+        let a = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        vu.begin_message();
+        let b = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        assert_eq!(a, b, "memory-backed rows are not evicted by begin_message");
     }
 
     #[test]

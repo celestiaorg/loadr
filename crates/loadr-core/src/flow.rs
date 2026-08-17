@@ -279,45 +279,48 @@ impl CompiledGrpcValue {
 
 enum CompiledGrpcValues {
     Literal(Arc<Vec<serde_json::Value>>),
-    Dynamic(Vec<CompiledJson>),
+    Dynamic {
+        values: Vec<CompiledJson>,
+        repeat: usize,
+    },
 }
 
 impl CompiledGrpcValues {
-    fn compile(values: &[serde_json::Value], what: &str) -> Result<Self, EngineError> {
+    /// `repeat` copies of `values` form the frame sequence. Literal lists are
+    /// expanded here so the `Arc` keeps the stable identity the gRPC handler's
+    /// encode cache keys on; dynamic lists are expanded per request in
+    /// `prepare`, where each copy can pull a fresh feeder row.
+    fn compile(
+        values: &[serde_json::Value],
+        repeat: usize,
+        what: &str,
+    ) -> Result<Self, EngineError> {
         let compiled = values
             .iter()
             .map(|value| CompiledJson::compile(value, what))
             .collect::<Result<Vec<_>, _>>()?;
         if compiled.iter().all(CompiledJson::is_literal) {
-            Ok(Self::Literal(Arc::new(values.to_vec())))
-        } else {
-            Ok(Self::Dynamic(compiled))
+            let mut expanded = Vec::with_capacity(values.len() * repeat);
+            for _ in 0..repeat {
+                expanded.extend_from_slice(values);
+            }
+            return Ok(Self::Literal(Arc::new(expanded)));
         }
+        Ok(Self::Dynamic {
+            values: compiled,
+            repeat,
+        })
     }
 
     fn is_empty(&self) -> bool {
         match self {
             Self::Literal(values) => values.is_empty(),
-            Self::Dynamic(values) => values.is_empty(),
+            Self::Dynamic { values, .. } => values.is_empty(),
         }
     }
 
     fn is_literal(&self) -> bool {
         matches!(self, Self::Literal(_))
-    }
-
-    fn render<F, E>(&self, render_template: &mut F) -> Result<Arc<Vec<serde_json::Value>>, E>
-    where
-        F: FnMut(&Template) -> Result<String, E>,
-    {
-        match self {
-            Self::Literal(values) => Ok(values.clone()),
-            Self::Dynamic(values) => values
-                .iter()
-                .map(|value| value.render(render_template))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Arc::new),
-        }
     }
 }
 
@@ -367,7 +370,11 @@ impl CompiledGrpc {
                 .as_ref()
                 .map(|message| CompiledGrpcValue::compile(message, "grpc message"))
                 .transpose()?,
-            messages: CompiledGrpcValues::compile(&grpc.messages, "grpc message")?,
+            messages: CompiledGrpcValues::compile(
+                &grpc.messages,
+                grpc.stream_repeat.unwrap_or(1),
+                "grpc message",
+            )?,
             metadata: grpc
                 .metadata
                 .iter()
@@ -383,16 +390,28 @@ impl CompiledGrpc {
         })
     }
 
-    fn render<F, E>(&self, render_template: &mut F) -> Result<GrpcRequest, E>
+    /// `messages` is rendered by the caller: evicting plugin-backed rows
+    /// between frames needs the `VuContext`, which a single `FnMut` renderer
+    /// cannot reach. Metadata renders first so it stays bound to the
+    /// request-level row rather than the last frame's.
+    fn render<F, E>(
+        &self,
+        messages: Arc<Vec<serde_json::Value>>,
+        render_template: &mut F,
+    ) -> Result<GrpcRequest, E>
     where
         F: FnMut(&Template) -> Result<String, E>,
     {
+        let metadata = self
+            .metadata
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), render_template(value)?)))
+            .collect::<Result<_, E>>()?;
         let message = self
             .message
             .as_ref()
             .map(|message| message.render(render_template))
             .transpose()?;
-        let messages = self.messages.render(render_template)?;
         let message_literal = if self.messages.is_empty() {
             self.message
                 .as_ref()
@@ -400,11 +419,6 @@ impl CompiledGrpc {
         } else {
             self.messages.is_literal()
         };
-        let metadata = self
-            .metadata
-            .iter()
-            .map(|(key, value)| Ok((key.clone(), render_template(value)?)))
-            .collect::<Result<_, E>>()?;
         Ok(GrpcRequest {
             proto_files: self.proto_files.clone(),
             proto_includes: self.proto_includes.clone(),
@@ -1762,8 +1776,29 @@ impl FlowRunner {
             });
         }
         if let Some(grpc) = &req.grpc {
-            let mut rendered =
-                grpc.render(&mut |template| render_template(self, template, vu, script))?;
+            // Frames render here rather than inside `CompiledGrpc` so each one
+            // can evict plugin-backed rows first. The boundary is skipped for
+            // frame 0, which shares the row already used by the url, headers,
+            // and body above.
+            let messages =
+                match &grpc.messages {
+                    CompiledGrpcValues::Literal(values) => values.clone(),
+                    CompiledGrpcValues::Dynamic { values, repeat } => {
+                        let mut frames = Vec::with_capacity(values.len() * repeat);
+                        for value in std::iter::repeat_n(values, *repeat).flatten() {
+                            if !frames.is_empty() {
+                                vu.begin_message();
+                            }
+                            frames.push(value.render(&mut |template| {
+                                render_template(self, template, vu, script)
+                            })?);
+                        }
+                        Arc::new(frames)
+                    }
+                };
+            let mut rendered = grpc.render(messages, &mut |template| {
+                render_template(self, template, vu, script)
+            })?;
             let has_after_request = script
                 .as_ref()
                 .is_some_and(|s| s.has_function("afterRequest"));
@@ -3147,9 +3182,10 @@ mod request_metrics_tests {
 
 #[cfg(test)]
 mod grpc_template_tests {
-    use super::{CompiledGrpc, CompiledJson};
+    use super::{CompiledGrpc, CompiledGrpcValues, CompiledJson};
     use crate::data::DataFeeds;
     use crate::metrics::{MetricRegistry, MetricsBus, Tags};
+    use crate::protocol::GrpcRequest;
     use crate::vu::{RunContext, VuContext};
     use indexmap::IndexMap;
     use loadr_config::{
@@ -3303,6 +3339,18 @@ mod grpc_template_tests {
         );
     }
 
+    /// `prepare` renders the frames; these plans all use literal message
+    /// lists, so handing back the compiled `Arc` is what production does.
+    fn render_grpc<F, E>(grpc: &CompiledGrpc, render_template: &mut F) -> Result<GrpcRequest, E>
+    where
+        F: FnMut(&Template) -> Result<String, E>,
+    {
+        let CompiledGrpcValues::Literal(messages) = &grpc.messages else {
+            panic!("test plans use literal message lists");
+        };
+        grpc.render(messages.clone(), render_template)
+    }
+
     #[test]
     fn grpc_literal_and_dynamic_arc_identity_is_preserved() {
         let mut literal_options = grpc_options();
@@ -3313,8 +3361,8 @@ mod grpc_template_tests {
         let mut never_render = |_: &Template| -> Result<String, ()> {
             panic!("literal request must not render templates")
         };
-        let first = literal.render(&mut never_render).expect("first literal");
-        let second = literal.render(&mut never_render).expect("second literal");
+        let first = render_grpc(&literal, &mut never_render).expect("first literal");
+        let second = render_grpc(&literal, &mut never_render).expect("second literal");
         assert!(Arc::ptr_eq(
             first.message.as_ref().expect("message"),
             second.message.as_ref().expect("message")
@@ -3331,8 +3379,8 @@ mod grpc_template_tests {
         ];
         let streaming = CompiledGrpc::compile(&streaming_options, Path::new("."))
             .expect("compile literal stream");
-        let stream_first = streaming.render(&mut never_render).expect("first stream");
-        let stream_second = streaming.render(&mut never_render).expect("second stream");
+        let stream_first = render_grpc(&streaming, &mut never_render).expect("first stream");
+        let stream_second = render_grpc(&streaming, &mut never_render).expect("second stream");
         assert!(Arc::ptr_eq(&stream_first.messages, &stream_second.messages));
         assert!(stream_first.message_literal);
 
@@ -3344,8 +3392,8 @@ mod grpc_template_tests {
         let dynamic =
             CompiledGrpc::compile(&dynamic_options, Path::new(".")).expect("compile dynamic grpc");
         let mut render = |template: &Template| template.render(|_| Some("same".to_string()));
-        let dynamic_first = dynamic.render(&mut render).expect("first dynamic");
-        let dynamic_second = dynamic.render(&mut render).expect("second dynamic");
+        let dynamic_first = render_grpc(&dynamic, &mut render).expect("first dynamic");
+        let dynamic_second = render_grpc(&dynamic, &mut render).expect("second dynamic");
         assert!(!Arc::ptr_eq(
             dynamic_first.message.as_ref().expect("message"),
             dynamic_second.message.as_ref().expect("message")
@@ -3355,6 +3403,24 @@ mod grpc_template_tests {
             dynamic_first.metadata,
             vec![("x-value".to_string(), "Bearer same".to_string())]
         );
+    }
+
+    #[test]
+    fn stream_repeat_expands_literal_frames_at_compile_time() {
+        let mut options = grpc_options();
+        options.messages = vec![serde_json::json!({"message": "one"})];
+        options.stream_repeat = Some(3);
+        let compiled =
+            CompiledGrpc::compile(&options, Path::new(".")).expect("compile repeated stream");
+        let mut never_render = |_: &Template| -> Result<String, ()> {
+            panic!("literal request must not render templates")
+        };
+        let first = render_grpc(&compiled, &mut never_render).expect("first");
+        let second = render_grpc(&compiled, &mut never_render).expect("second");
+        assert_eq!(first.messages.len(), 3);
+        assert!(first.message_literal);
+        // Stable identity keeps the handler's encode cache correct.
+        assert!(Arc::ptr_eq(&first.messages, &second.messages));
     }
 
     #[test]

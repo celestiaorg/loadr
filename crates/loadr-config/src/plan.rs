@@ -1243,6 +1243,11 @@ pub struct GrpcOptions {
     /// Messages for client/bidi streaming calls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<serde_json::Value>,
+    /// Send `messages` N times in one call, one frame per copy. Plugin-backed
+    /// `${data...}` leaves are re-fetched per frame, so each copy carries a
+    /// fresh row (e.g. a distinct signed transaction). Must be >= 1 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_repeat: Option<usize>,
     /// gRPC metadata (in addition to request `headers`).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub metadata: IndexMap<String, String>,
@@ -2000,10 +2005,11 @@ pub enum DataSource {
         pick: PickStrategy,
     },
     /// Rows generated on demand by a `data_source`-capable plugin listed
-    /// under `plugins:`. Rows are per-request: each request preparation
-    /// pulls a fresh row; a plugin that reports exhaustion retires the VU
-    /// (like `on_eof: stop`). No `mode`/`on_eof`/`pick` — those describe
-    /// stored-row iteration, which doesn't apply here.
+    /// under `plugins:`. Rows are per-request, and per frame within a
+    /// streaming request: each pulls a fresh row. A plugin that reports
+    /// exhaustion retires the VU (like `on_eof: stop`). No
+    /// `mode`/`on_eof`/`pick` — those describe stored-row iteration, which
+    /// doesn't apply here.
     Plugin {
         /// Plugin name (a `plugins:` entry) that generates the rows.
         source: String,
