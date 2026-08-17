@@ -196,3 +196,61 @@ thresholds:
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The `blocking: true` bracket is a runtime behavior, so drive it through the
+/// real binary against a real server rather than asserting it compiles. The
+/// upstream version of this test used the `noop` protocol, which this build
+/// does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_feeder_completes_a_grpc_run() {
+    let server = loadr_testserver::GrpcEchoServer::spawn()
+        .await
+        .expect("server");
+    let feeder = build_reference_feeder();
+    let feeder_json = serde_json::to_string(feeder.to_str().expect("utf8 path")).expect("json");
+    let dir = tempfile::tempdir().expect("tmp");
+    let plan = write_plan(
+        dir.path(),
+        &format!(
+            r#"
+plugins:
+  - name: tx-signer
+    path: {feeder_json}
+    config: {{ seed: 1 }}
+data:
+  signed:
+    type: plugin
+    source: tx-signer
+    blocking: true
+    config: {{ chain_id: testnet }}
+scenarios:
+  submit:
+    executor: shared-iterations
+    vus: 2
+    iterations: 8
+    flow:
+      - request:
+          url: grpc://{addr}
+          grpc:
+            reflection: true
+            service: loadr.test.Echo
+            method: UnaryEcho
+            message: {{ message: "${{data.signed.nonce}}", payload: "${{data.signed.tx_b64}}" }}
+          checks: [{{ type: status, equals: 0 }}]
+thresholds:
+  grpc_reqs: ["count==8"]
+"#,
+            addr = server.addr
+        ),
+    );
+    let output = Command::new(BIN)
+        .args(["run", "--quiet", plan.to_str().expect("plan path")])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

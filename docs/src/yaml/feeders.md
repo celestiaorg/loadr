@@ -27,6 +27,15 @@ Each call receives run, agent instance, partition, VU, iteration, per-source
 sequence, scenario, request, and timestamp identity. `next_row` may be called
 concurrently and should avoid global locks on its hot path.
 
+`blocking: true` on the data source fetches its rows under
+`tokio::task::block_in_place`, so a CPU-heavy (signing, hashing) or I/O-backed
+(database, vault) feeder cannot stall the runtime's worker threads — without
+it, enough concurrently-preparing VUs on a slow feeder delay timers and
+unrelated VUs, degrading the load shape itself. It is off by default: the
+bracket has a fixed per-call cost a microsecond feeder should not pay, and it
+applies only inside a multi-thread runtime (the bracket panics on a
+current-thread one, so that case falls back to the plain inline call).
+
 A row is fetched once per request, and once per frame of a streaming request —
 so a `messages` list of length L with `stream_repeat: N` pulls `N × L` rows and
 every frame carries a distinct payload. Derive uniqueness from `seq`: `ts_ms`
