@@ -427,6 +427,12 @@ pub struct BuiltinMetrics {
     pub data_received: Arc<str>,
     pub grpc_reqs: Arc<str>,
     pub grpc_req_duration: Arc<str>,
+    pub graphql_reqs: Arc<str>,
+    pub graphql_req_duration: Arc<str>,
+    pub ws_connecting: Arc<str>,
+    pub ws_session_duration: Arc<str>,
+    pub ws_msgs_sent: Arc<str>,
+    pub ws_msgs_received: Arc<str>,
 }
 
 impl BuiltinMetrics {
@@ -459,6 +465,12 @@ impl BuiltinMetrics {
             data_received: name("data_received"),
             grpc_reqs: name("grpc_reqs"),
             grpc_req_duration: name("grpc_req_duration"),
+            graphql_reqs: name("graphql_reqs"),
+            graphql_req_duration: name("graphql_req_duration"),
+            ws_connecting: name("ws_connecting"),
+            ws_session_duration: name("ws_session_duration"),
+            ws_msgs_sent: name("ws_msgs_sent"),
+            ws_msgs_received: name("ws_msgs_received"),
         }
     }
 }

@@ -1691,81 +1691,80 @@ impl RequestMetricEmitter {
         let b = &self.builtins;
         let m = &self.metrics;
         let t = &response.timings;
+        let sent = response.bytes_sent as f64;
+        let received = response.bytes_received as f64;
+        let failed = if response.failed() { 1.0 } else { 0.0 };
 
-        if request.protocol == "grpc" {
-            m.emit_cached_values(
-                &[
-                    (
-                        &b.data_sent,
-                        MetricKind::Counter,
-                        response.bytes_sent as f64,
-                    ),
-                    (
-                        &b.data_received,
-                        MetricKind::Counter,
-                        response.bytes_received as f64,
-                    ),
-                    (&b.grpc_reqs, MetricKind::Counter, 1.0),
-                    (&b.grpc_req_duration, MetricKind::Trend, t.duration_ms),
-                    (
-                        &b.http_req_failed,
-                        MetricKind::Rate,
-                        if response.failed() { 1.0 } else { 0.0 },
-                    ),
-                ],
-                tags,
-            );
-            return;
-        }
-
-        let tags = &tags.tags;
-        m.counter(&b.data_sent, response.bytes_sent as f64, tags);
-        m.counter(&b.data_received, response.bytes_received as f64, tags);
-
+        // Every arm emits through `emit_cached_values` so the tag hash computed
+        // once in `request_tags` is reused. Going through `MetricsBus::counter`
+        // and friends instead drops back to `Aggregator::record`, which
+        // re-hashes the whole tag map per sample — 11 times per HTTP request.
         match request.protocol.as_str() {
             "http" | "graphql" => {
-                m.counter(&b.http_reqs, 1.0, tags);
-                m.trend(&b.http_req_duration, t.duration_ms, tags);
-                m.trend(&b.http_req_blocked, t.blocked_ms, tags);
-                m.trend(&b.http_req_connecting, t.connect_ms, tags);
-                m.trend(&b.http_req_tls_handshaking, t.tls_ms, tags);
-                m.trend(&b.http_req_sending, t.sending_ms, tags);
-                m.trend(&b.http_req_waiting, t.waiting_ms, tags);
-                m.trend(&b.http_req_receiving, t.receiving_ms, tags);
-                m.rate(&b.http_req_failed, response.failed(), tags);
+                m.emit_cached_values(
+                    &[
+                        (&b.data_sent, MetricKind::Counter, sent),
+                        (&b.data_received, MetricKind::Counter, received),
+                        (&b.http_reqs, MetricKind::Counter, 1.0),
+                        (&b.http_req_duration, MetricKind::Trend, t.duration_ms),
+                        (&b.http_req_blocked, MetricKind::Trend, t.blocked_ms),
+                        (&b.http_req_connecting, MetricKind::Trend, t.connect_ms),
+                        (&b.http_req_tls_handshaking, MetricKind::Trend, t.tls_ms),
+                        (&b.http_req_sending, MetricKind::Trend, t.sending_ms),
+                        (&b.http_req_waiting, MetricKind::Trend, t.waiting_ms),
+                        (&b.http_req_receiving, MetricKind::Trend, t.receiving_ms),
+                        (&b.http_req_failed, MetricKind::Rate, failed),
+                    ],
+                    tags,
+                );
                 if request.protocol == "graphql" {
-                    self.emit_named("graphql_reqs", MetricKind::Counter, 1.0, tags);
-                    self.emit_named(
-                        "graphql_req_duration",
-                        MetricKind::Trend,
-                        t.duration_ms,
+                    m.emit_cached_values(
+                        &[
+                            (&b.graphql_reqs, MetricKind::Counter, 1.0),
+                            (&b.graphql_req_duration, MetricKind::Trend, t.duration_ms),
+                        ],
                         tags,
                     );
                 }
             }
-            "ws" => {
-                self.emit_named("ws_connecting", MetricKind::Trend, t.blocked_ms, tags);
-                self.emit_named(
-                    "ws_session_duration",
-                    MetricKind::Trend,
-                    t.duration_ms,
+            "grpc" => {
+                m.emit_cached_values(
+                    &[
+                        (&b.data_sent, MetricKind::Counter, sent),
+                        (&b.data_received, MetricKind::Counter, received),
+                        (&b.grpc_reqs, MetricKind::Counter, 1.0),
+                        (&b.grpc_req_duration, MetricKind::Trend, t.duration_ms),
+                        (&b.http_req_failed, MetricKind::Rate, failed),
+                    ],
                     tags,
                 );
-                let sent = response
+            }
+            "ws" => {
+                let msgs_sent = response
                     .extras
                     .get("msgs_sent")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
-                let received = response
+                let msgs_received = response
                     .extras
                     .get("msgs_received")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
-                self.emit_named("ws_msgs_sent", MetricKind::Counter, sent, tags);
-                self.emit_named("ws_msgs_received", MetricKind::Counter, received, tags);
-                m.rate(&b.http_req_failed, response.error.is_some(), tags);
+                // ws failure is connection error only, not `response.failed()`.
+                let errored = if response.error.is_some() { 1.0 } else { 0.0 };
+                m.emit_cached_values(
+                    &[
+                        (&b.data_sent, MetricKind::Counter, sent),
+                        (&b.data_received, MetricKind::Counter, received),
+                        (&b.ws_connecting, MetricKind::Trend, t.blocked_ms),
+                        (&b.ws_session_duration, MetricKind::Trend, t.duration_ms),
+                        (&b.ws_msgs_sent, MetricKind::Counter, msgs_sent),
+                        (&b.ws_msgs_received, MetricKind::Counter, msgs_received),
+                        (&b.http_req_failed, MetricKind::Rate, errored),
+                    ],
+                    tags,
+                );
             }
-            "grpc" => unreachable!(),
             other => {
                 // tcp/udp built-ins keep their own family name. The
                 // `sse`/`browser` built-ins historically share the generic
@@ -1781,6 +1780,16 @@ impl RequestMetricEmitter {
                     "sse" | "browser" => "plugin".to_string(),
                     name => metric_family(name),
                 };
+                m.emit_cached_values(
+                    &[
+                        (&b.data_sent, MetricKind::Counter, sent),
+                        (&b.data_received, MetricKind::Counter, received),
+                    ],
+                    tags,
+                );
+                // Family names are per-protocol rather than static, so these
+                // still resolve through the registry per request. They do reuse
+                // the cached tag hash.
                 self.emit_named(&format!("{family}_reqs"), MetricKind::Counter, 1.0, tags);
                 self.emit_named(
                     &format!("{family}_req_duration"),
@@ -1802,18 +1811,18 @@ impl RequestMetricEmitter {
                 if let Some(msgs) = response.extras.get("msgs").and_then(|v| v.as_f64()) {
                     self.emit_named(&format!("{family}_msgs"), MetricKind::Counter, msgs, tags);
                 }
-                m.rate(&b.http_req_failed, response.failed(), tags);
+                m.emit_cached(&b.http_req_failed, MetricKind::Rate, failed, tags);
             }
         }
     }
 
-    fn emit_named(&self, name: &str, kind: MetricKind, value: f64, tags: &Arc<Tags>) {
+    fn emit_named(&self, name: &str, kind: MetricKind, value: f64, tags: &CachedTags) {
         let metric = self
             .registry
             .get(name)
             .map(|d| d.name)
             .unwrap_or_else(|| Arc::from(name));
-        self.metrics.emit_value(&metric, kind, value, tags);
+        self.metrics.emit_cached(&metric, kind, value, tags);
     }
 }
 
