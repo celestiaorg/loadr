@@ -145,11 +145,18 @@ pub fn is_additive_gauge(metric: &str) -> bool {
 /// gauge.
 pub const LIVE_GAUGES: &[&str] = &["vus"];
 
+/// Ceiling on interned tag sets. Reaching it stops the table growing; callers
+/// then get an un-interned [`CachedTags`], which is slower to compare but still
+/// correct (see [`MetricRegistry::intern_tags`]).
+const TAG_INTERN_CAP: usize = 4096;
+
 /// Registry of known metrics: built-ins, YAML custom metrics, and metrics
-/// created at runtime from JS.
+/// created at runtime from JS. Also interns tag sets, so every VU emitting the
+/// same logical tags shares one `Arc` (see [`MetricRegistry::intern_tags`]).
 #[derive(Debug, Default)]
 pub struct MetricRegistry {
     defs: RwLock<HashMap<Arc<str>, MetricDef>>,
+    tag_sets: RwLock<HashMap<Arc<Tags>, u64>>,
 }
 
 impl MetricRegistry {
@@ -171,6 +178,42 @@ impl MetricRegistry {
             }
         }
         reg
+    }
+
+    /// Canonicalize a tag set: equal tags always come back as the same `Arc`.
+    ///
+    /// `VuContext::sample_tags` allocates a fresh `Arc<Tags>` per VU, so the
+    /// aggregator used to hold one of ~`vus / shards` rival allocations per
+    /// series and every compare walked the whole `BTreeMap`. Sharing one `Arc`
+    /// makes the pointer-equality shortcut in `Arc`'s own `PartialEq` fire
+    /// instead, reducing `SeriesKey::eq` to two pointer compares.
+    ///
+    /// Past [`TAG_INTERN_CAP`] distinct sets this stops interning and returns a
+    /// private `CachedTags`. That only costs a full compare in the aggregator —
+    /// `Arc`'s `PartialEq` falls back to comparing contents — so unbounded tag
+    /// cardinality (arbitrary tags from JS `metric_add`, say) degrades speed
+    /// rather than correctness or memory.
+    pub(crate) fn intern_tags(&self, tags: Arc<Tags>) -> CachedTags {
+        if let Some((canonical, hash)) = self.tag_sets.read().get_key_value(&tags) {
+            return CachedTags {
+                tags: canonical.clone(),
+                hash: *hash,
+            };
+        }
+        let cached = CachedTags::new(tags);
+        let mut sets = self.tag_sets.write();
+        // Another thread may have interned this set while we were unlocked; its
+        // `Arc` is the canonical one.
+        if let Some((canonical, hash)) = sets.get_key_value(&cached.tags) {
+            return CachedTags {
+                tags: canonical.clone(),
+                hash: *hash,
+            };
+        }
+        if sets.len() < TAG_INTERN_CAP {
+            sets.insert(cached.tags.clone(), cached.hash);
+        }
+        cached
     }
 
     /// Register a metric; returns an error when re-registering with a different kind.
@@ -358,11 +401,7 @@ impl MetricsBus {
                     self.emit_value(metric, kind, value, &tags.tags);
                 }
             }
-            Sink::Shard { shards, idx } => {
-                for &(metric, kind, value) in values {
-                    shards.record_cached(*idx, metric, kind, value, tags);
-                }
-            }
+            Sink::Shard { shards, idx } => shards.record_cached_values(*idx, values, tags),
         }
     }
 
@@ -419,6 +458,12 @@ pub struct BuiltinMetrics {
     pub data_received: Arc<str>,
     pub grpc_reqs: Arc<str>,
     pub grpc_req_duration: Arc<str>,
+    pub graphql_reqs: Arc<str>,
+    pub graphql_req_duration: Arc<str>,
+    pub ws_connecting: Arc<str>,
+    pub ws_session_duration: Arc<str>,
+    pub ws_msgs_sent: Arc<str>,
+    pub ws_msgs_received: Arc<str>,
 }
 
 impl BuiltinMetrics {
@@ -451,6 +496,12 @@ impl BuiltinMetrics {
             data_received: name("data_received"),
             grpc_reqs: name("grpc_reqs"),
             grpc_req_duration: name("grpc_req_duration"),
+            graphql_reqs: name("graphql_reqs"),
+            graphql_req_duration: name("graphql_req_duration"),
+            ws_connecting: name("ws_connecting"),
+            ws_session_duration: name("ws_session_duration"),
+            ws_msgs_sent: name("ws_msgs_sent"),
+            ws_msgs_received: name("ws_msgs_received"),
         }
     }
 }
@@ -458,6 +509,30 @@ impl BuiltinMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_interning_degrades_past_the_cap_without_breaking() {
+        let reg = MetricRegistry::default();
+        for i in 0..(TAG_INTERN_CAP + 16) {
+            reg.intern_tags(Arc::new(Tags::from([("i".to_string(), i.to_string())])));
+        }
+        assert_eq!(reg.tag_sets.read().len(), TAG_INTERN_CAP);
+
+        // A set that got in before the cap still canonicalizes.
+        let early = Tags::from([("i".to_string(), "0".to_string())]);
+        let a = reg.intern_tags(Arc::new(early.clone()));
+        let b = reg.intern_tags(Arc::new(early));
+        assert!(Arc::ptr_eq(&a.tags, &b.tags));
+
+        // One that missed it is not shared, but is still correct: same contents,
+        // same hash, so the aggregator folds them onto one series anyway.
+        let late = Tags::from([("late".to_string(), "1".to_string())]);
+        let c = reg.intern_tags(Arc::new(late.clone()));
+        let d = reg.intern_tags(Arc::new(late));
+        assert!(!Arc::ptr_eq(&c.tags, &d.tags));
+        assert_eq!(c.tags, d.tags);
+        assert_eq!(c.hash, d.hash);
+    }
 
     #[test]
     fn registry_has_builtins() {

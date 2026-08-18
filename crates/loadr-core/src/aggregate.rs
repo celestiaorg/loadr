@@ -1034,6 +1034,21 @@ impl MetricShards {
             .record_cached(metric, kind, value, tags);
     }
 
+    /// Record a whole batch under one lock acquisition. ~31 VUs share a shard at
+    /// 500 VUs, so locking per metric multiplied the chance of colliding with
+    /// them by the number of metrics in the batch.
+    pub(crate) fn record_cached_values(
+        &self,
+        idx: usize,
+        values: &[(&Arc<str>, MetricKind, f64)],
+        tags: &CachedTags,
+    ) {
+        let mut shard = self.shards[idx % self.shards.len()].lock();
+        for &(metric, kind, value) in values {
+            shard.record_cached(metric, kind, value, tags);
+        }
+    }
+
     /// Drain every shard's delta into `target` — one `take_delta` +
     /// `merge_delta` per shard.
     pub fn drain_into(&self, target: &mut Aggregator) {
@@ -1185,6 +1200,47 @@ mod tests {
         agg.record_cached(&metric, MetricKind::Counter, 1.0, &left);
         agg.record_cached(&metric, MetricKind::Counter, 1.0, &right);
         assert_eq!(agg.snapshot().series.len(), 2);
+    }
+
+    #[test]
+    fn uninterned_equal_tags_still_fold_into_one_series() {
+        // Past the interner cap, callers hand over distinct `Arc`s for equal
+        // tags. `Arc`'s `PartialEq` falls back to comparing contents, so these
+        // must still land on a single series.
+        let metric: Arc<str> = Arc::from("http_reqs");
+        let tags = Tags::from([("status".to_string(), "200".to_string())]);
+        let left = CachedTags::new(Arc::new(tags.clone()));
+        let right = CachedTags::new(Arc::new(tags));
+        assert!(!Arc::ptr_eq(&left.tags, &right.tags));
+
+        let mut agg = Aggregator::new();
+        agg.record_cached(&metric, MetricKind::Counter, 1.0, &left);
+        agg.record_cached(&metric, MetricKind::Counter, 1.0, &right);
+        let snap = agg.snapshot();
+        assert_eq!(snap.series.len(), 1);
+        assert_eq!(snap.find("http_reqs").unwrap().agg.sum, 2.0);
+    }
+
+    #[test]
+    fn batched_shard_record_keeps_totals_exact() {
+        let shards = MetricShards::new(1);
+        let counter: Arc<str> = Arc::from("grpc_reqs");
+        let trend: Arc<str> = Arc::from("grpc_req_duration");
+        let tags = CachedTags::new(Arc::new(Tags::new()));
+        shards.record_cached_values(
+            0,
+            &[
+                (&counter, MetricKind::Counter, 2.0),
+                (&trend, MetricKind::Trend, 5.0),
+                (&counter, MetricKind::Counter, 3.0),
+            ],
+            &tags,
+        );
+        let mut target = Aggregator::new();
+        shards.drain_into(&mut target);
+        let snap = target.snapshot();
+        assert_eq!(snap.find("grpc_reqs").unwrap().agg.sum, 5.0);
+        assert_eq!(snap.find("grpc_req_duration").unwrap().agg.count, 1);
     }
 
     #[test]
