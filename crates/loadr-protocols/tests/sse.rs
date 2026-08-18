@@ -17,7 +17,8 @@ use loadr_protocols::SseHandler;
 use loadr_testserver::SseTestServer;
 
 fn vu() -> VuContext {
-    let data = DataFeeds::load(&Default::default(), Path::new(".")).expect("data feeds");
+    let data = DataFeeds::load(&Default::default(), Path::new("."), Default::default())
+        .expect("data feeds");
     let run = Arc::new(RunContext {
         variables: serde_json::Map::new(),
         secrets: Default::default(),

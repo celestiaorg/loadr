@@ -61,7 +61,7 @@ $ loadr run test.yaml
 |---|---|---|---|
 | Test format | JavaScript | XML (GUI) | **YAML + JS, JSON-Schema-validated** |
 | Open & closed load models | ✅ | partial | ✅ all 7 k6 executors |
-| Protocols built in | HTTP, WS, gRPC | many | **HTTP/1.1+2, WS, SSE, gRPC (+reflection), GraphQL, TCP, UDP** — plus Redis, SQL (PostgreSQL/MySQL) and MongoDB as installable native plugins |
+| Protocols built in | HTTP, WS, gRPC | many | **HTTP/1.1+2, WS, SSE, gRPC (+reflection), GraphQL, TCP, UDP, no-op self-test** — plus Redis, SQL (PostgreSQL/MySQL) and MongoDB as installable native plugins |
 | JMeter-style assertions/extractors/timers | ❌ | ✅ | ✅ JSONPath, XPath, CSS, regex, boundary; constant/uniform/gaussian/throughput timers |
 | Plugins | Go/xk6 rebuild | jars | **WASM (sandboxed) + native, no rebuild** |
 | Distributed | paid cloud | manual | **built-in controller/agents, correct HDR percentile merging** |
@@ -168,7 +168,7 @@ decisions: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 crates/loadr-core        engine: executors, VUs, metrics (HDR), thresholds
 crates/loadr-config      YAML schema, validation, ${...} interpolation
 crates/loadr-js          embedded QuickJS runtime + loadr scripting stdlib
-crates/loadr-protocols   HTTP/1.1+2, WebSocket, SSE, gRPC, GraphQL, TCP, UDP
+crates/loadr-protocols   HTTP/1.1+2, WebSocket, SSE, gRPC, GraphQL, TCP, UDP, no-op
 crates/loadr-outputs     JSONL, CSV, Prometheus, InfluxDB, OTLP, StatsD
 crates/loadr-plugin-api  WASM (WIT) + native (abi_stable) plugin SDK
 crates/loadr-agent       distributed controller/agent coordination (gRPC)

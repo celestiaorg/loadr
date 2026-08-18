@@ -175,6 +175,7 @@ impl CacheEntry {
             error: None,
             url: url.to_string(),
             extras: serde_json::json!({ "cache": cache_state }),
+            grpc_protobuf_outcomes: Vec::new(),
         }
     }
 }
@@ -660,6 +661,7 @@ impl HttpHandler {
             error: read_error,
             url: url.to_string(),
             extras: serde_json::Value::Null,
+            grpc_protobuf_outcomes: Vec::new(),
         })
     }
 

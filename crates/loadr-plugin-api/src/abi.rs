@@ -68,10 +68,27 @@ pub trait FfiService: Send {
     fn stop(&mut self);
 }
 
+/// An on-demand data source (`data.<name>.type: plugin`). `next_row` is on
+/// the request hot path and is called concurrently from VU threads.
+#[sabi_trait]
+pub trait FfiDataSource: Send + Sync {
+    fn name(&self) -> RString;
+
+    /// Called once before VUs start. `init_json`:
+    /// `{"plugin_config": <merged [config] + PluginRef.config>,
+    ///   "sources": {"<data name>": <data.<name>.config>, ...}}`
+    fn init(&mut self, init_json: RString) -> RResult<(), RString>;
+
+    /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
+    /// Returns `{"row": {"col": <scalar>, ...}}` or `{"exhausted": true}`.
+    fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
+}
+
 /// Boxed trait objects as they cross the FFI boundary.
 pub type FfiOutputBox = FfiOutput_TO<'static, RBox<()>>;
 pub type FfiProtocolBox = FfiProtocol_TO<'static, RBox<()>>;
 pub type FfiServiceBox = FfiService_TO<'static, RBox<()>>;
+pub type FfiDataSourceBox = FfiDataSource_TO<'static, RBox<()>>;
 
 /// The root module every native loadr plugin exports.
 ///
@@ -90,6 +107,10 @@ pub struct PluginMod {
     pub make_protocol: ROption<extern "C" fn() -> FfiProtocolBox>,
     #[sabi(last_prefix_field)]
     pub make_service: ROption<extern "C" fn() -> FfiServiceBox>,
+    /// Suffix field: plugins compiled before it existed still load; the
+    /// accessor then returns `RNone`. Not an ABI break — version stays 1.
+    #[sabi(missing_field(default))]
+    pub make_data_source: ROption<extern "C" fn() -> FfiDataSourceBox>,
 }
 
 impl RootModule for PluginModRef {
@@ -115,6 +136,7 @@ impl RootModule for PluginModRef {
 ///         make_output: RSome(make_output),
 ///         make_protocol: RNone,
 ///         make_service: RNone,
+///         make_data_source: RNone,
 ///     }
 /// }
 /// ```

@@ -62,7 +62,7 @@ impl ProtocolHandler for FlakyHttp {
                 .emit_value(&metric, MetricKind::Counter, 1.0, &tags);
         }
 
-        // ~1 in 9 requests is a transport timeout (no HTTP status).
+        // ~1 in 9 requests is a transport timeout (no response status).
         if n % 9 == 4 {
             return Ok(ProtocolResponse {
                 protocol_version: "HTTP/1.1".to_string(),

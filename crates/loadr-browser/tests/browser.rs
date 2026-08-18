@@ -33,7 +33,7 @@ fn run_ctx() -> Arc<RunContext> {
             pick: PickStrategy::Sequential,
         },
     );
-    let data = DataFeeds::load(&sources, Path::new(".")).expect("load data feeds");
+    let data = DataFeeds::load(&sources, Path::new("."), HashMap::new()).expect("load data feeds");
     Arc::new(RunContext {
         variables: serde_json::Map::new(),
         secrets: HashMap::new(),

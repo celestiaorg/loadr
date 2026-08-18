@@ -13,7 +13,7 @@ loadr.io/
 │   ├── loadr-core/        # Engine: scheduling, executors, VUs, metrics, thresholds, checks, lifecycle
 │   ├── loadr-config/      # YAML schema (serde + schemars), validation, ${...} interpolation, env overrides
 │   ├── loadr-js/          # Embedded JavaScript runtime (rquickjs) + k6-flavoured stdlib
-│   ├── loadr-protocols/   # HTTP/1.1+2, WebSocket, gRPC, GraphQL, TCP, UDP clients with phase metrics
+│   ├── loadr-protocols/   # HTTP/1.1+2, WebSocket, gRPC, GraphQL, TCP, UDP, no-op self-test
 │   ├── loadr-plugin-api/  # Stable plugin ABI (abi_stable) + WASM WIT world + SDK helpers
 │   ├── loadr-agent/       # Controller + agent: gRPC coordination, load partitioning, HDR merge
 │   └── loadr-cli/         # The `loadr` binary: run, validate, convert, agent, controller, plugin, report
@@ -69,10 +69,14 @@ ships as a first-party service plugin but is also statically linked into the def
 
 Controller and agents speak `loadr.coordination.v1` (proto in `crates/loadr-agent/proto/`),
 compiled at build time with **protox** (pure-Rust protoc — no system protoc dependency).
-Bidirectional streaming RPC `AgentSession` carries: register → assignment (test definition +
-data-file blobs + load partition) → synchronized start barrier → metric deltas (1 s cadence) →
-control (pause/stop/scale) → drain/teardown. Heartbeats piggyback on the stream with a
-server-side liveness window; agents reconnect with exponential backoff and resume by run-id.
+Bidirectional streaming RPC `Session` carries: register → assignment (test definition +
+data-file blobs + load partition) → assignment-readiness handshake → synchronized start
+barrier (broadcast only once every assigned agent is ready) → metric deltas (1 s cadence) →
+control (pause/stop/scale) → drain/teardown. Assignment setup runs off the agent's session
+loop so heartbeats flow during slow preparation; agents are reserved at submission so
+concurrent runs cannot share them, and preparation is bounded by a per-submission timeout.
+Heartbeats piggyback on the stream with a server-side liveness window; agents reconnect with
+exponential backoff and resume by run-id (with per-phase assignment/start replay).
 Protocol is versioned via a `protocol_version` field checked at registration.
 
 **Metric correctness:** agents serialize HDR histograms (V2 deflate encoding) and the controller
@@ -185,7 +189,9 @@ YAML ──parse/validate──▶ TestPlan ──compile──▶ ScenarioProgr
        JsWorker (rquickjs)
 ```
 
-The `MetricsBus` is an mpsc fan-in; the `Aggregator` snapshots every second for live consumers
+The `MetricsBus` is an mpsc fan-in when a configured output consumes raw samples; when none
+does, VUs record straight into shard-local aggregators instead, drained into the primary
+aggregator once per snapshot tick. The `Aggregator` snapshots every second for live consumers
 (web UI SSE, controller stream, console progress) and finalizes into the end-of-run summary
 (console table + `--summary-export` JSON).
 
@@ -194,8 +200,10 @@ The `MetricsBus` is an mpsc fan-in; the `Aggregator` snapshots every second for 
 `loadr controller` runs the coordination gRPC server, the REST/UI control plane (web UI plugin),
 and the central aggregator. `loadr agent --join host:port` registers and waits. A test submitted
 to the controller (CLI or UI) is partitioned, shipped (definition + data files inline in the
-assignment message), started via a barrier timestamp, and aggregated live. Agent loss triggers
-configurable policy: `continue` (default, remaining agents keep their share) or `abort`.
+assignment message), prepared off the agents' session loops, and started via a barrier
+timestamp computed once every agent acknowledges readiness, then aggregated live. Agent loss
+triggers configurable policy: `continue` (default, remaining agents keep their share) or
+`abort`; loss before start is a preparation failure.
 
 ## Security posture
 

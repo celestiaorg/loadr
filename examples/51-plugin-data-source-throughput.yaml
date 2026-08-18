@@ -1,0 +1,36 @@
+# Maximum-throughput self-test for an on-demand native data-source plugin.
+# There is no network target: the built-in noop protocol accepts each rendered
+# request and immediately reports success. Build and install the example plugin:
+#   cargo build -p loadr-plugin-example-native-data-source --release
+#   # stage plugin.toml + the platform library, then: loadr plugin install <dir>
+name: plugin-data-source-throughput
+description: native tx-signer feeder throughput without a network target
+
+plugins:
+  - name: tx-signer
+    config:
+      seed: 42
+
+data:
+  signed_tx:
+    type: plugin
+    source: tx-signer
+    config:
+      chain_id: throughput-test
+
+scenarios:
+  generate:
+    executor: constant-vus
+    vus: 100
+    duration: 30s
+    flow:
+      - request:
+          name: generate signed payload
+          protocol: noop
+          url: noop://local
+          method: POST
+          body: "${data.signed_tx.tx_b64}"
+
+thresholds:
+  noop_reqs: [ "count>0" ]
+  http_req_failed: [ "rate==0" ]

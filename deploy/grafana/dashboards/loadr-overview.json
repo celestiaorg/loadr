@@ -7,6 +7,22 @@
   "version": 1,
   "refresh": "5s",
   "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "loadr_run_id",
+        "label": "Run",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
+        "query": { "query": "query_result(sort_desc(loadr_fleet_run_started_timestamp_seconds))", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "regex": "/loadr_run_id=\"([^\"]+)\"/",
+        "refresh": 1,
+        "sort": 0,
+        "multi": false,
+        "includeAll": false
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,
@@ -14,7 +30,7 @@
       "title": "Requests / s",
       "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(rate(loadr_http_reqs_total[30s]))", "refId": "A" }],
+      "targets": [{ "expr": "rate(loadr_fleet_http_reqs_total{loadr_run_id=~\"$loadr_run_id\"}[30s])", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" } }, "overrides": [] }
     },
     {
@@ -23,7 +39,7 @@
       "title": "Active VUs",
       "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(loadr_vus)", "refId": "A" }],
+      "targets": [{ "expr": "loadr_fleet_vus{loadr_run_id=~\"$loadr_run_id\"}", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] }
     },
     {
@@ -32,7 +48,7 @@
       "title": "Error rate",
       "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(loadr_http_req_failed_rate)", "refId": "A" }],
+      "targets": [{ "expr": "loadr_fleet_http_req_failed_rate{loadr_run_id=~\"$loadr_run_id\"}", "refId": "A" }],
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -47,7 +63,7 @@
       "title": "p95 latency",
       "gridPos": { "h": 5, "w": 4, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "max(loadr_http_req_duration_milliseconds{quantile=\"0.95\"})", "refId": "A" }],
+      "targets": [{ "expr": "loadr_fleet_http_req_duration_milliseconds{loadr_run_id=~\"$loadr_run_id\",quantile=\"0.95\"}", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
     },
     {
@@ -56,7 +72,7 @@
       "title": "Data received / s",
       "gridPos": { "h": 5, "w": 4, "x": 16, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(rate(loadr_data_received_total[30s]))", "refId": "A" }],
+      "targets": [{ "expr": "rate(loadr_fleet_data_received_total{loadr_run_id=~\"$loadr_run_id\"}[30s])", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] }
     },
     {
@@ -65,7 +81,7 @@
       "title": "Iterations / s",
       "gridPos": { "h": 5, "w": 4, "x": 20, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(rate(loadr_iterations_total[30s]))", "refId": "A" }],
+      "targets": [{ "expr": "rate(loadr_fleet_iterations_total{loadr_run_id=~\"$loadr_run_id\"}[30s])", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
     },
     {
@@ -74,7 +90,7 @@
       "title": "Request rate by scenario",
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum by (scenario) (rate(loadr_http_reqs_total[30s]))", "legendFormat": "{{scenario}}", "refId": "A" }],
+      "targets": [{ "expr": "sum by (scenario) (rate(loadr_http_reqs_total{loadr_run_id=~\"$loadr_run_id\"}[30s]))", "legendFormat": "{{scenario}}", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 15 } }, "overrides": [] }
     },
     {
@@ -84,10 +100,10 @@
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
       "targets": [
-        { "expr": "max(loadr_http_req_duration_milliseconds{quantile=\"0.5\"})", "legendFormat": "p50", "refId": "A" },
-        { "expr": "max(loadr_http_req_duration_milliseconds{quantile=\"0.9\"})", "legendFormat": "p90", "refId": "B" },
-        { "expr": "max(loadr_http_req_duration_milliseconds{quantile=\"0.95\"})", "legendFormat": "p95", "refId": "C" },
-        { "expr": "max(loadr_http_req_duration_milliseconds{quantile=\"0.99\"})", "legendFormat": "p99", "refId": "D" }
+        { "expr": "loadr_fleet_http_req_duration_milliseconds{loadr_run_id=~\"$loadr_run_id\",quantile=\"0.5\"}", "legendFormat": "p50", "refId": "A" },
+        { "expr": "loadr_fleet_http_req_duration_milliseconds{loadr_run_id=~\"$loadr_run_id\",quantile=\"0.9\"}", "legendFormat": "p90", "refId": "B" },
+        { "expr": "loadr_fleet_http_req_duration_milliseconds{loadr_run_id=~\"$loadr_run_id\",quantile=\"0.95\"}", "legendFormat": "p95", "refId": "C" },
+        { "expr": "loadr_fleet_http_req_duration_milliseconds{loadr_run_id=~\"$loadr_run_id\",quantile=\"0.99\"}", "legendFormat": "p99", "refId": "D" }
       ],
       "fieldConfig": { "defaults": { "unit": "ms", "custom": { "fillOpacity": 5 } }, "overrides": [] }
     },
@@ -97,7 +113,7 @@
       "title": "Active VUs",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(loadr_vus)", "legendFormat": "vus", "refId": "A" }],
+      "targets": [{ "expr": "loadr_fleet_vus{loadr_run_id=~\"$loadr_run_id\"}", "legendFormat": "vus", "refId": "A" }],
       "fieldConfig": { "defaults": { "custom": { "fillOpacity": 25 } }, "overrides": [] }
     },
     {
@@ -107,9 +123,8 @@
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
       "targets": [
-        { "expr": "sum(rate(loadr_http_req_failed_count_total[30s])) - sum(rate(loadr_http_req_failed_passes_total[30s]))", "legendFormat": "ok/s", "refId": "A", "hide": true },
-        { "expr": "sum(rate(loadr_http_req_failed_passes_total[30s]))", "legendFormat": "failed/s", "refId": "B" },
-        { "expr": "sum(rate(loadr_dropped_iterations_total[30s]))", "legendFormat": "dropped iters/s", "refId": "C" }
+        { "expr": "rate(loadr_fleet_http_req_failed_passes_total{loadr_run_id=~\"$loadr_run_id\"}[30s])", "legendFormat": "failed/s", "refId": "A" },
+        { "expr": "rate(loadr_fleet_dropped_iterations_total{loadr_run_id=~\"$loadr_run_id\"}[30s])", "legendFormat": "dropped iters/s", "refId": "B" }
       ],
       "fieldConfig": { "defaults": { "custom": { "fillOpacity": 20 } }, "overrides": [] }
     },
@@ -119,8 +134,17 @@
       "title": "Checks pass rate",
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
-      "targets": [{ "expr": "sum(loadr_checks_rate)", "legendFormat": "pass rate", "refId": "A" }],
+      "targets": [{ "expr": "loadr_fleet_checks_rate{loadr_run_id=~\"$loadr_run_id\"}", "legendFormat": "pass rate", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "custom": { "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Request rate by agent",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "loadr-prometheus" },
+      "targets": [{ "expr": "sum by (loadr_agent) (rate(loadr_http_reqs_total{loadr_run_id=~\"$loadr_run_id\"}[30s]))", "legendFormat": "{{loadr_agent}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } }, "overrides": [] }
     }
   ]
 }

@@ -31,3 +31,4 @@ prost = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+indexmap = { workspace = true }

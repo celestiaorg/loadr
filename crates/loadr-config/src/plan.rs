@@ -1243,9 +1243,40 @@ pub struct GrpcOptions {
     /// Messages for client/bidi streaming calls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<serde_json::Value>,
+    /// Send `messages` N times in one call, one frame per copy. Plugin-backed
+    /// `${data...}` leaves are re-fetched per frame, so each copy carries a
+    /// fresh row (e.g. a distinct signed transaction). Must be >= 1 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_repeat: Option<usize>,
     /// gRPC metadata (in addition to request `headers`).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub metadata: IndexMap<String, String>,
+    /// Share a fixed pool of N HTTP/2 channels across all VUs for this endpoint,
+    /// round-robined (vs. the default: one connection per VU). Recommended for
+    /// high-concurrency runs against a single endpoint. Must be >= 1 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_pool_size: Option<usize>,
+    /// Client transport: `channel` (default) or `raw`. The `LOADR_GRPC_TRANSPORT`
+    /// env var overrides this for whole-fleet A/B runs.
+    #[serde(default, skip_serializing_if = "GrpcTransport::is_default")]
+    pub transport: GrpcTransport,
+}
+
+/// Client transport driving gRPC calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcTransport {
+    /// tonic `Channel`: a tower::buffer queue plus a worker task per channel.
+    #[default]
+    Channel,
+    /// Direct hyper HTTP/2 driven from the VU task (experimental perf path).
+    Raw,
+}
+
+impl GrpcTransport {
+    fn is_default(&self) -> bool {
+        *self == GrpcTransport::Channel
+    }
 }
 
 /// GraphQL request options.
@@ -1645,6 +1676,30 @@ pub enum Condition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_failure: Option<FailureAction>,
     },
+    /// Descriptor-aware assertion over a top-level protobuf response field.
+    /// Unlike JSONPath, this observes proto3 implicit defaults and explicit
+    /// presence without converting the response message to JSON.
+    ProtobufField {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Exact field name from the response message's `.proto` definition.
+        field: String,
+        /// Expected scalar value. Type compatibility is checked against the
+        /// response descriptor when the gRPC call is resolved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        equals: Option<serde_json::Value>,
+        /// Require/forbid protobuf presence (default: require). Implicit
+        /// proto3 scalars are always semantically present with their default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exists: Option<bool>,
+        /// Optional bounded semantic-failure grouping. Only listed numeric
+        /// values receive their own group; all other values collapse to
+        /// `other` rather than creating an unbounded metric series.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_groups: Option<BTreeMap<i64, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_failure: Option<FailureAction>,
+    },
     /// Body contains a substring.
     BodyContains {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1746,6 +1801,7 @@ impl Condition {
             | Condition::BodyContains { name, .. }
             | Condition::BodyMatches { name, .. }
             | Condition::Jsonpath { name, .. }
+            | Condition::ProtobufField { name, .. }
             | Condition::Xpath { name, .. }
             | Condition::Duration { name, .. }
             | Condition::Size { name, .. }
@@ -1781,6 +1837,7 @@ impl Condition {
             }
             Condition::BodyMatches { pattern, .. } => format!("body matches /{pattern}/"),
             Condition::Jsonpath { expression, .. } => format!("jsonpath {expression}"),
+            Condition::ProtobufField { field, .. } => format!("protobuf field {field}"),
             Condition::Xpath { expression, .. } => format!("xpath {expression}"),
             Condition::Duration { max, .. } => format!("duration < {max}"),
             Condition::Size { .. } => "body size".to_string(),
@@ -1795,6 +1852,7 @@ impl Condition {
             | Condition::BodyContains { on_failure, .. }
             | Condition::BodyMatches { on_failure, .. }
             | Condition::Jsonpath { on_failure, .. }
+            | Condition::ProtobufField { on_failure, .. }
             | Condition::Xpath { on_failure, .. }
             | Condition::Duration { on_failure, .. }
             | Condition::Size { on_failure, .. }
@@ -1946,6 +2004,25 @@ pub enum DataSource {
         #[serde(default)]
         pick: PickStrategy,
     },
+    /// Rows generated on demand by a `data_source`-capable plugin listed
+    /// under `plugins:`. Rows are per-request, and per frame within a
+    /// streaming request: each pulls a fresh row. A plugin that reports
+    /// exhaustion retires the VU (like `on_eof: stop`). No
+    /// `mode`/`on_eof`/`pick` — those describe stored-row iteration, which
+    /// doesn't apply here.
+    Plugin {
+        /// Plugin name (a `plugins:` entry) that generates the rows.
+        source: String,
+        /// Source-level config passed to the plugin at init.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        config: serde_json::Value,
+        /// Fetch this source's rows under `tokio::task::block_in_place`, so a
+        /// CPU-heavy (signing, hashing) or I/O-backed feeder cannot stall the
+        /// runtime's worker threads. Off by default: the bracket has a fixed
+        /// cost that a cheap in-memory generator should not pay.
+        #[serde(default, skip_serializing_if = "is_false")]
+        blocking: bool,
+    },
 }
 
 /// Where a secret's value comes from.
@@ -2019,6 +2096,11 @@ pub enum OutputConfig {
         /// Push interval (default `5s`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interval: Option<Dur>,
+        /// Keep a standalone scrape endpoint alive for this long after
+        /// completion so Prometheus can collect the terminal snapshot.
+        /// Delays run exit by as much; disabled by default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_scrape_grace: Option<Dur>,
     },
     /// InfluxDB line protocol over HTTP.
     Influxdb {
@@ -2288,6 +2370,37 @@ plugins:
     }
 
     #[test]
+    fn protobuf_field_condition_round_trips() {
+        let yaml = r#"
+type: protobuf_field
+name: admission_accepted
+field: code
+equals: 0
+failure_groups:
+  18: WrongShard
+  20: PoolAtCapacity
+"#;
+        let condition: Condition = serde_yaml::from_str(yaml).expect("parse condition");
+        match &condition {
+            Condition::ProtobufField {
+                name,
+                field,
+                equals,
+                failure_groups,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("admission_accepted"));
+                assert_eq!(field, "code");
+                assert_eq!(equals.as_ref(), Some(&serde_json::json!(0)));
+                assert_eq!(failure_groups.as_ref().unwrap()[&18], "WrongShard");
+            }
+            other => panic!("expected protobuf condition, got {other:?}"),
+        }
+        let encoded = serde_yaml::to_string(&condition).expect("serialize condition");
+        let _: Condition = serde_yaml::from_str(&encoded).expect("reparse condition");
+    }
+
+    #[test]
     fn rate_normalized_by_time_unit() {
         let s = Scenario {
             executor: ExecutorKind::ConstantArrivalRate,
@@ -2379,5 +2492,68 @@ flow:
         let c: Condition =
             serde_yaml::from_str("{ type: duration, max: 500ms, name: fast }").unwrap();
         assert_eq!(c.display_name(), "fast");
+    }
+
+    #[test]
+    fn plugin_data_source_round_trips() {
+        let ds: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer, config: { chain_id: t-1 } }")
+                .expect("parse");
+        match &ds {
+            DataSource::Plugin {
+                source,
+                config,
+                blocking,
+            } => {
+                assert_eq!(source, "tx-signer");
+                assert_eq!(config["chain_id"], "t-1");
+                assert!(!blocking, "blocking defaults to off");
+            }
+            other => panic!("expected DataSource::Plugin, got {other:?}"),
+        }
+        let yaml = serde_yaml::to_string(&ds).expect("serialize");
+        let back: DataSource = serde_yaml::from_str(&yaml).expect("reparse");
+        assert!(matches!(back, DataSource::Plugin { .. }));
+    }
+
+    #[test]
+    fn plugin_data_source_blocking_flag_round_trips() {
+        let ds: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer, blocking: true }")
+                .expect("parse");
+        assert!(matches!(ds, DataSource::Plugin { blocking: true, .. }));
+        let yaml = serde_yaml::to_string(&ds).expect("serialize");
+        assert!(yaml.contains("blocking: true"), "explicit opt-in survives");
+        let back: DataSource = serde_yaml::from_str(&yaml).expect("reparse");
+        assert!(matches!(back, DataSource::Plugin { blocking: true, .. }));
+
+        let off: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer, blocking: false }")
+                .expect("parse");
+        assert!(matches!(
+            off,
+            DataSource::Plugin {
+                blocking: false,
+                ..
+            }
+        ));
+        let yaml = serde_yaml::to_string(&off).expect("serialize");
+        assert!(
+            !yaml.contains("blocking"),
+            "the default is not serialized back out"
+        );
+    }
+
+    #[test]
+    fn plugin_data_source_config_defaults_to_null() {
+        let ds: DataSource =
+            serde_yaml::from_str("{ type: plugin, source: tx-signer }").expect("parse");
+        match &ds {
+            DataSource::Plugin { source, config, .. } => {
+                assert_eq!(source, "tx-signer");
+                assert!(config.is_null());
+            }
+            other => panic!("expected DataSource::Plugin, got {other:?}"),
+        }
     }
 }

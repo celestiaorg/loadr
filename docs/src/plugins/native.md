@@ -36,6 +36,15 @@ pub trait FfiService {
     fn start(&mut self, config_json: RString) -> RResult<RString, RString>;
     fn stop(&mut self);
 }
+
+#[sabi_trait]
+pub trait FfiDataSource {
+    fn name(&self) -> RString;
+    fn init(&mut self, init_json: RString) -> RResult<(), RString>;
+    /// row context JSON -> `{"row": {...}}` or `{"exhausted": true}`; called
+    /// concurrently from VU threads, once per request.
+    fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
+}
 ```
 
 A plugin exports one **root module** advertising what it provides:
@@ -65,13 +74,17 @@ cargo build --release
 # package target/release/libmy_plugin.so with a plugin.toml (type = "native")
 ```
 
-The two shipped examples are the best reference:
+The shipped examples are the best reference:
 
 - `plugins/examples/native-output` —
   an output plugin writing snapshot digests to a file;
 - `plugins/examples/native-protocol` —
   an `echo-proto` protocol handler, including how `request.options.plugin`
-  config reaches your `execute`.
+  config reaches your `execute`;
+- `plugins/examples/native-data-source` —
+  `tx-signer`, an on-demand data source generating Ed25519-signed rows; see
+  [Native data-source plugins](developing.md#native-data-source-plugins) for
+  the full contract.
 
 ## Safety notes
 

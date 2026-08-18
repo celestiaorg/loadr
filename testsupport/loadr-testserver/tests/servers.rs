@@ -436,12 +436,38 @@ async fn grpc_unary_echo() {
     let response = within(client.unary_echo(EchoRequest {
         message: "hello grpc".to_string(),
         repeat: 0,
+        ..Default::default()
     }))
     .await
     .expect("unary")
     .into_inner();
     assert_eq!(response.message, "hello grpc");
     assert_eq!(response.index, 0);
+}
+
+#[tokio::test]
+async fn grpc_tls_url_uses_https_and_connects() {
+    let server = GrpcEchoServer::spawn_tls().await.expect("spawn tls");
+    assert!(server.url().starts_with("https://127.0.0.1:"));
+    assert_eq!(server.base_url(), server.url());
+
+    let certificate =
+        tonic::transport::Certificate::from_pem(server.cert_pem().expect("TLS server certificate"));
+    let endpoint = tonic::transport::Endpoint::from_shared(server.url())
+        .expect("endpoint")
+        .tls_config(tonic::transport::ClientTlsConfig::new().ca_certificate(certificate))
+        .expect("TLS config");
+    let channel = within(endpoint.connect()).await.expect("TLS connect");
+    let mut client = EchoClient::new(channel);
+    let response = within(client.unary_echo(EchoRequest {
+        message: "hello TLS gRPC".to_string(),
+        repeat: 0,
+        ..Default::default()
+    }))
+    .await
+    .expect("unary")
+    .into_inner();
+    assert_eq!(response.message, "hello TLS gRPC");
 }
 
 #[tokio::test]
@@ -455,6 +481,7 @@ async fn grpc_server_stream_echo() {
     let mut stream = within(client.server_stream_echo(EchoRequest {
         message: "s".to_string(),
         repeat: 4,
+        ..Default::default()
     }))
     .await
     .expect("server stream")
@@ -473,6 +500,7 @@ async fn grpc_server_stream_echo() {
     let mut stream = within(client.server_stream_echo(EchoRequest {
         message: "d".to_string(),
         repeat: 0,
+        ..Default::default()
     }))
     .await
     .expect("server stream")
@@ -495,14 +523,17 @@ async fn grpc_client_stream_echo() {
         EchoRequest {
             message: "a".to_string(),
             repeat: 0,
+            ..Default::default()
         },
         EchoRequest {
             message: "b".to_string(),
             repeat: 0,
+            ..Default::default()
         },
         EchoRequest {
             message: "c".to_string(),
             repeat: 0,
+            ..Default::default()
         },
     ]);
     let response = within(client.client_stream_echo(requests))
@@ -523,14 +554,17 @@ async fn grpc_bidi_echo() {
         EchoRequest {
             message: "x".to_string(),
             repeat: 0,
+            ..Default::default()
         },
         EchoRequest {
             message: "y".to_string(),
             repeat: 0,
+            ..Default::default()
         },
         EchoRequest {
             message: "z".to_string(),
             repeat: 0,
+            ..Default::default()
         },
     ]);
     let mut inbound = within(client.bidi_echo(requests))

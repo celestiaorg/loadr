@@ -1,8 +1,16 @@
 // Coordination protocol between the loadr controller and its load agents.
 //
 // A single bidirectional stream carries everything: the agent registers,
-// then heartbeats, metric deltas and run lifecycle events flow up while
-// assignments, the synchronized start barrier and control commands flow down.
+// then heartbeats, metric deltas, assignment readiness and run lifecycle
+// events flow up while assignments, the synchronized start barrier and
+// control commands flow down. An assignment is prepared off the agent's
+// session loop and acknowledged with AssignmentReady; the controller sends
+// Start only once every assigned agent is ready.
+//
+// Uplink delivery is at-least-once on the wire and effectively-once at the
+// controller: the agent keeps every sequenced message until it is acknowledged
+// and replays the unacknowledged tail over the next session, while the
+// controller discards what it has already applied. See `UplinkAck`.
 
 syntax = "proto3";
 
@@ -18,7 +26,16 @@ message AgentMessage {
     Heartbeat heartbeat = 2;
     MetricsBatch metrics = 3;
     RunEvent event = 4;
+    ControlAck control_ack = 5;
+    // 6 is taken by `seq` below.
+    AssignmentReady assignment_ready = 7;
   }
+  // Position in this agent incarnation's uplink sequence, starting at 1.
+  //
+  // 0 means ephemeral: Register and Heartbeat describe the moment they are
+  // built, so replaying one would report state that no longer holds. They are
+  // never buffered, never retried and never acknowledged.
+  uint64 seq = 6;
 }
 
 message Register {
@@ -30,12 +47,20 @@ message Register {
   map<string, string> labels = 6;
   // Set on reconnection when a run is still in flight (controller decides policy).
   string resume_run_id = 7;
+  // Source revision embedded when this agent binary was built.
+  string build_revision = 8;
+  // Identifies this agent process's uplink sequence space. `agent_id` is
+  // stable across restarts by design, so a restarted agent's fresh `seq = 1`
+  // would otherwise look like a duplicate to a controller that still remembers
+  // a high cursor. A new incarnation resets that cursor.
+  string incarnation = 9;
 }
 
 message Heartbeat {
   uint64 active_vus = 1;
   double cpu_load = 2;
   string run_id = 3;
+  // idle | preparing | pending | running | stopping | finished
   string run_state = 4;
 }
 
@@ -47,11 +72,26 @@ message MetricsBatch {
 
 message RunEvent {
   string run_id = 1;
-  // started | finished | failed | aborted
+  // started | finished | failed | aborted | prep_failed
+  //
+  // prep_failed means the assignment never became a running engine (setup
+  // error, busy agent, cancelled preparation); the controller fails the run
+  // as a preparation failure instead of an execution failure.
   string kind = 2;
   string detail = 3;
   // serde_json encoding of loadr_core::Summary (finished/aborted only).
   bytes summary_json = 4;
+}
+
+// The agent finished materializing an assignment (files written, plan
+// loaded, engine built) and is armed behind the start barrier. Sequenced
+// (seq >= 1): readiness is durable across reconnects, and the controller
+// must not compute a start timestamp until every assigned agent said this.
+message AssignmentReady {
+  string run_id = 1;
+  // Echoes Assignment.partition_index so a stale or misdirected readiness
+  // claim can be rejected.
+  uint64 partition_index = 2;
 }
 
 message ControllerMessage {
@@ -60,7 +100,27 @@ message ControllerMessage {
     Assignment assignment = 2;
     Start start = 3;
     Control control = 4;
+    UplinkAck uplink_ack = 5;
   }
+}
+
+// Cumulative receipt: every AgentMessage through `seq` has been processed and
+// will never be requested again. The agent discards them from its replay
+// window.
+//
+// Two obligations follow from at-least-once delivery. The controller MUST
+// discard any `seq` at or below its own cursor before applying it --
+// metric merging is additive, so a replayed MetricsBatch would double-count.
+// And it MUST acknowledge messages it discards, including duplicates and
+// messages it can never apply: an unacknowledged message is replayed forever
+// and eventually fills the agent's window.
+//
+// An acknowledgement is only valid on the session that produced it. The
+// controller never acknowledges a superseded stream, because the agent's
+// window is shared across its sessions and retiring an entry the controller
+// refused to apply would lose it permanently.
+message UplinkAck {
+  uint64 seq = 1;
 }
 
 message Registered {
@@ -83,7 +143,8 @@ message DataFile {
   bytes content = 2;
 }
 
-// Synchronized start barrier.
+// Synchronized start barrier. Sent only after every assigned agent has
+// reported AssignmentReady, so the timestamp is never eaten by setup time.
 message Start {
   string run_id = 1;
   int64 start_unix_ms = 2;
@@ -95,4 +156,15 @@ message Control {
   string action = 2;
   string scenario = 3;
   uint64 value = 4;
+  uint64 command_id = 5;
+}
+
+message ControlAck {
+  string run_id = 1;
+  uint64 command_id = 2;
+  string action = 3;
+  string scenario = 4;
+  uint64 value = 5;
+  bool applied = 6;
+  string detail = 7;
 }

@@ -21,8 +21,14 @@ pub enum AgentError {
     Security(String),
     #[error("no connected agents match the request")]
     NoAgents,
+    #[error("all matching agents are busy with other runs")]
+    AgentsBusy,
     #[error("unknown run `{0}`")]
     UnknownRun(String),
+    #[error("run `{0}` has not started yet")]
+    NotStarted(String),
     #[error("engine error: {0}")]
     Engine(String),
+    #[error("control command failed: {0}")]
+    Control(String),
 }

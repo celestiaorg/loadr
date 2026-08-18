@@ -12,9 +12,16 @@ service Echo {
 message EchoRequest {
   string message = 1;
   int32 repeat = 2;
+  bytes payload = 3;
+  uint32 response_code = 4;
+  optional uint32 owner_hint = 5;
+  bool fail_transport = 6;
 }
 
 message EchoResponse {
   string message = 1;
   int32 index = 2;
+  bytes payload = 3;
+  uint32 code = 4;
+  optional uint32 owner_hint = 5;
 }

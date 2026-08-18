@@ -1,0 +1,11 @@
+[plugin]
+name = "tx-signer"
+version = "0.1.0"
+kind = "service"
+type = "native"
+entry = "libnative_data_source.so"
+description = "Generates Ed25519-signed transaction payloads for gRPC SubmitRequest"
+capabilities = ["data_source"]
+
+[config]
+seed = 1

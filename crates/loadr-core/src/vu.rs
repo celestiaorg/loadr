@@ -9,8 +9,14 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
 use crate::cookies::CookieJar;
-use crate::data::{DataFeeds, NextRowError};
-use crate::metrics::{MetricRegistry, MetricsBus, Tags};
+use crate::data::{DataFeeds, NextRowError, RowIdentity};
+use crate::metrics::{CachedTags, MetricRegistry, MetricsBus, Tags};
+
+struct TagCacheEntry {
+    groups: Vec<String>,
+    extras: Vec<(String, String)>,
+    tags: CachedTags,
+}
 
 /// Type-keyed storage protocol handlers use for per-VU state
 /// (connection pools, gRPC channels, ...).
@@ -62,6 +68,8 @@ pub struct VuContext {
     pub iteration: u64,
     /// Tags applied to every sample this VU emits (scenario + global tags).
     pub base_tags: Arc<Tags>,
+    base_cached_tags: CachedTags,
+    tag_cache: Vec<TagCacheEntry>,
     /// Group stack (innermost last); rendered into the `group` tag as `::a::b`.
     pub groups: Vec<String>,
     /// Per-VU variables: extracted values, JS-set values.
@@ -75,6 +83,9 @@ pub struct VuContext {
     pub data_state: crate::data::VuFeedState,
     /// Rows fetched this iteration (one row per source per iteration).
     pub current_rows: HashMap<String, Arc<crate::data::Row>>,
+    /// The request currently being prepared, if any. Set by
+    /// [`VuContext::begin_request`], cleared right after `prepare` returns.
+    pub current_request: Option<String>,
     /// Whether the most recent request failed (drives `retry` success).
     pub last_request_failed: bool,
 }
@@ -88,20 +99,27 @@ impl VuContext {
         run: Arc<RunContext>,
         cookies_auto: bool,
     ) -> Self {
+        let base_cached_tags = run.registry.intern_tags(base_tags.clone());
         VuContext {
             vu_id,
             scenario,
             iteration: 0,
             base_tags,
+            base_cached_tags,
+            tag_cache: Vec::new(),
             groups: Vec::new(),
             vars: serde_json::Map::new(),
             cookies: CookieJar::new(cookies_auto),
-            metrics,
+            // Pinning here (rather than at each emit site) covers every
+            // sample source — VUs, the JS host, plugin protocols — with a
+            // one-line change (see `MetricsBus::for_vu`).
+            metrics: metrics.for_vu(vu_id),
             run,
             rng: SmallRng::seed_from_u64(0x10ad ^ vu_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
             extensions: Extensions::default(),
             data_state: crate::data::VuFeedState::new(),
             current_rows: HashMap::new(),
+            current_request: None,
             last_request_failed: false,
         }
     }
@@ -121,21 +139,84 @@ impl VuContext {
         Arc::new(tags)
     }
 
+    pub(crate) fn cached_sample_tags(&mut self, extras: &[(&str, &str)]) -> CachedTags {
+        if extras.is_empty() && self.groups.is_empty() {
+            return self.base_cached_tags.clone();
+        }
+        if let Some(entry) = self.tag_cache.iter().find(|entry| {
+            entry.groups == self.groups
+                && entry.extras.len() == extras.len()
+                && entry.extras.iter().zip(extras).all(
+                    |((cached_key, cached_value), (key, value))| {
+                        cached_key == key && cached_value == value
+                    },
+                )
+        }) {
+            return entry.tags.clone();
+        }
+
+        let tags = self.run.registry.intern_tags(self.sample_tags(extras));
+        if self.tag_cache.len() >= 64 {
+            self.tag_cache.clear();
+        }
+        self.tag_cache.push(TagCacheEntry {
+            groups: self.groups.clone(),
+            extras: extras
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            tags: tags.clone(),
+        });
+        tags
+    }
+
     /// Begin a new iteration: bump the counter, clear per-iteration row cache.
     pub fn begin_iteration(&mut self) {
         self.iteration += 1;
         self.current_rows.clear();
+        self.current_request = None;
     }
 
-    /// The data row for `source` in the current iteration (fetched once).
+    /// Begin preparing a request: plugin-backed rows are per-request, so
+    /// evict them from the iteration cache and remember the request name
+    /// for row context. A no-op when the run has no on-demand sources.
+    pub fn begin_request(&mut self, name: &str) {
+        if !self.run.data.has_on_demand() {
+            return;
+        }
+        self.current_request = Some(name.to_string());
+        self.begin_message();
+    }
+
+    /// Begin one message of a multi-message request (a gRPC streaming frame):
+    /// evict plugin-backed rows so every frame renders a fresh row. A no-op
+    /// when the run has no on-demand sources.
+    pub fn begin_message(&mut self) {
+        if !self.run.data.has_on_demand() {
+            return;
+        }
+        let data = &self.run.data;
+        self.current_rows.retain(|src, _| !data.is_on_demand(src));
+    }
+
+    /// The data row for `source` in the current iteration (fetched once),
+    /// or the current request if `source` is plugin-backed (fetched once per
+    /// request, and once per streamed frame within it; see
+    /// [`VuContext::begin_request`] and [`VuContext::begin_message`]).
     pub fn data_row(&mut self, source: &str) -> Result<Arc<crate::data::Row>, NextRowError> {
         if let Some(row) = self.current_rows.get(source) {
             return Ok(row.clone());
         }
+        let id = RowIdentity {
+            vu: self.vu_id,
+            iteration: self.iteration.saturating_sub(1),
+            scenario: &self.scenario,
+            request: self.current_request.as_deref(),
+        };
         let row = self
             .run
             .data
-            .next_row(source, &mut self.data_state, &mut self.rng)?;
+            .next_row(source, &mut self.data_state, &mut self.rng, &id)?;
         self.current_rows.insert(source.to_string(), row.clone());
         Ok(row)
     }
@@ -213,7 +294,8 @@ mod tests {
                 pick: loadr_config::PickStrategy::Sequential,
             },
         );
-        let data = DataFeeds::load(&sources, std::path::Path::new(".")).expect("data");
+        let data =
+            DataFeeds::load(&sources, std::path::Path::new("."), HashMap::new()).expect("data");
         Arc::new(RunContext {
             variables,
             secrets,
@@ -274,6 +356,50 @@ mod tests {
     }
 
     #[test]
+    fn distinct_vus_share_one_tag_set_arc() {
+        // The aggregator's `SeriesKey` compare leans on `Arc`'s pointer-equality
+        // shortcut. That only fires if two VUs emitting the same logical tags
+        // hand it the same allocation, which is what interning buys.
+        let run = run_ctx();
+        let (bus, _rx) = MetricsBus::new();
+        let mut first = VuContext::new(
+            1,
+            Arc::from("browse"),
+            Arc::new(Tags::new()),
+            bus.clone(),
+            run.clone(),
+            true,
+        );
+        let mut second = VuContext::new(
+            2,
+            Arc::from("browse"),
+            Arc::new(Tags::new()),
+            bus,
+            run,
+            true,
+        );
+
+        let extras = [("name", "submit"), ("status", "200")];
+        let a = first.cached_sample_tags(&extras);
+        let b = second.cached_sample_tags(&extras);
+        assert!(
+            Arc::ptr_eq(&a.tags, &b.tags),
+            "equal tag sets from different VUs must share one Arc"
+        );
+        assert_eq!(a.hash, b.hash);
+
+        // Base tags too, even though each VU was handed its own empty map.
+        assert!(Arc::ptr_eq(
+            &first.base_cached_tags.tags,
+            &second.base_cached_tags.tags
+        ));
+
+        // Different tags stay different series.
+        let other = second.cached_sample_tags(&[("name", "submit"), ("status", "500")]);
+        assert!(!Arc::ptr_eq(&a.tags, &other.tags));
+    }
+
+    #[test]
     fn group_tags() {
         let mut vu = vu();
         vu.groups.push("checkout".to_string());
@@ -284,10 +410,222 @@ mod tests {
     }
 
     #[test]
+    fn cached_tags_reuse_arc_and_distinguish_context() {
+        let mut vu = vu();
+        let first = vu.cached_sample_tags(&[("status", "0")]);
+        let again = vu.cached_sample_tags(&[("status", "0")]);
+        assert!(Arc::ptr_eq(&first.tags, &again.tags));
+        assert_eq!(first.hash, again.hash);
+
+        let failed = vu.cached_sample_tags(&[("status", "13")]);
+        assert!(!Arc::ptr_eq(&first.tags, &failed.tags));
+
+        vu.groups.push("checkout".to_string());
+        let grouped = vu.cached_sample_tags(&[("status", "0")]);
+        assert_eq!(grouped.tags.get("group").unwrap(), "::checkout");
+        vu.groups.pop();
+        let ungrouped = vu.cached_sample_tags(&[("status", "0")]);
+        assert!(Arc::ptr_eq(&first.tags, &ungrouped.tags));
+    }
+
+    #[test]
     fn extensions_typemap() {
         struct PoolState(u32);
         let mut vu = vu();
         vu.extensions.get_or_insert_with(|| PoolState(1)).0 += 1;
         assert_eq!(vu.extensions.get_mut::<PoolState>().unwrap().0, 2);
+    }
+
+    /// (vu, iteration, request name) recorded from one `next_row` call.
+    type SeenCall = (u64, u64, Option<String>);
+
+    /// Shared observability handle for [`RecordingPlugin`]: records the
+    /// `RowIdentity`-derived context of every `next_row` call and returns a
+    /// fresh, distinguishable row (an incrementing counter) each time.
+    #[derive(Clone)]
+    struct PluginHandle {
+        counter: Arc<std::sync::atomic::AtomicU64>,
+        seen: Arc<std::sync::Mutex<Vec<SeenCall>>>,
+    }
+
+    struct RecordingPlugin {
+        handle: PluginHandle,
+    }
+
+    impl crate::data::DataSourcePlugin for RecordingPlugin {
+        fn name(&self) -> &str {
+            "signer"
+        }
+
+        fn init(
+            &mut self,
+            _source_configs: &IndexMap<String, serde_json::Value>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn next_row(
+            &self,
+            ctx: &crate::data::PluginRowCtx<'_>,
+        ) -> Result<crate::data::PluginRowResult, String> {
+            let n = self
+                .handle
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.handle.seen.lock().unwrap().push((
+                ctx.vu,
+                ctx.iteration,
+                ctx.request.map(str::to_string),
+            ));
+            let mut row = crate::data::Row::new();
+            row.insert("n".to_string(), n.to_string());
+            Ok(crate::data::PluginRowResult::Row(row))
+        }
+    }
+
+    /// A run context with both a memory-backed `users` source and a
+    /// plugin-backed `signed` source, plus a handle to inspect the plugin's
+    /// calls after the fact.
+    fn run_ctx_with_plugin() -> (Arc<RunContext>, PluginHandle) {
+        let handle = PluginHandle {
+            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let plugin = RecordingPlugin {
+            handle: handle.clone(),
+        };
+        let mut sources = IndexMap::new();
+        let mut row = IndexMap::new();
+        row.insert("user".to_string(), serde_json::json!("u1"));
+        sources.insert(
+            "users".to_string(),
+            loadr_config::DataSource::Inline {
+                rows: vec![row],
+                mode: loadr_config::DataMode::Shared,
+                on_eof: loadr_config::OnEof::Recycle,
+                pick: loadr_config::PickStrategy::Sequential,
+            },
+        );
+        sources.insert(
+            "signed".to_string(),
+            loadr_config::DataSource::Plugin {
+                source: "signer".to_string(),
+                config: serde_json::Value::Null,
+                blocking: false,
+            },
+        );
+        let mut plugins: HashMap<String, Box<dyn crate::data::DataSourcePlugin>> = HashMap::new();
+        plugins.insert("signer".to_string(), Box::new(plugin));
+        let data = DataFeeds::load(&sources, std::path::Path::new("."), plugins).expect("data");
+        (
+            Arc::new(RunContext {
+                variables: serde_json::Map::new(),
+                secrets: HashMap::new(),
+                env: HashMap::new(),
+                data,
+                registry: Arc::new(MetricRegistry::with_builtins()),
+                base_dir: ".".into(),
+                setup_data: parking_lot::RwLock::new(serde_json::Value::Null),
+            }),
+            handle,
+        )
+    }
+
+    fn vu_with(run: Arc<RunContext>) -> VuContext {
+        let (bus, _rx) = MetricsBus::new();
+        VuContext::new(
+            7,
+            Arc::from("browse"),
+            Arc::new(Tags::new()),
+            bus,
+            run,
+            true,
+        )
+    }
+
+    #[test]
+    fn plugin_row_stable_within_a_request() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit");
+        let a = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        let b = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        assert_eq!(a, b, "same request sees the same plugin row");
+    }
+
+    #[test]
+    fn plugin_row_is_fresh_after_begin_request() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit 1");
+        let a = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        vu.begin_request("submit 2");
+        let b = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        assert_ne!(a, b, "a new request pulls a fresh plugin row");
+    }
+
+    #[test]
+    fn plugin_row_is_fresh_for_each_streamed_message() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit");
+        let a = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        vu.begin_message();
+        let b = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        vu.begin_message();
+        let c = vu.resolve_expr("data.signed.n").unwrap().unwrap();
+        assert_ne!(a, b, "each streamed frame pulls a fresh plugin row");
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn memory_feeds_unaffected_by_message_eviction() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit");
+        let a = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        vu.begin_message();
+        let b = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        assert_eq!(a, b, "memory-backed rows are not evicted by begin_message");
+    }
+
+    #[test]
+    fn memory_feeds_unaffected_by_request_eviction() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        let a = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        vu.begin_request("submit 1");
+        let b = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        vu.begin_request("submit 2");
+        let c = vu.resolve_expr("data.users.user").unwrap().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c, "memory-backed rows are not evicted by begin_request");
+    }
+
+    #[test]
+    fn plugin_ctx_carries_request_name_and_zero_based_iteration() {
+        let (run, handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.begin_request("submit tx");
+        vu.resolve_expr("data.signed.n").unwrap();
+        let seen = handle.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], (7, 0, Some("submit tx".to_string())));
+    }
+
+    #[test]
+    fn plugin_row_fetched_outside_request_has_no_request_name() {
+        let (run, handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        vu.begin_iteration();
+        vu.resolve_expr("data.signed.n").unwrap();
+        let seen = handle.seen.lock().unwrap();
+        assert_eq!(seen[0].2, None);
     }
 }

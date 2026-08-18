@@ -360,6 +360,7 @@ impl NavOutcome {
             error: None,
             url,
             extras,
+            grpc_protobuf_outcomes: Vec::new(),
         }
     }
 }
@@ -464,6 +465,7 @@ fn error_response(url: String, err: &str) -> ProtocolResponse {
         error: Some(err.to_string()),
         url,
         extras: serde_json::json!({}),
+        grpc_protobuf_outcomes: Vec::new(),
     }
 }
 

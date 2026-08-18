@@ -56,6 +56,7 @@ fn socket_response(
         error,
         url: url.to_string(),
         extras: serde_json::Value::Null,
+        grpc_protobuf_outcomes: Vec::new(),
     }
 }
 

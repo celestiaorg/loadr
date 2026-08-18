@@ -36,12 +36,17 @@ pub struct AgentArgs {
     /// Override the TLS server name
     #[arg(long)]
     pub tls_domain: Option<String>,
+    /// Tokio worker threads for the agent (default: number of CPUs)
+    #[arg(long, env = "LOADR_WORKER_THREADS")]
+    pub worker_threads: Option<usize>,
 }
 
 pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = args.worker_threads {
+        builder.worker_threads(n.max(1));
+    }
+    let runtime = builder.enable_all().build()?;
     runtime.block_on(async move {
         let mut labels = HashMap::new();
         for label in &args.label {
@@ -63,20 +68,71 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
         });
 
         // Real protocol and JS factories.
-        let protocols: loadr_agent::ProtocolFactory = Arc::new(|http_defaults, base_dir| {
-            let mut registry = loadr_protocols::builtin_registry(http_defaults, base_dir)
+        let protocols: loadr_agent::ProtocolFactory = Arc::new(|plan, base_dir| {
+            let mut registry = loadr_protocols::builtin_registry(&plan.defaults.http, base_dir)
                 .map_err(|e| e.to_string())?;
             // Browser protocol (headless Chrome via CDP); lazy until first use.
             registry.register(Arc::new(
-                loadr_browser::BrowserHandler::from_config(http_defaults)
+                loadr_browser::BrowserHandler::from_config(&plan.defaults.http)
                     .map_err(|e| e.to_string())?,
             ));
+            // Protocol plugins declared in the plan. The controller ships no
+            // plugin binaries: they resolve on this host from LOADR_PLUGINS_DIR
+            // or ~/.loadr/plugins (or an explicit `path:` in the plan).
+            let plugins_dir = loadr_plugin_api::default_plugins_dir();
+            for plugin_ref in &plan.plugins {
+                if !plugin_ref.enabled {
+                    continue;
+                }
+                let loaded = loadr_plugin_api::PluginRegistry::load_ref(plugin_ref, &plugins_dir)
+                    .map_err(|e| format!("plugin `{}`: {e}", plugin_ref.name))?;
+                match loaded {
+                    loadr_plugin_api::LoadedPlugin::Protocol(handler) => registry.register(handler),
+                    // Data-source capability is plumbed separately via
+                    // RunnerDeps::data_sources; don't warn about it here.
+                    loadr_plugin_api::LoadedPlugin::Service {
+                        data_source: Some(_),
+                        ..
+                    } => {}
+                    other => tracing::warn!(
+                        plugin = %plugin_ref.name,
+                        kind = %other.kind(),
+                        "plugin kind has no agent-side plumbing; ignoring"
+                    ),
+                }
+            }
             Ok(registry)
         });
         let script: loadr_agent::ScriptFactory = Arc::new(|js_config, base_dir| {
             loadr_js::JsEngine::new(js_config, base_dir)
                 .map(|e| Arc::new(e) as Arc<dyn loadr_core::ScriptEngine>)
                 .map_err(|e| e.to_string())
+        });
+        // Data-source plugins declared in the plan. The controller ships no
+        // plugin binaries: they resolve on this host from LOADR_PLUGINS_DIR
+        // or ~/.loadr/plugins (or an explicit `path:` in the plan).
+        let data_sources: loadr_agent::DataSourceFactory = Arc::new(|plugin_refs, _base_dir| {
+            let plugins_dir = loadr_plugin_api::default_plugins_dir();
+            let mut sources: HashMap<String, Box<dyn loadr_core::DataSourcePlugin>> =
+                HashMap::new();
+            for plugin_ref in plugin_refs {
+                if !plugin_ref.enabled {
+                    continue;
+                }
+                let loaded = loadr_plugin_api::PluginRegistry::load_ref(plugin_ref, &plugins_dir)
+                    .map_err(|e| format!("plugin `{}`: {e}", plugin_ref.name))?;
+                if let loadr_plugin_api::LoadedPlugin::Service {
+                    data_source: Some(data_source),
+                    ..
+                } = loaded
+                {
+                    // Keyed by the plan's `plugins:` name, not the plugin's
+                    // self-reported `info().name` -- that's what
+                    // `data.<name>.source` refers to.
+                    sources.insert(plugin_ref.name.clone(), data_source);
+                }
+            }
+            Ok(sources)
         });
 
         let config = loadr_agent::AgentConfig {
@@ -94,6 +150,7 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
             deps: loadr_agent::RunnerDeps {
                 protocols,
                 script: Some(script),
+                data_sources: Some(data_sources),
             },
         };
 

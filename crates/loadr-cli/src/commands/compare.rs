@@ -865,11 +865,13 @@ mod tests {
             name: "status is 200".to_string(),
             passes: 100,
             fails: 0,
+            failure_groups: Vec::new(),
         }];
         let checks_c = vec![CheckSummary {
             name: "status is 200".to_string(),
             passes: 90,
             fails: 10,
+            failure_groups: Vec::new(),
         }];
         let b = summary(Vec::new(), checks_b);
         let c = summary(Vec::new(), checks_c);

@@ -83,6 +83,30 @@ fn load_native_protocol(
     }
 }
 
+/// Build the `Service` variant from a loaded `kind = "service"` native
+/// plugin: takes whichever of the lifecycle/data_source capabilities the
+/// plugin provides, and errors only when it provides neither.
+fn load_native_service(
+    name: &str,
+    plugin: &NativePlugin,
+    config: serde_json::Value,
+) -> Result<LoadedPlugin, PluginError> {
+    let service = plugin.maybe_service();
+    let data_source = plugin.make_data_source(config);
+    if service.is_none() && data_source.is_none() {
+        return Err(PluginError::KindMismatch {
+            name: name.to_string(),
+            expected: "service or data_source".to_string(),
+            actual: plugin.info().kind.clone(),
+        });
+    }
+    Ok(LoadedPlugin::Service {
+        service: service.map(|s| Box::new(s) as Box<dyn ServicePlugin>),
+        data_source: data_source
+            .map(|d| Box::new(d) as Box<dyn loadr_core::data::DataSourcePlugin>),
+    })
+}
+
 /// Marker file that disables a plugin without uninstalling it.
 pub const DISABLED_MARKER: &str = "disabled";
 
@@ -103,7 +127,15 @@ pub enum LoadedPlugin {
     Assertion(Box<dyn PluginAssertion>),
     Output(Box<dyn loadr_core::Output>),
     Protocol(Arc<dyn loadr_core::ProtocolHandler>),
-    Service(Box<dyn ServicePlugin>),
+    /// A `kind = "service"` plugin. Either capability may be absent: a
+    /// signer/data-source plugin may skip the lifecycle entirely
+    /// (`service: None`), and an existing lifecycle-only service plugin
+    /// simply doesn't implement `data_source` (`data_source: None`). At
+    /// least one is always present.
+    Service {
+        service: Option<Box<dyn ServicePlugin>>,
+        data_source: Option<Box<dyn loadr_core::data::DataSourcePlugin>>,
+    },
 }
 
 impl LoadedPlugin {
@@ -113,7 +145,7 @@ impl LoadedPlugin {
             LoadedPlugin::Assertion(_) => PluginKind::Assertion,
             LoadedPlugin::Output(_) => PluginKind::Output,
             LoadedPlugin::Protocol(_) => PluginKind::Protocol,
-            LoadedPlugin::Service(_) => PluginKind::Service,
+            LoadedPlugin::Service { .. } => PluginKind::Service,
         }
     }
 }
@@ -195,9 +227,7 @@ impl PluginRegistry {
                     PluginKind::Output => {
                         Ok(LoadedPlugin::Output(Box::new(plugin.make_output(config)?)))
                     }
-                    PluginKind::Service => {
-                        Ok(LoadedPlugin::Service(Box::new(plugin.make_service()?)))
-                    }
+                    PluginKind::Service => load_native_service(&manifest.name, &plugin, config),
                     other => Err(PluginError::Other(format!(
                         "native plugins cannot provide `{other}` (only output/protocol/service); \
                          use a wasm plugin for `{}`",
@@ -300,9 +330,7 @@ impl PluginRegistry {
                     register_protocol_schemes(handler.name(), &schemes);
                     Ok(LoadedPlugin::Protocol(Arc::new(handler)))
                 }
-                Some(PluginKind::Service) => {
-                    Ok(LoadedPlugin::Service(Box::new(plugin.make_service()?)))
-                }
+                Some(PluginKind::Service) => load_native_service(&plugin_ref.name, &plugin, config),
                 _ => Err(PluginError::Other(format!(
                     "native plugin `{}` reports unsupported kind `{kind}`",
                     plugin_ref.name

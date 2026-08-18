@@ -31,9 +31,15 @@ struct EchoService;
 impl Echo for EchoService {
     async fn unary_echo(&self, request: Request<EchoRequest>) -> EchoResult<EchoResponse> {
         let req = request.into_inner();
+        if req.fail_transport {
+            return Err(Status::resource_exhausted("requested transport failure"));
+        }
         Ok(Response::new(EchoResponse {
             message: req.message,
             index: 0,
+            payload: req.payload,
+            code: req.response_code,
+            owner_hint: req.owner_hint,
         }))
     }
 
@@ -46,10 +52,16 @@ impl Echo for EchoService {
         let req = request.into_inner();
         let repeat = if req.repeat > 0 { req.repeat } else { 3 };
         let message = req.message;
+        let payload = req.payload;
+        let code = req.response_code;
+        let owner_hint = req.owner_hint;
         let stream = futures::stream::iter((0..repeat).map(move |index| {
             Ok(EchoResponse {
                 message: message.clone(),
                 index,
+                payload: payload.clone(),
+                code,
+                owner_hint,
             })
         }));
         Ok(Response::new(Box::pin(stream)))
@@ -61,14 +73,23 @@ impl Echo for EchoService {
     ) -> EchoResult<EchoResponse> {
         let mut inbound = request.into_inner();
         let mut combined = String::new();
+        let mut payload = Vec::new();
+        let mut code = 0;
+        let mut owner_hint = None;
         let mut count = 0i32;
         while let Some(req) = inbound.message().await? {
             combined.push_str(&req.message);
+            payload = req.payload;
+            code = req.response_code;
+            owner_hint = req.owner_hint;
             count += 1;
         }
         Ok(Response::new(EchoResponse {
             message: combined,
             index: count,
+            payload,
+            code,
+            owner_hint,
         }))
     }
 
@@ -87,6 +108,9 @@ impl Echo for EchoService {
                         Ok(EchoResponse {
                             message: req.message,
                             index,
+                            payload: req.payload,
+                            code: req.response_code,
+                            owner_hint: req.owner_hint,
                         }),
                         (Some(inbound), index + 1),
                     )),
@@ -109,8 +133,11 @@ impl Echo for EchoService {
 ///
 /// Also serves gRPC v1 server reflection. Shuts down on drop.
 pub struct GrpcEchoServer {
-    /// Bound address (always `127.0.0.1` with an ephemeral port).
+    /// Bound address (always `127.0.0.1`; port is ephemeral unless spawned
+    /// via [`spawn_on`](Self::spawn_on)).
     pub addr: SocketAddr,
+    scheme: &'static str,
+    cert_pem: Option<String>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -118,18 +145,63 @@ impl GrpcEchoServer {
     /// Spawns the server on `127.0.0.1` with an ephemeral port.
     pub async fn spawn() -> Result<Self, TestServerError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        Self::serve(listener, None).await
+    }
+
+    /// Spawns on a specific address — e.g. to come back up on the same port
+    /// after a shutdown in reconnect tests.
+    pub async fn spawn_on(addr: SocketAddr) -> Result<Self, TestServerError> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        Self::serve(listener, None).await
+    }
+
+    /// Spawns a TLS server with a self-signed certificate (valid for
+    /// `localhost` and `127.0.0.1`, ALPN `h2`). Trust it client-side via
+    /// [`cert_pem`](Self::cert_pem) or connect with verification disabled.
+    pub async fn spawn_tls() -> Result<Self, TestServerError> {
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .map_err(|e| TestServerError::Tls(e.to_string()))?;
+        let cert_pem = certified.cert.pem();
+        let identity =
+            tonic::transport::Identity::from_pem(&cert_pem, certified.signing_key.serialize_pem());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut server = Self::serve(listener, Some(identity)).await?;
+        server.cert_pem = Some(cert_pem);
+        Ok(server)
+    }
+
+    async fn serve(
+        listener: tokio::net::TcpListener,
+        tls: Option<tonic::transport::Identity>,
+    ) -> Result<Self, TestServerError> {
         let addr = listener.local_addr()?;
+        let scheme = if tls.is_some() { "https" } else { "http" };
         let (tx, rx) = oneshot::channel::<()>();
         let reflection = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
             .build_v1()
             .map_err(|e| TestServerError::Grpc(e.to_string()))?;
         let incoming = futures::stream::unfold(listener, |listener| async move {
-            let accepted = listener.accept().await.map(|(stream, _)| stream);
+            let accepted = listener.accept().await.map(|(stream, _)| {
+                // Raw accept bypasses tonic's TcpIncoming, which is what
+                // normally disables Nagle; without this, multi-write h2
+                // responses stall ~40ms on delayed ACKs under load.
+                let _ = stream.set_nodelay(true);
+                stream
+            });
             Some((accepted, listener))
         });
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(identity) = tls {
+            builder = builder
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .map_err(|e| TestServerError::Tls(e.to_string()))?;
+        }
         tokio::spawn(async move {
-            let result = tonic::transport::Server::builder()
+            let result = builder
                 .add_service(EchoServer::new(EchoService))
                 .add_service(reflection)
                 .serve_with_incoming_shutdown(incoming, async {
@@ -144,13 +216,21 @@ impl GrpcEchoServer {
         tracing::debug!(%addr, "grpc test server listening");
         Ok(Self {
             addr,
+            scheme,
+            cert_pem: None,
             shutdown: Some(tx),
         })
     }
 
-    /// Base URL suitable for `EchoClient::connect`, e.g. `http://127.0.0.1:54321`.
+    /// PEM certificate when spawned with [`spawn_tls`](Self::spawn_tls).
+    pub fn cert_pem(&self) -> Option<&str> {
+        self.cert_pem.as_deref()
+    }
+
+    /// Base URL suitable for `EchoClient::connect`, e.g. `http://127.0.0.1:54321`
+    /// or `https://127.0.0.1:54321` for a TLS server.
     pub fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        format!("{}://{}", self.scheme, self.addr)
     }
 
     /// Alias for [`url`](Self::url).

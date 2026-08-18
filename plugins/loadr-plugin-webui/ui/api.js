@@ -84,6 +84,7 @@ window.API = (function () {
             return;
           }
           if (!res.ok || !res.body) throw new Error('stream failed: ' + res.status);
+          if (handlers.open) handlers.open();
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let buf = '';
@@ -116,6 +117,8 @@ window.API = (function () {
           return;
         } catch (e) {
           if (closed) return;
+          if (handlers.error) handlers.error(e);
+          if (handlers.reconnecting) handlers.reconnecting();
           await new Promise((r) => setTimeout(r, 2000));
           ctrl = new AbortController();
         }

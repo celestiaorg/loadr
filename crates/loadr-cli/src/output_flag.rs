@@ -2,7 +2,8 @@
 
 use loadr_config::OutputConfig;
 
-/// Parse `json=path`, `csv=path`, `prometheus=listen_addr`,
+/// Parse `json=path`, `csv=path`,
+/// `prometheus=listen_addr[,final_scrape_grace=dur]`,
 /// `influxdb=url,database`, `statsd=addr`, `otlp=endpoint`.
 pub fn parse_output_flag(spec: &str) -> Result<OutputConfig, String> {
     let (kind, value) = spec
@@ -11,11 +12,35 @@ pub fn parse_output_flag(spec: &str) -> Result<OutputConfig, String> {
     match kind {
         "json" => Ok(OutputConfig::Json { path: value.into() }),
         "csv" => Ok(OutputConfig::Csv { path: value.into() }),
-        "prometheus" => Ok(OutputConfig::Prometheus {
-            listen: Some(value.to_string()),
-            remote_write_url: None,
-            interval: None,
-        }),
+        "prometheus" => {
+            let (listen, options) = match value.split_once(',') {
+                Some((addr, rest)) => (addr, rest),
+                None => (value, ""),
+            };
+            let mut final_scrape_grace = None;
+            for option in options.split(',').filter(|o| !o.is_empty()) {
+                match option.split_once('=') {
+                    Some(("final_scrape_grace", dur)) => {
+                        final_scrape_grace = Some(
+                            loadr_config::Dur::parse(dur)
+                                .map_err(|e| format!("prometheus final_scrape_grace: {e}"))?,
+                        );
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown prometheus output option `{option}` \
+                             (supported: final_scrape_grace=<duration>)"
+                        ))
+                    }
+                }
+            }
+            Ok(OutputConfig::Prometheus {
+                listen: Some(listen.to_string()),
+                remote_write_url: None,
+                interval: None,
+                final_scrape_grace,
+            })
+        }
         "influxdb" => {
             let (url, database) = value
                 .split_once(',')
@@ -56,8 +81,26 @@ mod tests {
         ));
         assert!(matches!(
             parse_output_flag("prometheus=127.0.0.1:9091").unwrap(),
-            OutputConfig::Prometheus { .. }
+            OutputConfig::Prometheus {
+                final_scrape_grace: None,
+                ..
+            }
         ));
+        match parse_output_flag("prometheus=127.0.0.1:9091,final_scrape_grace=10s").unwrap() {
+            OutputConfig::Prometheus {
+                listen,
+                final_scrape_grace,
+                ..
+            } => {
+                assert_eq!(listen.as_deref(), Some("127.0.0.1:9091"));
+                assert_eq!(
+                    final_scrape_grace.map(|d| d.as_duration()),
+                    Some(std::time::Duration::from_secs(10))
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_output_flag("prometheus=127.0.0.1:9091,bogus=1").is_err());
         assert!(matches!(
             parse_output_flag("influxdb=http://x:8086,db").unwrap(),
             OutputConfig::Influxdb { .. }

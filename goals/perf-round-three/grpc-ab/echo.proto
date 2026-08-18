@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package loadr.test;
+
+service Echo {
+  rpc UnaryEcho(EchoRequest) returns (EchoResponse);
+  rpc ServerStreamEcho(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStreamEcho(stream EchoRequest) returns (EchoResponse);
+  rpc BidiEcho(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+  int32 repeat = 2;
+  bytes payload = 3;
+}
+
+message EchoResponse {
+  string message = 1;
+  int32 index = 2;
+  bytes payload = 3;
+}
