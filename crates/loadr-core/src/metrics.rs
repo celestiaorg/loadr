@@ -370,11 +370,7 @@ impl MetricsBus {
                     self.emit_value(metric, kind, value, &tags.tags);
                 }
             }
-            Sink::Shard { shards, idx } => {
-                for &(metric, kind, value) in values {
-                    shards.record_cached(*idx, metric, kind, value, tags);
-                }
-            }
+            Sink::Shard { shards, idx } => shards.record_cached_values(*idx, values, tags),
         }
     }
 

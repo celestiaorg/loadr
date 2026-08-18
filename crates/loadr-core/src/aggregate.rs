@@ -854,6 +854,21 @@ impl MetricShards {
             .record_cached(metric, kind, value, tags);
     }
 
+    /// Record a whole batch under one lock acquisition. ~31 VUs share a shard at
+    /// 500 VUs, so locking per metric multiplied the chance of colliding with
+    /// them by the number of metrics in the batch.
+    pub(crate) fn record_cached_values(
+        &self,
+        idx: usize,
+        values: &[(&Arc<str>, MetricKind, f64)],
+        tags: &CachedTags,
+    ) {
+        let mut shard = self.shards[idx % self.shards.len()].lock();
+        for &(metric, kind, value) in values {
+            shard.record_cached(metric, kind, value, tags);
+        }
+    }
+
     /// Drain every shard's delta into `target` — one `take_delta` +
     /// `merge_delta` per shard.
     pub fn drain_into(&self, target: &mut Aggregator) {
@@ -948,6 +963,28 @@ mod tests {
         let snap = agg.snapshot();
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.find("http_reqs").unwrap().agg.sum, 2.0);
+    }
+
+    #[test]
+    fn batched_shard_record_keeps_totals_exact() {
+        let shards = MetricShards::new(1);
+        let counter: Arc<str> = Arc::from("grpc_reqs");
+        let trend: Arc<str> = Arc::from("grpc_req_duration");
+        let tags = CachedTags::new(Arc::new(Tags::new()));
+        shards.record_cached_values(
+            0,
+            &[
+                (&counter, MetricKind::Counter, 2.0),
+                (&trend, MetricKind::Trend, 5.0),
+                (&counter, MetricKind::Counter, 3.0),
+            ],
+            &tags,
+        );
+        let mut target = Aggregator::new();
+        shards.drain_into(&mut target);
+        let snap = target.snapshot();
+        assert_eq!(snap.find("grpc_reqs").unwrap().agg.sum, 5.0);
+        assert_eq!(snap.find("grpc_req_duration").unwrap().agg.count, 1);
     }
 
     #[test]
