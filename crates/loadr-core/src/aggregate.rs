@@ -932,6 +932,25 @@ mod tests {
     }
 
     #[test]
+    fn uninterned_equal_tags_still_fold_into_one_series() {
+        // Past the interner cap, callers hand over distinct `Arc`s for equal
+        // tags. `Arc`'s `PartialEq` falls back to comparing contents, so these
+        // must still land on a single series.
+        let metric: Arc<str> = Arc::from("http_reqs");
+        let tags = Tags::from([("status".to_string(), "200".to_string())]);
+        let left = CachedTags::new(Arc::new(tags.clone()));
+        let right = CachedTags::new(Arc::new(tags));
+        assert!(!Arc::ptr_eq(&left.tags, &right.tags));
+
+        let mut agg = Aggregator::new();
+        agg.record_cached(&metric, MetricKind::Counter, 1.0, &left);
+        agg.record_cached(&metric, MetricKind::Counter, 1.0, &right);
+        let snap = agg.snapshot();
+        assert_eq!(snap.series.len(), 1);
+        assert_eq!(snap.find("http_reqs").unwrap().agg.sum, 2.0);
+    }
+
+    #[test]
     fn interval_counts_roll() {
         let mut agg = Aggregator::new();
         agg.record(&sample("reqs", MetricKind::Counter, 5.0, &[]));

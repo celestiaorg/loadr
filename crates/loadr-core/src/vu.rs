@@ -96,7 +96,7 @@ impl VuContext {
         run: Arc<RunContext>,
         cookies_auto: bool,
     ) -> Self {
-        let base_cached_tags = CachedTags::new(base_tags.clone());
+        let base_cached_tags = run.registry.intern_tags(base_tags.clone());
         VuContext {
             vu_id,
             scenario,
@@ -151,7 +151,7 @@ impl VuContext {
             return entry.tags.clone();
         }
 
-        let tags = CachedTags::new(self.sample_tags(extras));
+        let tags = self.run.registry.intern_tags(self.sample_tags(extras));
         if self.tag_cache.len() >= 64 {
             self.tag_cache.clear();
         }
@@ -316,6 +316,50 @@ mod tests {
         let a = vu.resolve_expr("data.users.user").unwrap().unwrap();
         let b = vu.resolve_expr("data.users.user").unwrap().unwrap();
         assert_eq!(a, b, "same iteration sees the same row");
+    }
+
+    #[test]
+    fn distinct_vus_share_one_tag_set_arc() {
+        // The aggregator's `SeriesKey` compare leans on `Arc`'s pointer-equality
+        // shortcut. That only fires if two VUs emitting the same logical tags
+        // hand it the same allocation, which is what interning buys.
+        let run = run_ctx();
+        let (bus, _rx) = MetricsBus::new();
+        let mut first = VuContext::new(
+            1,
+            Arc::from("browse"),
+            Arc::new(Tags::new()),
+            bus.clone(),
+            run.clone(),
+            true,
+        );
+        let mut second = VuContext::new(
+            2,
+            Arc::from("browse"),
+            Arc::new(Tags::new()),
+            bus,
+            run,
+            true,
+        );
+
+        let extras = [("name", "submit"), ("status", "200")];
+        let a = first.cached_sample_tags(&extras);
+        let b = second.cached_sample_tags(&extras);
+        assert!(
+            Arc::ptr_eq(&a.tags, &b.tags),
+            "equal tag sets from different VUs must share one Arc"
+        );
+        assert_eq!(a.hash, b.hash);
+
+        // Base tags too, even though each VU was handed its own empty map.
+        assert!(Arc::ptr_eq(
+            &first.base_cached_tags.tags,
+            &second.base_cached_tags.tags
+        ));
+
+        // Different tags stay different series.
+        let other = second.cached_sample_tags(&[("name", "submit"), ("status", "500")]);
+        assert!(!Arc::ptr_eq(&a.tags, &other.tags));
     }
 
     #[test]

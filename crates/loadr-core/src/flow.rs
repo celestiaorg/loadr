@@ -1901,13 +1901,16 @@ impl Drop for RequestMetricsGuard {
             .as_deref()
             .map(classify_transport_error)
             .unwrap_or("");
-        let tags = CachedTags::new(self.emitter.sample_tags(&[
-            ("name", &self.request.name),
-            ("method", &self.request.method),
-            ("status", &status),
-            ("proto", &self.request.protocol),
-            ("error_kind", error_kind),
-        ]));
+        let tags = self
+            .emitter
+            .registry
+            .intern_tags(self.emitter.sample_tags(&[
+                ("name", &self.request.name),
+                ("method", &self.request.method),
+                ("status", &status),
+                ("proto", &self.request.protocol),
+                ("error_kind", error_kind),
+            ]));
         self.emitter
             .emit_request_metrics(&self.request, &response, &tags);
         self.emitter.metrics.end_request();
