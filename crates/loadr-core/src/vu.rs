@@ -185,6 +185,9 @@ impl VuContext {
             return;
         }
         self.current_request = Some(name.to_string());
+        // Rows from a request that never completed (a failed prepare) are
+        // not reported. Per-frame rows accumulate, so only clear here.
+        self.data_state.clear_pending();
         self.begin_message();
     }
 
@@ -512,6 +515,7 @@ mod tests {
                 source: "signer".to_string(),
                 config: serde_json::Value::Null,
                 blocking: false,
+                on_result: false,
             },
         );
         let mut plugins: HashMap<String, Box<dyn crate::data::DataSourcePlugin>> = HashMap::new();

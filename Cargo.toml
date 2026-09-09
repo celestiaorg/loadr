@@ -49,6 +49,7 @@ members = [
     "plugins/examples/native-output",
     "plugins/examples/native-protocol",
     "plugins/examples/native-data-source",
+    "plugins/examples/native-nonce-feeder",
     "testsupport/loadr-testserver",
 ]
 

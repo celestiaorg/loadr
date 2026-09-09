@@ -1,0 +1,46 @@
+# A data source that reacts to what the server said.
+#
+# `on_result: true` hands the full response of every request that used a row
+# from this source back to the plugin. Here the plugin keeps a per-account
+# transaction nonce and advances it only when the submission succeeded — a
+# rejected transaction does not consume a nonce, so the next attempt for that
+# account reuses it.
+#
+# Build and install the example plugin first:
+#   cargo build -p loadr-plugin-example-native-nonce-feeder --release
+#   # stage plugin.toml + the platform library, then: loadr plugin install <dir>
+name: plugin-data-source-result-sink
+description: Blockchain submissions whose nonces only advance on success
+
+plugins:
+  - name: nonce-feeder
+    config:
+      shards: 256
+      accounts: 1000   # >= vus, so each VU owns an account
+
+data:
+  nonces:
+    type: plugin
+    source: nonce-feeder
+    # Send every request result back to the plugin's result_sink.
+    on_result: true
+
+scenarios:
+  submit:
+    executor: constant-vus
+    vus: 100
+    duration: 5m
+    flow:
+      - request:
+          name: submit tx
+          method: POST
+          url: http://node:8545/tx
+          body:
+            json:
+              account: "${data.nonces.account}"
+              nonce: "${data.nonces.nonce}"
+          checks:
+            - { type: status, equals: 200 }
+
+thresholds:
+  http_req_duration: [ "p(95)<150" ]

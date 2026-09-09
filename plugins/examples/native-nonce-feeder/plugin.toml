@@ -1,0 +1,16 @@
+[plugin]
+name = "nonce-feeder"
+version = "0.1.0"
+kind = "service"
+type = "native"
+entry = "libnative_nonce_feeder.so"
+description = "Per-account transaction nonces, advanced only when the submission succeeded"
+capabilities = ["data_source", "result_sink"]
+
+[config]
+# Number of independently locked shards the account map is split over. VUs
+# touching accounts in different shards never contend.
+shards = 256
+# Size of the account pool. Each VU owns one account (`vu % accounts`), so
+# keep this at or above the VU count to avoid two VUs sharing a nonce.
+accounts = 1000

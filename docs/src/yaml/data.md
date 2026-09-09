@@ -90,7 +90,7 @@ scenarios:
 ```
 
 The config surface is exactly `{ type: plugin, source: <plugin>, config:
-<object>, blocking: <bool> }`. **`mode`, `on_eof` and `pick` do not apply**
+<object>, blocking: <bool>, on_result: <bool> }`. **`mode`, `on_eof` and `pick` do not apply**
 and are ignored if present — those describe iterating over a stored set of
 rows, which doesn't exist here; a plugin generates every row fresh, per call.
 
@@ -101,6 +101,46 @@ threads — without it, enough concurrently-preparing VUs on a slow feeder
 delay timers and unrelated VUs, degrading the load shape itself. Leave it
 off (the default) for cheap in-memory generation: the bracket has a fixed
 per-call cost that a microsecond feeder should not pay.
+
+**`on_result: true`** hands the full result of every request that used a row
+from this source back to the plugin, so a feeder can react to what the server
+said. The plugin must provide the `result_sink` capability; if it doesn't, the
+flag is ignored with a warning. Off by default — the response is serialised
+per request, which a plugin that ignores it shouldn't pay for.
+
+The plugin receives one JSON payload per row the request used:
+
+```json
+{"source": "nonces", "vu": 7, "iteration": 3, "seq": 41,
+ "scenario": "submit", "request": "submit tx",
+ "row": {"account": "acct-12", "nonce": "17"},
+ "response": {"status": 200, "status_text": "OK", "body": "...",
+              "headers": {...}, "duration_ms": 12.4, "error": null,
+              "url": "...", "protocol": "HTTP/1.1"}}
+```
+
+The `row` is echoed back, so a plugin usually needs no pending-request
+bookkeeping of its own. `seq` identifies the row uniquely with `vu` and
+`source`. A streaming request that pulled N frames' worth of rows produces N
+payloads.
+
+Feedback must not be able to break a load test, so `on_result` returns nothing
+and a request cancelled mid-flight (a graceful stop) reports nothing at all — a
+plugin has to tolerate a row whose result never arrives.
+
+Two costs worth knowing. The response body is serialised into the payload, so
+a source that reports results on requests with large responses pays that per
+request; and a gRPC streaming request that pulled N frames' worth of rows sends
+N payloads, each carrying the same response.
+
+`blocking: true` covers `on_result` as well as `next_row`. Leave it off for a
+sink that just updates memory; turn it on if the sink does I/O, so a slow call
+can't stall the other VUs sharing its runtime thread. Either way the call runs
+inside the VU's own iteration, so its latency counts against that VU.
+
+See `plugins/examples/native-nonce-feeder` for a worked example: per-account
+blockchain nonces held in sharded maps, advanced only when the submission
+succeeded.
 
 **Freshness is per-request, not per-iteration.** CSV/JSON/inline sources
 cache one row per iteration (all references in the same iteration see the

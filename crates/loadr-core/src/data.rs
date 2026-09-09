@@ -40,6 +40,56 @@ pub struct PluginRowCtx<'a> {
     pub ts_ms: u64,
 }
 
+/// What a plugin's result sink receives for one row.
+#[derive(serde::Serialize)]
+struct ResultPayload<'a> {
+    source: &'a str,
+    vu: u64,
+    iteration: u64,
+    seq: u64,
+    scenario: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<&'a str>,
+    row: &'a Row,
+    response: ResponseView<'a>,
+}
+
+/// Serializes a response in place. Mirrors `flow::response_to_json`, but
+/// writes the body straight out of its `Bytes` instead of building an
+/// intermediate `serde_json::Value` and copying it.
+struct ResponseView<'a>(&'a crate::protocol::ProtocolResponse);
+
+impl serde::Serialize for ResponseView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let r = self.0;
+        let mut out = s.serialize_struct("response", 8)?;
+        out.serialize_field("status", &r.status)?;
+        out.serialize_field("status_text", &r.status_text)?;
+        out.serialize_field("body", &r.body_text())?;
+        out.serialize_field("headers", &Headers(&r.headers))?;
+        out.serialize_field("duration_ms", &r.timings.duration_ms)?;
+        out.serialize_field("error", &r.error)?;
+        out.serialize_field("url", &r.url)?;
+        out.serialize_field("protocol", &r.protocol_version)?;
+        out.end()
+    }
+}
+
+/// Header pairs as a lowercase-keyed map, matching `response_to_json`.
+struct Headers<'a>(&'a [(String, String)]);
+
+impl serde::Serialize for Headers<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(&k.to_ascii_lowercase(), v)?;
+        }
+        map.end()
+    }
+}
+
 /// Outcome of one on-demand row generation.
 pub enum PluginRowResult {
     Row(Row),
@@ -56,6 +106,16 @@ pub trait DataSourcePlugin: Send + Sync {
     fn init(&mut self, source_configs: &IndexMap<String, serde_json::Value>) -> Result<(), String>;
 
     fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String>;
+
+    /// Whether this plugin wants request results. Default: no.
+    fn has_result_sink(&self) -> bool {
+        false
+    }
+
+    /// Full result of a request that used one of this plugin's rows. Taken
+    /// by value so the FFI hand-off is a move, not a copy. Errors are the
+    /// plugin's problem: a load test must not fail on feedback.
+    fn on_result(&self, _result_json: String) {}
 }
 
 #[derive(Debug)]
@@ -74,6 +134,9 @@ enum Feed {
         /// Fetch rows under `block_in_place` so a slow feeder cannot stall
         /// the runtime (opt-in per source via `blocking: true`).
         blocking: bool,
+        /// Interned source name, so recording a pending row is a refcount
+        /// bump rather than an allocation.
+        name: Option<Arc<str>>,
     },
 }
 
@@ -81,7 +144,9 @@ impl std::fmt::Debug for Feed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Feed::Memory(feed) => feed.fmt(f),
-            Feed::Plugin { plugin, blocking } => {
+            Feed::Plugin {
+                plugin, blocking, ..
+            } => {
                 write!(f, "Feed::Plugin({}, blocking: {blocking})", plugin.name())
             }
         }
@@ -100,7 +165,7 @@ fn bracket_plugin_fetch(blocking: bool) -> bool {
 
 /// Per-VU feeder state: sequential cursors, per-VU shuffle orders, and
 /// plugin row sequence counters.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct VuFeedState {
     cursors: HashMap<String, usize>,
     shuffles: HashMap<String, Vec<usize>>,
@@ -111,6 +176,18 @@ pub struct VuFeedState {
     /// Branch-local cache of slots from `plugin_sequences`; steady-state
     /// fetches skip the lock and key allocation.
     local_sequences: HashMap<String, Arc<AtomicU64>>,
+    /// Rows pulled for the request being prepared, from sources with
+    /// `on_result: true`. Drained by `report_result`.
+    pending: Vec<PendingRow>,
+}
+
+/// One row awaiting the result of the request that used it.
+struct PendingRow {
+    source: Arc<str>,
+    seq: u64,
+    row: Arc<Row>,
+    plugin: Arc<dyn DataSourcePlugin>,
+    blocking: bool,
 }
 
 impl VuFeedState {
@@ -124,7 +201,17 @@ impl VuFeedState {
             shuffles: HashMap::new(),
             plugin_sequences: Arc::clone(&self.plugin_sequences),
             local_sequences: HashMap::new(),
+            pending: Vec::new(),
         }
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Drop rows whose request never completed (a prepare that failed).
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 
     fn next_plugin_seq(&mut self, source: &str) -> u64 {
@@ -155,6 +242,7 @@ impl VuFeedState {
 pub struct DataFeeds {
     feeds: HashMap<String, Feed>,
     has_on_demand: bool,
+    has_result_sinks: bool,
 }
 
 /// Signalled when a `stop`-mode source is exhausted: the VU should retire.
@@ -207,12 +295,14 @@ impl DataFeeds {
         }
 
         let mut has_on_demand = false;
+        let mut has_result_sinks = false;
         let mut feeds = HashMap::new();
         for (name, source) in sources {
             let feed = match source {
                 DataSource::Plugin {
                     source: plugin_name,
                     blocking,
+                    on_result,
                     ..
                 } => {
                     has_on_demand = true;
@@ -220,9 +310,19 @@ impl DataFeeds {
                         .get(plugin_name)
                         .expect("initialized above for every referenced plugin")
                         .clone();
+                    if *on_result && !plugin.has_result_sink() {
+                        tracing::warn!(
+                            source = %name,
+                            plugin = %plugin_name,
+                            "`on_result: true` ignored: plugin provides no result_sink"
+                        );
+                    }
+                    let reports = *on_result && plugin.has_result_sink();
+                    has_result_sinks |= reports;
                     Feed::Plugin {
                         plugin,
                         blocking: *blocking,
+                        name: reports.then(|| Arc::from(name.as_str())),
                     }
                 }
                 DataSource::Csv {
@@ -356,7 +456,42 @@ impl DataFeeds {
         Ok(DataFeeds {
             feeds,
             has_on_demand,
+            has_result_sinks,
         })
+    }
+
+    /// Hand the result of a completed request to every plugin whose rows it
+    /// used. Drains `state`'s pending rows.
+    pub fn report_result(
+        &self,
+        state: &mut VuFeedState,
+        id: &RowIdentity<'_>,
+        response: &crate::protocol::ProtocolResponse,
+    ) {
+        for entry in state.pending.drain(..) {
+            let payload = ResultPayload {
+                source: &entry.source,
+                vu: id.vu,
+                iteration: id.iteration,
+                seq: entry.seq,
+                scenario: id.scenario,
+                request: id.request,
+                row: &entry.row,
+                response: ResponseView(response),
+            };
+            let json = match serde_json::to_string(&payload) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!(source = %entry.source, error = %e, "cannot encode result");
+                    continue;
+                }
+            };
+            if bracket_plugin_fetch(entry.blocking) {
+                tokio::task::block_in_place(|| entry.plugin.on_result(json));
+            } else {
+                entry.plugin.on_result(json);
+            }
+        }
     }
 
     pub fn has_source(&self, name: &str) -> bool {
@@ -370,6 +505,12 @@ impl DataFeeds {
     /// Whether any loaded source is plugin-backed (on-demand rows).
     pub fn has_on_demand(&self) -> bool {
         self.has_on_demand
+    }
+
+    /// Whether any source reports request results back to its plugin. Gates
+    /// response-body decoding, which a sink needs to read.
+    pub fn has_result_sinks(&self) -> bool {
+        self.has_result_sinks
     }
 
     /// Whether `name` is a plugin-backed (on-demand) source.
@@ -395,7 +536,11 @@ impl DataFeeds {
             .ok_or_else(|| NextRowError::UnknownSource(source.to_string()))?;
 
         let feed = match feed {
-            Feed::Plugin { plugin, blocking } => {
+            Feed::Plugin {
+                plugin,
+                blocking,
+                name,
+            } => {
                 let seq = state.next_plugin_seq(source);
                 let ctx = PluginRowCtx {
                     source,
@@ -415,7 +560,19 @@ impl DataFeeds {
                     plugin.next_row(&ctx)
                 };
                 return match fetched {
-                    Ok(PluginRowResult::Row(row)) => Ok(Arc::new(row)),
+                    Ok(PluginRowResult::Row(row)) => {
+                        let row = Arc::new(row);
+                        if let Some(name) = name {
+                            state.pending.push(PendingRow {
+                                source: name.clone(),
+                                seq,
+                                row: row.clone(),
+                                plugin: plugin.clone(),
+                                blocking: *blocking,
+                            });
+                        }
+                        Ok(row)
+                    }
                     Ok(PluginRowResult::Exhausted) => {
                         Err(NextRowError::Exhausted(EndOfData(source.to_string())))
                     }
@@ -604,6 +761,7 @@ mod tests {
                 source: name,
                 config: serde_json::Value::Null,
                 blocking,
+                on_result: false,
             },
         );
         DataFeeds::load(&sources, Path::new("."), plugins).expect("load")
@@ -860,6 +1018,7 @@ mod tests {
                 source: plugin_name.to_string(),
                 config: serde_json::Value::Null,
                 blocking: false,
+                on_result: false,
             },
         );
         sources
@@ -1032,6 +1191,7 @@ mod tests {
                 source: "signer".to_string(),
                 config: serde_json::json!({"k": "a"}),
                 blocking: false,
+                on_result: false,
             },
         );
         sources.insert(
@@ -1040,6 +1200,7 @@ mod tests {
                 source: "signer".to_string(),
                 config: serde_json::json!({"k": "b"}),
                 blocking: false,
+                on_result: false,
             },
         );
         let (plugin, handle) = fake_plugin("signer", FakeMode::EchoSeq);

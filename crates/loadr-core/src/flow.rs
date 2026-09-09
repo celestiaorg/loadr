@@ -1456,7 +1456,22 @@ impl FlowRunner {
             vu.metrics.rate(&self.builtins.http_req_failed, true, &tags);
         }
 
-        // 6. afterRequest hook.
+        // 6. Feed the result back to plugins that generated rows for it.
+        // Before the hook: a row an `afterRequest` hook pulls belongs to no
+        // request, and must not be reported against this one.
+        if vu.data_state.has_pending() {
+            let id = crate::data::RowIdentity {
+                vu: vu.vu_id,
+                iteration: vu.iteration.saturating_sub(1),
+                scenario: &vu.scenario,
+                request: Some(&prepared.name),
+            };
+            vu.run
+                .data
+                .report_result(&mut vu.data_state, &id, &response);
+        }
+
+        // 7. afterRequest hook.
         if let Some(vu_script) = script.as_mut() {
             if vu_script.has_function("afterRequest") {
                 let res_json = response_to_json(&response);
@@ -1469,7 +1484,7 @@ impl FlowRunner {
             }
         }
 
-        // 7. Assertions (mark failed + flow control) and checks (record only).
+        // 8. Assertions (mark failed + flow control) and checks (record only).
         // A failed chain check may already have requested abort; start there.
         let mut flow = chain_flow;
         let mut assert_failed = false;
@@ -1803,8 +1818,10 @@ impl FlowRunner {
                 .as_ref()
                 .is_some_and(|s| s.has_function("afterRequest"));
             let has_protobuf_checks = req.grpc_protobuf_checks.is_some();
-            let discard_response_body =
-                !req.reads_response_body && !has_protobuf_checks && !has_after_request;
+            let discard_response_body = !req.reads_response_body
+                && !has_protobuf_checks
+                && !has_after_request
+                && !vu.run.data.has_result_sinks();
             // Skip decode when nothing in the plan reads the body and no
             // `afterRequest` hook can see it either (`has_function` is an
             // O(1) HashSet lookup — no extra caching machinery needed).

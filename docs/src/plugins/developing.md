@@ -358,6 +358,7 @@ loadr_plugin_api::export_loadr_plugin! {
         make_protocol: RNone,
         make_service: RNone,
         make_data_source: RSome(make_data_source),
+        make_result_sink: RNone,
     }
 }
 ```
@@ -378,6 +379,50 @@ Key facts that shape the design:
 - The manifest may declare `capabilities = ["data_source"]` under
   `[plugin]` — informational only. The host's authoritative check is
   whether `make_data_source` is present in the loaded module.
+
+### Reacting to request results
+
+A data source can also see what the server did with the rows it produced.
+Implement `FfiResultSink` and export it via `make_result_sink`; the user opts
+in per source with `data.<name>.on_result: true`.
+
+```rust
+use loadr_plugin_api::abi::{FfiResultSink, FfiResultSinkBox, FfiResultSink_TO};
+
+struct MySink;
+
+impl FfiResultSink for MySink {
+    /// Called concurrently, after the response.
+    fn on_result(&self, result_json: RString) {
+        // {"source","vu","iteration","seq","scenario","request"?,
+        //  "row": {...}, "response": {"status","body","headers",...}}
+    }
+}
+
+extern "C" fn make_result_sink() -> FfiResultSinkBox {
+    FfiResultSink_TO::from_value(MySink, abi_stable::erased_types::TD_Opaque)
+}
+```
+
+`make_result_sink` is a suffix field like `make_data_source`: a plugin
+compiled before it existed still loads, and the accessor returns `RNone`.
+(abi_stable's layout check rejects a library declaring fewer fields than the
+host, so the loader retries without that check and falls back on the
+`abi_version` integer — the same contract it always enforced.)
+
+The row is echoed back in the payload, so the sink usually needs no
+pending-request bookkeeping — read what you generated straight off
+`result_json`. The two objects are constructed by separate `extern "C"`
+calls, so shared state goes in a `OnceLock` inside the dylib;
+`plugins/examples/native-nonce-feeder` shows the pattern with sharded
+per-account nonces that only advance when the submission succeeded.
+
+The sink runs before the `afterRequest` hook, so a row the hook pulls is never
+misreported as belonging to the finished request.
+
+Results are best-effort by design: `on_result` returns nothing and a request
+cancelled mid-flight reports nothing at all. A plugin must tolerate a row whose
+result never arrives, and must not panic — it runs on a VU worker thread.
 
 ### Init / row JSON contracts
 

@@ -559,3 +559,138 @@ fn data_source_adapter_perf_smoke() {
         rows as f64 / elapsed
     );
 }
+
+fn nonce_feeder_so() -> std::path::PathBuf {
+    common::build_native_example(
+        "loadr-plugin-example-native-nonce-feeder",
+        "native_nonce_feeder",
+    )
+}
+
+fn nonce_ctx(vu: u64, seq: u64) -> PluginRowCtx<'static> {
+    PluginRowCtx {
+        source: "nonces",
+        vu,
+        iteration: 0,
+        seq,
+        scenario: "submit",
+        request: Some("submit tx"),
+        ts_ms: 1_700_000_000_000,
+    }
+}
+
+fn nonce_result(row: &loadr_core::data::Row, status: i64) -> String {
+    serde_json::json!({
+        "source": "nonces",
+        "vu": 1,
+        "iteration": 0,
+        "seq": 0,
+        "scenario": "submit",
+        "request": "submit tx",
+        "row": row,
+        "response": {"status": status, "error": serde_json::Value::Null},
+    })
+    .to_string()
+}
+
+fn load_nonce_feeder() -> loadr_plugin_api::NativeDataSourceAdapter {
+    let plugin = NativePlugin::load(&nonce_feeder_so()).expect("load nonce feeder");
+    let mut adapter = plugin
+        .make_data_source(serde_json::json!({"shards": 4, "accounts": 1}))
+        .expect("plugin provides data_source capability");
+    let mut sources = IndexMap::new();
+    sources.insert("nonces".to_string(), serde_json::Value::Null);
+    adapter.init(&sources).expect("init");
+    adapter
+}
+
+#[test]
+fn result_sink_advances_nonce_only_on_success() {
+    let adapter = load_nonce_feeder();
+    assert!(
+        adapter.has_result_sink(),
+        "the feeder exports make_result_sink"
+    );
+
+    let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
+        PluginRowResult::Row(row) => row,
+        PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+    };
+    assert_eq!(row.get("nonce").map(String::as_str), Some("0"));
+
+    // A failed request leaves the nonce where it was.
+    adapter.on_result(nonce_result(&row, 500));
+    let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
+        PluginRowResult::Row(row) => row,
+        PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+    };
+    assert_eq!(row.get("nonce").map(String::as_str), Some("0"));
+
+    // A successful one advances it.
+    adapter.on_result(nonce_result(&row, 200));
+    let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
+        PluginRowResult::Row(row) => row,
+        PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+    };
+    assert_eq!(row.get("nonce").map(String::as_str), Some("1"));
+}
+
+#[test]
+fn plugin_without_result_sink_reports_none() {
+    let plugin = NativePlugin::load(&data_source_so()).expect("load data source plugin");
+    let adapter = plugin
+        .make_data_source(serde_json::json!({"seed": 1}))
+        .expect("plugin provides data_source capability");
+    assert!(
+        !adapter.has_result_sink(),
+        "tx-signer exports no make_result_sink"
+    );
+    // Still safe to call: it must be a no-op, not a panic.
+    adapter.on_result("{}".to_string());
+}
+
+/// Binary compatibility with a plugin compiled before `make_result_sink`
+/// existed. `LOADR_OLD_PLUGIN_SO` points at such a library (build the
+/// `native-data-source` example from a pre-`result_sink` checkout); the test
+/// is skipped when it is unset.
+#[test]
+fn old_plugin_binary_still_loads_and_resolves() {
+    let Ok(path) = std::env::var("LOADR_OLD_PLUGIN_SO") else {
+        return;
+    };
+    let plugin = NativePlugin::load(std::path::Path::new(&path)).expect("old plugin loads");
+
+    // Prefix fields present in both versions resolve to the right addresses.
+    assert_eq!(plugin.info().name, "tx-signer");
+    assert_eq!(plugin.info().kind, "service");
+
+    let mut adapter = plugin
+        .make_data_source(serde_json::json!({"seed": 42}))
+        .expect("old plugin still provides data_source");
+    // The suffix field it predates reads as absent, not as garbage.
+    assert!(!adapter.has_result_sink());
+
+    let mut sources = IndexMap::new();
+    sources.insert(
+        "signed_tx".to_string(),
+        serde_json::json!({"chain_id": "testnet-1"}),
+    );
+    adapter.init(&sources).expect("init");
+    let ctx = PluginRowCtx {
+        source: "signed_tx",
+        vu: 3,
+        iteration: 0,
+        seq: 5,
+        scenario: "submit",
+        request: Some("submit tx"),
+        ts_ms: 1_700_000_000_000,
+    };
+    let row = match adapter.next_row(&ctx).expect("next_row") {
+        PluginRowResult::Row(row) => row,
+        PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+    };
+    // Same value the current-tree build produces: the call landed on the
+    // real `next_row`, not a shifted vtable slot.
+    assert_eq!(row.get("nonce").map(String::as_str), Some("3:5"));
+    assert!(row.contains_key("tx_b64"));
+}

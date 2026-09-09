@@ -26,7 +26,7 @@ use loadr_core::{
 };
 
 use crate::abi::{
-    FfiDataSourceBox, FfiOutputBox, FfiProtocolBox, FfiServiceBox, PluginModRef,
+    FfiDataSourceBox, FfiOutputBox, FfiProtocolBox, FfiResultSinkBox, FfiServiceBox, PluginModRef,
     LOADR_PLUGIN_ABI_VERSION,
 };
 use crate::error::PluginError;
@@ -98,13 +98,22 @@ impl NativePlugin {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        let module: PluginModRef =
-            header
-                .init_root_module::<PluginModRef>()
-                .map_err(|e| PluginError::Load {
-                    path: path.display().to_string(),
-                    message: e.to_string(),
-                })?;
+        // A plugin built before a suffix field was added declares fewer
+        // fields than this host, and abi_stable's layout check rejects that
+        // outright even though prefix types handle it at runtime (the
+        // accessor for a field the plugin lacks returns `RNone`). Retry
+        // without the layout check; `abi_version` below is the contract.
+        let module: PluginModRef = match header.init_root_module::<PluginModRef>() {
+            Ok(module) => module,
+            Err(strict) => {
+                unsafe { header.init_root_module_with_unchecked_layout() }.map_err(|e| {
+                    PluginError::Load {
+                        path: path.display().to_string(),
+                        message: format!("{strict}; unchecked retry also failed: {e}"),
+                    }
+                })?
+            }
+        };
         let version = module.abi_version();
         if version != LOADR_PLUGIN_ABI_VERSION {
             return Err(PluginError::AbiVersion {
@@ -177,9 +186,16 @@ impl NativePlugin {
     }
 
     /// Instantiate the plugin's `data_source` capability, if it provides one.
+    /// Its `result_sink`, when present, comes along on the same adapter.
     pub fn make_data_source(&self, config: serde_json::Value) -> Option<NativeDataSourceAdapter> {
         match self.module.make_data_source() {
-            ROption::RSome(ctor) => Some(NativeDataSourceAdapter::new(ctor(), config)),
+            ROption::RSome(ctor) => {
+                let sink = match self.module.make_result_sink() {
+                    ROption::RSome(sink_ctor) => Some(sink_ctor()),
+                    ROption::RNone => None,
+                };
+                Some(NativeDataSourceAdapter::new(ctor(), config, sink))
+            }
             ROption::RNone => None,
         }
     }
@@ -521,6 +537,7 @@ pub struct NativeDataSourceAdapter {
     name: String,
     config: serde_json::Value,
     inner: FfiDataSourceBox,
+    sink: Option<FfiResultSinkBox>,
 }
 
 impl std::fmt::Debug for NativeDataSourceAdapter {
@@ -532,12 +549,17 @@ impl std::fmt::Debug for NativeDataSourceAdapter {
 }
 
 impl NativeDataSourceAdapter {
-    fn new(inner: FfiDataSourceBox, config: serde_json::Value) -> Self {
+    fn new(
+        inner: FfiDataSourceBox,
+        config: serde_json::Value,
+        sink: Option<FfiResultSinkBox>,
+    ) -> Self {
         let name = inner.name().into_string();
         NativeDataSourceAdapter {
             name,
             config,
             inner,
+            sink,
         }
     }
 }
@@ -589,6 +611,16 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
             .map(|(k, v)| (k.clone(), loadr_core::vu::json_to_string(v)))
             .collect();
         Ok(PluginRowResult::Row(row))
+    }
+
+    fn has_result_sink(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    fn on_result(&self, result_json: String) {
+        if let Some(sink) = &self.sink {
+            sink.on_result(RString::from(result_json));
+        }
     }
 }
 
