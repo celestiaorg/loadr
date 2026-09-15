@@ -82,20 +82,28 @@ pub trait FfiDataSource: Send + Sync {
     /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
     /// Returns `{"row": {"col": <scalar>, ...}}` or `{"exhausted": true}`.
     fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
-}
 
-/// Receives the full result of every request that used a row from this
-/// plugin's data source. `result_json`:
-/// `{"source","vu","iteration","seq","scenario","request"?,"row",
-///   "response":{"status","status_text","body","headers","duration_ms",
-///   "error","url","protocol"}}`.
-///
-/// Opt-in per source via `data.<name>.on_result: true`. Called concurrently
-/// from VU threads, after the response; never called for a request that was
-/// cancelled mid-flight.
-#[sabi_trait]
-pub trait FfiResultSink: Send + Sync {
-    fn on_result(&self, result_json: RString);
+    // Methods below were added after the first release. Each must keep its
+    // default body and new ones go after them: a plugin built before a
+    // method existed has no vtable slot for it, and abi_stable runs the
+    // default instead.
+
+    /// The full result of a request that used a row from this source, if
+    /// `wants_results` returned `true`. `result_json`:
+    /// `{"source","vu","iteration","seq","scenario","request"?,"row",
+    ///   "response":{"status","status_text","body","headers","duration_ms",
+    ///   "error","url","protocol"}}`.
+    ///
+    /// Called concurrently from VU threads, after the response; never called
+    /// for a request that was cancelled mid-flight.
+    fn on_result(&self, _result_json: RString) {}
+
+    /// Whether the host should call `on_result`. Asked once, after `init`.
+    /// Return `true` only if `on_result` is overridden: reporting serialises
+    /// every response (body included), which is wasted work otherwise.
+    fn wants_results(&self) -> bool {
+        false
+    }
 }
 
 /// Boxed trait objects as they cross the FFI boundary.
@@ -103,7 +111,6 @@ pub type FfiOutputBox = FfiOutput_TO<'static, RBox<()>>;
 pub type FfiProtocolBox = FfiProtocol_TO<'static, RBox<()>>;
 pub type FfiServiceBox = FfiService_TO<'static, RBox<()>>;
 pub type FfiDataSourceBox = FfiDataSource_TO<'static, RBox<()>>;
-pub type FfiResultSinkBox = FfiResultSink_TO<'static, RBox<()>>;
 
 /// The root module every native loadr plugin exports.
 ///
@@ -128,9 +135,6 @@ pub struct PluginMod {
     /// so `NativePlugin::load` retries without it (see the comment there).
     #[sabi(missing_field(default))]
     pub make_data_source: ROption<extern "C" fn() -> FfiDataSourceBox>,
-    /// Suffix field, same rules as `make_data_source`.
-    #[sabi(missing_field(default))]
-    pub make_result_sink: ROption<extern "C" fn() -> FfiResultSinkBox>,
 }
 
 impl RootModule for PluginModRef {
@@ -157,7 +161,6 @@ impl RootModule for PluginModRef {
 ///         make_protocol: RNone,
 ///         make_service: RNone,
 ///         make_data_source: RNone,
-///         make_result_sink: RNone,
 ///     }
 /// }
 /// ```

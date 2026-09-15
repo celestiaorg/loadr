@@ -2023,12 +2023,6 @@ pub enum DataSource {
         /// generator should not pay.
         #[serde(default, skip_serializing_if = "is_false")]
         blocking: bool,
-        /// Hand every request result that used a row from this source back to
-        /// the plugin's `result_sink`. Off by default: the response is
-        /// serialised per request, which a plugin that ignores it shouldn't
-        /// pay for.
-        #[serde(default, skip_serializing_if = "is_false")]
-        on_result: bool,
     },
 }
 

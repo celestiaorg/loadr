@@ -1,5 +1,5 @@
-//! Flow-level coverage for `data.<name>.on_result`: a plugin that provides a
-//! result sink sees the outcome of every request that used one of its rows,
+//! Flow-level coverage for `DataSourcePlugin::on_result`: a plugin that wants
+//! results sees the outcome of every request that used one of its rows,
 //! and sees it only for requests that actually completed.
 //!
 //! Driven through the real engine with a mock protocol handler and an
@@ -43,7 +43,7 @@ impl ProtocolHandler for StatusHandler {
 #[derive(Default)]
 struct RecordingPlugin {
     counter: AtomicU64,
-    sink: bool,
+    wants: bool,
     results: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
 }
 
@@ -66,8 +66,8 @@ impl DataSourcePlugin for RecordingPlugin {
         Ok(PluginRowResult::Row(row))
     }
 
-    fn has_result_sink(&self) -> bool {
-        self.sink
+    fn wants_results(&self) -> bool {
+        self.wants
     }
 
     fn on_result(&self, result_json: String) {
@@ -77,8 +77,8 @@ impl DataSourcePlugin for RecordingPlugin {
     }
 }
 
-async fn run(yaml: &str, sink: bool, status: i64) -> Vec<serde_json::Value> {
-    let loaded = loadr_config::load_str(yaml, &loadr_config::LoadOptions::new()).expect("parse");
+async fn run(wants: bool, status: i64) -> Vec<serde_json::Value> {
+    let loaded = loadr_config::load_str(PLAN, &loadr_config::LoadOptions::new()).expect("parse");
     let mut protocols = ProtocolRegistry::new();
     protocols.register(Arc::new(StatusHandler { status }));
     let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -87,7 +87,7 @@ async fn run(yaml: &str, sink: bool, status: i64) -> Vec<serde_json::Value> {
         "feeder".to_string(),
         Box::new(RecordingPlugin {
             counter: AtomicU64::new(0),
-            sink,
+            wants,
             results: results.clone(),
         }),
     );
@@ -106,9 +106,7 @@ async fn run(yaml: &str, sink: bool, status: i64) -> Vec<serde_json::Value> {
     out
 }
 
-fn plan(on_result: bool) -> String {
-    format!(
-        r#"
+const PLAN: &str = r#"
 plugins:
   - name: feeder
     path: ./libfeeder.so
@@ -116,7 +114,6 @@ data:
   rows:
     type: plugin
     source: feeder
-    on_result: {on_result}
 scenarios:
   s:
     executor: per-vu-iterations
@@ -125,14 +122,12 @@ scenarios:
     flow:
       - request:
           name: submit
-          url: "http://example.test/tx?n=${{data.rows.n}}"
-"#
-    )
-}
+          url: "http://example.test/tx?n=${data.rows.n}"
+"#;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn result_sink_receives_one_payload_per_request() {
-    let results = run(&plan(true), true, 200).await;
+async fn on_result_receives_one_payload_per_request() {
+    let results = run(true, 200).await;
     assert_eq!(results.len(), 2, "one result per request");
 
     let first = &results[0];
@@ -148,8 +143,8 @@ async fn result_sink_receives_one_payload_per_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn result_sink_sees_failed_requests_too() {
-    let results = run(&plan(true), true, 500).await;
+async fn on_result_sees_failed_requests_too() {
+    let results = run(true, 500).await;
     assert_eq!(results.len(), 2);
     // The status is reported as-is; deciding what counts as success is the
     // plugin's job, not the engine's.
@@ -157,16 +152,7 @@ async fn result_sink_sees_failed_requests_too() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn no_payloads_without_on_result() {
-    let results = run(&plan(false), true, 200).await;
-    assert!(results.is_empty(), "on_result is opt-in");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn no_payloads_when_plugin_has_no_sink() {
-    let results = run(&plan(true), false, 200).await;
-    assert!(
-        results.is_empty(),
-        "on_result is ignored when the plugin provides no sink"
-    );
+async fn no_payloads_unless_plugin_wants_results() {
+    let results = run(false, 200).await;
+    assert!(results.is_empty(), "reporting is opt-in by the plugin");
 }

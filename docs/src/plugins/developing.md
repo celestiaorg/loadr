@@ -358,7 +358,6 @@ loadr_plugin_api::export_loadr_plugin! {
         make_protocol: RNone,
         make_service: RNone,
         make_data_source: RSome(make_data_source),
-        make_result_sink: RNone,
     }
 }
 ```
@@ -383,41 +382,45 @@ Key facts that shape the design:
 ### Reacting to request results
 
 A data source can also see what the server did with the rows it produced.
-Implement `FfiResultSink` and export it via `make_result_sink`; the user opts
-in per source with `data.<name>.on_result: true`.
+Override `FfiDataSource::on_result`, and return `true` from `wants_results` so
+the host calls it:
 
 ```rust
-use loadr_plugin_api::abi::{FfiResultSink, FfiResultSinkBox, FfiResultSink_TO};
+impl FfiDataSource for MySource {
+    // name / init / next_row as above
 
-struct MySink;
-
-impl FfiResultSink for MySink {
     /// Called concurrently, after the response.
     fn on_result(&self, result_json: RString) {
         // {"source","vu","iteration","seq","scenario","request"?,
         //  "row": {...}, "response": {"status","body","headers",...}}
     }
-}
 
-extern "C" fn make_result_sink() -> FfiResultSinkBox {
-    FfiResultSink_TO::from_value(MySink, abi_stable::erased_types::TD_Opaque)
+    fn wants_results(&self) -> bool {
+        true
+    }
 }
 ```
 
-`make_result_sink` is a suffix field like `make_data_source`: a plugin
-compiled before it existed still loads, and the accessor returns `RNone`.
-(abi_stable's layout check rejects a library declaring fewer fields than the
-host, so the loader retries without that check and falls back on the
-`abi_version` integer — the same contract it always enforced.)
+The host asks `wants_results` once, after `init`, and only then records rows
+and serialises responses for this plugin — so a data source that doesn't
+override it pays nothing per request. Return `true` only when you override
+`on_result`.
 
-The row is echoed back in the payload, so the sink usually needs no
+Both methods have default bodies (`false` and a no-op), so a data source that
+doesn't care about results needs no change. They sit at the end of the trait
+for a reason: a plugin compiled before they existed has no vtable slots for
+them, and abi_stable runs the defaults instead. (abi_stable's layout check
+rejects a library declaring fewer methods than the host, so the loader retries
+without that check and falls back on the `abi_version` integer — the same
+contract it always enforced.)
+
+The row is echoed back in the payload, so a source usually needs no
 pending-request bookkeeping — read what you generated straight off
-`result_json`. The two objects are constructed by separate `extern "C"`
-calls, so shared state goes in a `OnceLock` inside the dylib;
-`plugins/examples/native-nonce-feeder` shows the pattern with sharded
-per-account nonces that only advance when the submission succeeded.
+`result_json`. State that `next_row` and `on_result` share lives on the data
+source itself; `plugins/examples/native-nonce-feeder` shows the pattern with
+sharded per-account nonces that only advance when the submission succeeded.
 
-The sink runs before the `afterRequest` hook, so a row the hook pulls is never
+`on_result` runs before the `afterRequest` hook, so a row the hook pulls is never
 misreported as belonging to the finished request.
 
 Results are best-effort by design: `on_result` returns nothing and a request

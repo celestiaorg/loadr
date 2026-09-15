@@ -90,7 +90,7 @@ scenarios:
 ```
 
 The config surface is exactly `{ type: plugin, source: <plugin>, config:
-<object>, blocking: <bool>, on_result: <bool> }`. **`mode`, `on_eof` and `pick` do not apply**
+<object>, blocking: <bool> }`. **`mode`, `on_eof` and `pick` do not apply**
 and are ignored if present — those describe iterating over a stored set of
 rows, which doesn't exist here; a plugin generates every row fresh, per call.
 
@@ -102,11 +102,12 @@ delay timers and unrelated VUs, degrading the load shape itself. Leave it
 off (the default) for cheap in-memory generation: the bracket has a fixed
 per-call cost that a microsecond feeder should not pay.
 
-**`on_result: true`** hands the full result of every request that used a row
-from this source back to the plugin, so a feeder can react to what the server
-said. The plugin must provide the `result_sink` capability; if it doesn't, the
-flag is ignored with a warning. Off by default — the response is serialised
-per request, which a plugin that ignores it shouldn't pay for.
+**Request results.** A plugin can ask for the full result of every request
+that used one of its rows, so a feeder can react to what the server said. There
+is nothing to configure: the plugin opts in itself (see
+[Developing plugins](../plugins/developing.md#reacting-to-request-results)),
+and a plugin that doesn't costs nothing — responses are only serialised for
+plugins that asked.
 
 The plugin receives one JSON payload per row the request used:
 
@@ -133,8 +134,8 @@ a source that reports results on requests with large responses pays that per
 request; and a gRPC streaming request that pulled N frames' worth of rows sends
 N payloads, each carrying the same response.
 
-`blocking: true` covers `on_result` as well as `next_row`. Leave it off for a
-sink that just updates memory; turn it on if the sink does I/O, so a slow call
+`blocking: true` covers `on_result` as well as `next_row`. Leave it off for an
+`on_result` that just updates memory; turn it on if it does I/O, so a slow call
 can't stall the other VUs sharing its runtime thread. Either way the call runs
 inside the VU's own iteration, so its latency counts against that VU.
 

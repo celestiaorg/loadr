@@ -6,12 +6,10 @@
 //! are spread over N shards; each shard has its own lock, so VUs touching
 //! different shards never contend.
 //!
-//! Rows look like `{"account": "acct-3", "nonce": "17"}`. The result sink
-//! reads the row back off the payload, so no pending-request bookkeeping is
-//! needed.
+//! Rows look like `{"account": "acct-3", "nonce": "17"}`. `on_result` reads
+//! the row back off the payload, so no pending-request bookkeeping is needed.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
@@ -22,8 +20,7 @@ use abi_stable::std_types::{
     RString,
 };
 use loadr_plugin_api::abi::{
-    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, FfiResultSink, FfiResultSinkBox,
-    FfiResultSink_TO, PluginMod, LOADR_PLUGIN_ABI_VERSION,
+    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, PluginMod, LOADR_PLUGIN_ABI_VERSION,
 };
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -82,13 +79,6 @@ impl NonceMap {
     }
 }
 
-/// Both capabilities are separate trait objects, so they share one instance.
-static STATE: OnceLock<NonceMap> = OnceLock::new();
-
-fn state() -> &'static NonceMap {
-    STATE.get_or_init(|| NonceMap::new(DEFAULT_SHARDS, DEFAULT_ACCOUNTS))
-}
-
 #[derive(Deserialize)]
 struct InitPayload {
     plugin_config: serde_json::Value,
@@ -112,7 +102,9 @@ struct Response {
     error: Option<String>,
 }
 
-struct Feeder;
+struct Feeder {
+    nonces: NonceMap,
+}
 
 impl FfiDataSource for Feeder {
     fn name(&self) -> RString {
@@ -134,9 +126,7 @@ impl FfiDataSource for Feeder {
             .get("accounts")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_ACCOUNTS);
-        // First writer wins; a second `init` (one plugin backing several
-        // sources) keeps the map that is already handing out nonces.
-        let _ = STATE.set(NonceMap::new(shards, accounts));
+        self.nonces = NonceMap::new(shards, accounts);
         ROk(())
     }
 
@@ -145,17 +135,12 @@ impl FfiDataSource for Feeder {
             Ok(c) => c,
             Err(e) => return RErr(RString::from(format!("invalid row context JSON: {e}"))),
         };
-        let map = state();
-        let account = map.account_for(ctx.vu);
-        let nonce = map.peek(&account);
+        let account = self.nonces.account_for(ctx.vu);
+        let nonce = self.nonces.peek(&account);
         let row = serde_json::json!({"row": {"account": account, "nonce": nonce.to_string()}});
         ROk(RString::from(row.to_string()))
     }
-}
 
-struct Sink;
-
-impl FfiResultSink for Sink {
     fn on_result(&self, result_json: RString) {
         let Ok(payload) = serde_json::from_str::<ResultPayload>(result_json.as_str()) else {
             return;
@@ -165,8 +150,12 @@ impl FfiResultSink for Sink {
         };
         let ok = payload.response.error.is_none() && (200..300).contains(&payload.response.status);
         if ok {
-            state().advance(account);
+            self.nonces.advance(account);
         }
+    }
+
+    fn wants_results(&self) -> bool {
+        true
     }
 }
 
@@ -183,11 +172,10 @@ extern "C" fn plugin_info() -> RString {
 }
 
 extern "C" fn make_data_source() -> FfiDataSourceBox {
-    FfiDataSource_TO::from_value(Feeder, abi_stable::erased_types::TD_Opaque)
-}
-
-extern "C" fn make_result_sink() -> FfiResultSinkBox {
-    FfiResultSink_TO::from_value(Sink, abi_stable::erased_types::TD_Opaque)
+    let feeder = Feeder {
+        nonces: NonceMap::new(DEFAULT_SHARDS, DEFAULT_ACCOUNTS),
+    };
+    FfiDataSource_TO::from_value(feeder, abi_stable::erased_types::TD_Opaque)
 }
 
 loadr_plugin_api::export_loadr_plugin! {
@@ -198,6 +186,5 @@ loadr_plugin_api::export_loadr_plugin! {
         make_protocol: RNone,
         make_service: RNone,
         make_data_source: RSome(make_data_source),
-        make_result_sink: RSome(make_result_sink),
     }
 }

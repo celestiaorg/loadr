@@ -515,7 +515,6 @@ mod tests {
                 source: "signer".to_string(),
                 config: serde_json::Value::Null,
                 blocking: false,
-                on_result: false,
             },
         );
         let mut plugins: HashMap<String, Box<dyn crate::data::DataSourcePlugin>> = HashMap::new();

@@ -1821,7 +1821,7 @@ impl FlowRunner {
             let discard_response_body = !req.reads_response_body
                 && !has_protobuf_checks
                 && !has_after_request
-                && !vu.run.data.has_result_sinks();
+                && !vu.run.data.reports_results();
             // Skip decode when nothing in the plan reads the body and no
             // `afterRequest` hook can see it either (`has_function` is an
             // O(1) HashSet lookup — no extra caching machinery needed).

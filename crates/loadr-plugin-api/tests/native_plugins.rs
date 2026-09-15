@@ -605,11 +605,11 @@ fn load_nonce_feeder() -> loadr_plugin_api::NativeDataSourceAdapter {
 }
 
 #[test]
-fn result_sink_advances_nonce_only_on_success() {
+fn on_result_advances_nonce_only_on_success() {
     let adapter = load_nonce_feeder();
     assert!(
-        adapter.has_result_sink(),
-        "the feeder exports make_result_sink"
+        adapter.wants_results(),
+        "the feeder overrides wants_results"
     );
 
     let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
@@ -636,23 +636,21 @@ fn result_sink_advances_nonce_only_on_success() {
 }
 
 #[test]
-fn plugin_without_result_sink_reports_none() {
+fn plugin_without_on_result_uses_the_default() {
     let plugin = NativePlugin::load(&data_source_so()).expect("load data source plugin");
     let adapter = plugin
         .make_data_source(serde_json::json!({"seed": 1}))
         .expect("plugin provides data_source capability");
-    assert!(
-        !adapter.has_result_sink(),
-        "tx-signer exports no make_result_sink"
-    );
-    // Still safe to call: it must be a no-op, not a panic.
+    // tx-signer overrides neither method: the host must not report to it, and
+    // a stray call must be a no-op, not a panic.
+    assert!(!adapter.wants_results());
     adapter.on_result("{}".to_string());
 }
 
-/// Binary compatibility with a plugin compiled before `make_result_sink`
-/// existed. `LOADR_OLD_PLUGIN_SO` points at such a library (build the
-/// `native-data-source` example from a pre-`result_sink` checkout); the test
-/// is skipped when it is unset.
+/// Binary compatibility with a plugin compiled before `FfiDataSource::on_result`
+/// and `wants_results` existed. `LOADR_OLD_PLUGIN_SO` points at such a library
+/// (build the `native-data-source` example from a pre-`on_result` checkout);
+/// the test is skipped when it is unset.
 #[test]
 fn old_plugin_binary_still_loads_and_resolves() {
     let Ok(path) = std::env::var("LOADR_OLD_PLUGIN_SO") else {
@@ -667,8 +665,10 @@ fn old_plugin_binary_still_loads_and_resolves() {
     let mut adapter = plugin
         .make_data_source(serde_json::json!({"seed": 42}))
         .expect("old plugin still provides data_source");
-    // The suffix field it predates reads as absent, not as garbage.
-    assert!(!adapter.has_result_sink());
+    // Its vtable has no slot for either method: both calls must fall back to
+    // the trait's defaults, not jump past the end of the vtable.
+    assert!(!adapter.wants_results());
+    adapter.on_result("{}".to_string());
 
     let mut sources = IndexMap::new();
     sources.insert(

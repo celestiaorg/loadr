@@ -1,7 +1,7 @@
 # A data source that reacts to what the server said.
 #
-# `on_result: true` hands the full response of every request that used a row
-# from this source back to the plugin. Here the plugin keeps a per-account
+# The plugin asks for the full response of every request that used one of its
+# rows (it overrides `wants_results`), so no extra config is needed here. It keeps a per-account
 # transaction nonce and advances it only when the submission succeeded — a
 # rejected transaction does not consume a nonce, so the next attempt for that
 # account reuses it.
@@ -22,8 +22,6 @@ data:
   nonces:
     type: plugin
     source: nonce-feeder
-    # Send every request result back to the plugin's result_sink.
-    on_result: true
 
 scenarios:
   submit:

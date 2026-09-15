@@ -5,7 +5,7 @@ kind = "service"
 type = "native"
 entry = "libnative_nonce_feeder.so"
 description = "Per-account transaction nonces, advanced only when the submission succeeded"
-capabilities = ["data_source", "result_sink"]
+capabilities = ["data_source"]
 
 [config]
 # Number of independently locked shards the account map is split over. VUs

@@ -116,6 +116,5 @@ loadr_plugin_api::export_loadr_plugin! {
         make_protocol: RNone,
         make_service: RNone,
         make_data_source: RNone,
-        make_result_sink: RNone,
     }
 }

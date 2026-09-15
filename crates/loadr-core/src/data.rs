@@ -40,7 +40,7 @@ pub struct PluginRowCtx<'a> {
     pub ts_ms: u64,
 }
 
-/// What a plugin's result sink receives for one row.
+/// What a plugin's `on_result` receives for one row.
 #[derive(serde::Serialize)]
 struct ResultPayload<'a> {
     source: &'a str,
@@ -107,14 +107,17 @@ pub trait DataSourcePlugin: Send + Sync {
 
     fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String>;
 
-    /// Whether this plugin wants request results. Default: no.
-    fn has_result_sink(&self) -> bool {
+    /// Whether this plugin wants `on_result` calls. Asked once, after `init`.
+    /// Default: no — reporting serialises every response, which a plugin
+    /// that ignores results must not pay for.
+    fn wants_results(&self) -> bool {
         false
     }
 
-    /// Full result of a request that used one of this plugin's rows. Taken
-    /// by value so the FFI hand-off is a move, not a copy. Errors are the
-    /// plugin's problem: a load test must not fail on feedback.
+    /// Full result of a request that used one of this plugin's rows, if
+    /// `wants_results` said yes. Taken by value so the FFI hand-off is a
+    /// move, not a copy. Errors are the plugin's problem: a load test must not
+    /// fail on feedback.
     fn on_result(&self, _result_json: String) {}
 }
 
@@ -176,8 +179,8 @@ pub struct VuFeedState {
     /// Branch-local cache of slots from `plugin_sequences`; steady-state
     /// fetches skip the lock and key allocation.
     local_sequences: HashMap<String, Arc<AtomicU64>>,
-    /// Rows pulled for the request being prepared, from sources with
-    /// `on_result: true`. Drained by `report_result`.
+    /// Rows pulled for the request being prepared, from plugins that want
+    /// results. Drained by `report_result`.
     pending: Vec<PendingRow>,
 }
 
@@ -242,7 +245,7 @@ impl VuFeedState {
 pub struct DataFeeds {
     feeds: HashMap<String, Feed>,
     has_on_demand: bool,
-    has_result_sinks: bool,
+    reports_results: bool,
 }
 
 /// Signalled when a `stop`-mode source is exhausted: the VU should retire.
@@ -295,14 +298,13 @@ impl DataFeeds {
         }
 
         let mut has_on_demand = false;
-        let mut has_result_sinks = false;
+        let mut reports_results = false;
         let mut feeds = HashMap::new();
         for (name, source) in sources {
             let feed = match source {
                 DataSource::Plugin {
                     source: plugin_name,
                     blocking,
-                    on_result,
                     ..
                 } => {
                     has_on_demand = true;
@@ -310,15 +312,8 @@ impl DataFeeds {
                         .get(plugin_name)
                         .expect("initialized above for every referenced plugin")
                         .clone();
-                    if *on_result && !plugin.has_result_sink() {
-                        tracing::warn!(
-                            source = %name,
-                            plugin = %plugin_name,
-                            "`on_result: true` ignored: plugin provides no result_sink"
-                        );
-                    }
-                    let reports = *on_result && plugin.has_result_sink();
-                    has_result_sinks |= reports;
+                    let reports = plugin.wants_results();
+                    reports_results |= reports;
                     Feed::Plugin {
                         plugin,
                         blocking: *blocking,
@@ -456,7 +451,7 @@ impl DataFeeds {
         Ok(DataFeeds {
             feeds,
             has_on_demand,
-            has_result_sinks,
+            reports_results,
         })
     }
 
@@ -508,9 +503,9 @@ impl DataFeeds {
     }
 
     /// Whether any source reports request results back to its plugin. Gates
-    /// response-body decoding, which a sink needs to read.
-    pub fn has_result_sinks(&self) -> bool {
-        self.has_result_sinks
+    /// response-body decoding, which `on_result` needs to read.
+    pub fn reports_results(&self) -> bool {
+        self.reports_results
     }
 
     /// Whether `name` is a plugin-backed (on-demand) source.
@@ -761,7 +756,6 @@ mod tests {
                 source: name,
                 config: serde_json::Value::Null,
                 blocking,
-                on_result: false,
             },
         );
         DataFeeds::load(&sources, Path::new("."), plugins).expect("load")
@@ -1018,7 +1012,6 @@ mod tests {
                 source: plugin_name.to_string(),
                 config: serde_json::Value::Null,
                 blocking: false,
-                on_result: false,
             },
         );
         sources
@@ -1191,7 +1184,6 @@ mod tests {
                 source: "signer".to_string(),
                 config: serde_json::json!({"k": "a"}),
                 blocking: false,
-                on_result: false,
             },
         );
         sources.insert(
@@ -1200,7 +1192,6 @@ mod tests {
                 source: "signer".to_string(),
                 config: serde_json::json!({"k": "b"}),
                 blocking: false,
-                on_result: false,
             },
         );
         let (plugin, handle) = fake_plugin("signer", FakeMode::EchoSeq);
