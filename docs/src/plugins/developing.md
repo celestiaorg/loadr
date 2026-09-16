@@ -214,6 +214,11 @@ Key facts that shape the design:
 The host serializes a `loadr_plugin_api::FfiRequest` to JSON and hands it to
 `execute`; the plugin returns a `FfiResponse` as JSON:
 
+Under native ABI v1, the host caches the serialized plugin-level `config`, so
+it does not clone and traverse that invariant value again for every request.
+The config remains part of each request payload, however, so ABI-v1 plugins
+still parse the request JSON, including `config`, on every `execute` call.
+
 ```jsonc
 // FfiRequest (host -> plugin)
 {
@@ -299,3 +304,188 @@ without any core changes per plugin.
   service up via `examples/harness/docker-compose.yml`.
 - End-to-end, load the built artifact with
   `loadr_plugin_api::NativePlugin::load("target/debug/libmyproto.so")`.
+
+## Native data-source plugins
+
+A **data-source plugin** generates `data.<name>` rows on demand instead of
+reading them from a CSV/JSON file — see [Data parameterization](../yaml/data.md#plugin-backed-on-demand-sources)
+for the `type: plugin` YAML surface. It's the right shape when a row must be
+computed fresh at request time (a signed, time-sensitive payload) rather than
+loaded once from a fixture. `plugins/examples/native-data-source` (`tx-signer`)
+is the reference implementation: it signs a small payload with Ed25519 on
+every call.
+
+### The ABI
+
+A data-source plugin implements `FfiDataSource` and exports it via
+`make_data_source`:
+
+```rust
+use loadr_plugin_api::abi::{
+    FfiDataSource, FfiDataSourceBox, FfiDataSource_TO, PluginMod, LOADR_PLUGIN_ABI_VERSION,
+};
+use abi_stable::std_types::{RString, RResult::{ROk, RErr}, ROption::{RNone, RSome}};
+
+#[derive(Default)]
+struct MySource { /* signing key, per-source config, ... */ }
+
+impl FfiDataSource for MySource {
+    fn name(&self) -> RString { RString::from("my-source") }
+
+    /// Called once before VUs start.
+    fn init(&mut self, init_json: RString) -> RResult<(), RString> {
+        // parse {"plugin_config": ..., "sources": {"<data name>": <config>, ...},
+        //        "vus": ..., "vu_offset": ...}
+        ROk(())
+    }
+
+    /// Called concurrently from VU worker threads, once per request.
+    fn next_row(&self, ctx_json: RString) -> RResult<RString, RString> {
+        // parse {"source","vu","iteration","seq","scenario","request"?,"ts_ms"}
+        // return {"row": {"col": "value", ...}} or {"exhausted": true}
+        ROk(RString::from(r#"{"row":{"col":"value"}}"#))
+    }
+}
+
+extern "C" fn make_data_source() -> FfiDataSourceBox {
+    FfiDataSource_TO::from_value(MySource::default(), abi_stable::erased_types::TD_Opaque)
+}
+
+loadr_plugin_api::export_loadr_plugin! {
+    PluginMod {
+        abi_version: LOADR_PLUGIN_ABI_VERSION,
+        info: plugin_info,
+        make_output: RNone,
+        make_protocol: RNone,
+        make_service: RNone,
+        make_data_source: RSome(make_data_source),
+    }
+}
+```
+
+Key facts that shape the design:
+
+- `next_row` is on the **request hot path** and is called **concurrently**
+  from VU worker threads (`FfiDataSource: Send + Sync`) — every request
+  preparation that references a `type: plugin` source calls it once. Keep it
+  fast: do CPU work inline (an Ed25519 signature at ~25–50µs is fine), but
+  never block on network/disk I/O here.
+- `init` is your one-time setup hook, called once before any VU starts. Load
+  keys and static configuration here — not per `next_row` call.
+- A `kind = "service"` plugin can provide `make_service`, `make_data_source`,
+  or both. A plugin that's data-source-only (like `tx-signer`) sets
+  `make_service: RNone`; the host only errors if a service-kind plugin
+  provides **neither** capability.
+- The manifest may declare `capabilities = ["data_source"]` under
+  `[plugin]` — informational only. The host's authoritative check is
+  whether `make_data_source` is present in the loaded module.
+
+### Reacting to request results
+
+A data source can also see what the server did with the rows it produced.
+Override `FfiDataSource::on_result`, and return `true` from `wants_results` so
+the host calls it:
+
+```rust
+impl FfiDataSource for MySource {
+    // name / init / next_row as above
+
+    /// Called concurrently, after the response.
+    fn on_result(&self, result_json: RString) {
+        // {"source","vu","iteration","seq","scenario","request"?,
+        //  "row": {...}, "response": {"status","body","headers",...}}
+    }
+
+    fn wants_results(&self) -> bool {
+        true
+    }
+}
+```
+
+The host asks `wants_results` once, after `init`, and only then records rows
+and serialises responses for this plugin — so a data source that doesn't
+override it pays nothing per request. Return `true` only when you override
+`on_result`.
+
+Both methods have default bodies (`false` and a no-op), so a data source that
+doesn't care about results needs no change. They sit at the end of the trait
+for a reason: a plugin compiled before they existed has no vtable slots for
+them, and abi_stable runs the defaults instead. (abi_stable's layout check
+rejects a library declaring fewer methods than the host, so the loader skips
+that check when missing trailing fields are the *only* difference. Any other
+layout mismatch still fails the load.)
+
+The row is echoed back in the payload, so a source usually needs no
+pending-request bookkeeping — read what you generated straight off
+`result_json`. State that `next_row` and `on_result` share lives on the data
+source itself; `plugins/examples/native-nonce-feeder` shows the pattern with
+sharded per-account nonces that only advance when the submission succeeded.
+
+`on_result` runs before the `afterRequest` hook, so a row the hook pulls is never
+misreported as belonging to the finished request. The payload's `request` is
+the request's name as `next_row` saw it (unrendered, e.g. `submit ${vars.kind}`),
+so the two can be matched.
+
+Only declarative `request:` steps report results. A row a JS step pulls and
+sends with `http.*` gets no `on_result`, and is dropped when the iteration
+ends.
+
+Results are best-effort by design: `on_result` returns nothing and a request
+cancelled mid-flight reports nothing at all. A plugin must tolerate a row whose
+result never arrives, and must not panic — it runs on a VU worker thread.
+
+### Init / row JSON contracts
+
+```jsonc
+// init_json (host -> plugin, once before VUs start)
+{
+  "plugin_config": { "seed": 42 },              // merged [config] + PluginRef.config
+  "sources": { "signed_tx": { "chain_id": "testnet-1" } }, // one entry per data.<name> backed by this plugin
+  "vus": 250,                                   // most VU ids this instance allocates
+  "vu_offset": 500                              // sum of "vus" over the agents before this one
+}
+
+// ctx_json (host -> plugin, per next_row call)
+{
+  "source": "signed_tx", "vu": 3, "iteration": 0, "seq": 5,
+  "scenario": "submit", "request": "submit tx", "ts_ms": 1700000000000
+}
+
+// row response (plugin -> host)
+{ "row": { "tx_b64": "...", "nonce": "3:5" } }
+// or, when the generator is exhausted (retires the VU, like `on_eof: stop`):
+{ "exhausted": true }
+```
+
+`seq` is a monotonic counter per (VU, source) — combine it with `vu` for
+lock-free uniqueness across VUs with no shared state on your side. `request`
+is the name of the request currently being prepared, or absent when the row
+is fetched outside request preparation (e.g. from a JS step). Row values
+cross as JSON scalars; strings map straight through, and a `bytes` protobuf
+field expects base64 (`prost-reflect` decodes it automatically).
+
+`vu` is local to one instance: in a distributed run every agent numbers its
+VUs from 1. Add `vu_offset` from `init_json` to get an id that is unique across
+the whole fleet, in `vu_offset + 1 ..= vu_offset + vus`. Every agent computes
+the same split from the same plan, so the ranges tile without overlap. `vus`
+counts the most VUs this agent can start (peak for ramping executors, the
+larger of `pre_allocated_vus` and `max_vus` for arrival-rate ones), not the
+number running right now.
+
+A host that predates these fields omits both. If your plugin needs a
+fleet-unique id to be correct, require `vu_offset` so init fails on such a
+host, as `native-nonce-feeder` does: defaulting it to 0 would put every agent's
+VUs on the same ids without any error.
+
+### Testing
+
+- Unit-test `init`/`next_row` by building the JSON payloads above and
+  asserting on the response — no host needed.
+- Load the built artifact with `loadr_plugin_api::NativePlugin::load(...)`
+  and drive it through `make_data_source(config)` — see
+  `crates/loadr-plugin-api/tests/native_plugins.rs` for the reference tests
+  (init/next_row roundtrip, signature verification, exhaustion, concurrent
+  calls from several threads).
+- End-to-end, reference the built artifact from a plan's `plugins:` entry
+  and a `data.<name>: { type: plugin, source: ... }` block, then run it
+  through the real `loadr` binary.

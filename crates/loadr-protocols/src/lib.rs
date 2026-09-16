@@ -11,6 +11,7 @@
 //! - [`GrpcHandler`] — dynamic gRPC from `.proto` files (compiled in-process)
 //!   or server reflection; all four call shapes.
 //! - [`TcpHandler`] / [`UdpHandler`] — raw socket round trips.
+//! - [`NoopHandler`] — zero-I/O success responses for engine self-testing.
 //!
 //! Redis, PostgreSQL and MySQL are no longer built in: each is its own
 //! runtime-loadable native protocol plugin (`loadr plugin install redis` /
@@ -23,8 +24,10 @@
 
 mod graphql;
 mod grpc;
+mod grpc_transport;
 mod http;
 mod net;
+mod noop;
 mod socket;
 mod sse;
 mod tls;
@@ -35,6 +38,7 @@ use std::sync::Arc;
 pub use graphql::GraphqlHandler;
 pub use grpc::GrpcHandler;
 pub use http::{HttpHandler, DEFAULT_USER_AGENT};
+pub use noop::NoopHandler;
 pub use socket::{TcpHandler, UdpHandler};
 pub use sse::SseHandler;
 pub use ws::WsHandler;
@@ -45,7 +49,7 @@ use loadr_core::{ProtocolError, ProtocolRegistry};
 ///
 /// Registers `http` (alias `https`), `graphql` (sharing the HTTP handler's
 /// transport), `ws` (alias `websocket`), `sse` (alias `sses`), `grpc`, `tcp`
-/// and `udp`. TLS client configuration is built once, here, from
+/// `udp` and `noop`. TLS client configuration is built once, here, from
 /// `http_defaults.tls`; `base_dir` resolves relative TLS/proto file paths.
 pub fn builtin_registry(
     http_defaults: &loadr_config::HttpDefaults,
@@ -69,6 +73,7 @@ pub fn builtin_registry(
 
     registry.register(Arc::new(TcpHandler::new()));
     registry.register(Arc::new(UdpHandler::new()));
+    registry.register(Arc::new(NoopHandler::new()));
 
     Ok(registry)
 }
@@ -92,6 +97,7 @@ mod tests {
             "grpc",
             "tcp",
             "udp",
+            "noop",
         ] {
             assert!(registry.get(name).is_some(), "missing handler `{name}`");
         }

@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use loadr_core::{
-    Aggregator, Engine, EngineOptions, Output, ProtocolRegistry, RunHandle, RunStatus, Sample,
-    ScriptEngine, Snapshot, Summary, Tags,
+    Engine, EngineOptions, MetricsDelta, Output, ProtocolRegistry, RunHandle, RunStatus,
+    ScriptEngine, Tags,
 };
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
@@ -22,12 +23,14 @@ use crate::pb;
 use crate::pb::agent_message::Msg as AgentMsg;
 use crate::pb::controller_message::Msg as CtrlMsg;
 use crate::pb::coordination_client::CoordinationClient;
+use crate::uplink::{SessionWriter, Uplink};
 use crate::{now_unix_ms, PROTOCOL_VERSION};
 
-/// Builds a [`ProtocolRegistry`] for one run from the plan's HTTP defaults and
-/// the run's base directory (where data files were materialized).
+/// Builds a [`ProtocolRegistry`] for one run from the parsed test plan (HTTP
+/// defaults, `plugins:` declarations) and the run's base directory (where
+/// data files were materialized).
 pub type ProtocolFactory = Arc<
-    dyn Fn(&loadr_config::HttpDefaults, &std::path::Path) -> Result<ProtocolRegistry, String>
+    dyn Fn(&loadr_config::TestPlan, &std::path::Path) -> Result<ProtocolRegistry, String>
         + Send
         + Sync,
 >;
@@ -40,12 +43,28 @@ pub type ScriptFactory = Arc<
         + Sync,
 >;
 
+/// Builds the plugin-backed data sources for one run from the plan's
+/// `plugins:` declarations and the run's base directory (where data files
+/// were materialized). The returned map is keyed by the plan's `plugins:`
+/// entry name — that is what `data.<name>.source` refers to.
+pub type DataSourceFactory = Arc<
+    dyn Fn(
+            &[loadr_config::PluginRef],
+            &std::path::Path,
+        ) -> Result<HashMap<String, Box<dyn loadr_core::DataSourcePlugin>>, String>
+        + Send
+        + Sync,
+>;
+
 /// Injected runtime dependencies (keeps `loadr-agent` decoupled from the
 /// protocol and JS crates).
 #[derive(Clone)]
 pub struct RunnerDeps {
     pub protocols: ProtocolFactory,
     pub script: Option<ScriptFactory>,
+    /// `None` means this agent build has no data-source plugin support: plans
+    /// that declare `data.*: { type: plugin }` sources fail engine setup.
+    pub data_sources: Option<DataSourceFactory>,
 }
 
 /// TLS settings for the agent → controller channel.
@@ -77,6 +96,34 @@ pub struct AgentConfig {
     pub deps: RunnerDeps,
 }
 
+/// The run currently occupying this agent.
+enum RunPhase {
+    /// Assignment accepted; setup is running on the blocking pool.
+    Preparing {
+        run_id: String,
+        /// Set by a controller stop/kill (or shutdown). Preparation itself
+        /// cannot be interrupted mid-call; the flag makes the preparation
+        /// task discard its engine at the guarded transition instead of
+        /// arming it.
+        cancel: Arc<AtomicBool>,
+        /// A `Start` that raced ahead of readiness (a controller replay).
+        /// Honored the moment the run is armed.
+        pending_start: Option<i64>,
+    },
+    /// Engine built: armed behind the start barrier (`start_tx` is `Some`)
+    /// or already running/finished (`start_tx` taken).
+    Armed(ActiveRun),
+}
+
+impl RunPhase {
+    fn run_id(&self) -> &str {
+        match self {
+            RunPhase::Preparing { run_id, .. } => run_id,
+            RunPhase::Armed(run) => &run.run_id,
+        }
+    }
+}
+
 /// The run currently executing (or armed and waiting for `Start`).
 struct ActiveRun {
     run_id: String,
@@ -84,7 +131,7 @@ struct ActiveRun {
     start_tx: Option<oneshot::Sender<i64>>,
 }
 
-type SharedRun = Arc<Mutex<Option<ActiveRun>>>;
+type SharedRun = Arc<Mutex<Option<RunPhase>>>;
 
 enum SessionEnd {
     Shutdown,
@@ -104,24 +151,16 @@ impl Agent {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let endpoint = build_endpoint(&config)?;
         let current: SharedRun = Arc::new(Mutex::new(None));
-        // The uplink outlives individual connections so run events and metric
-        // batches queued during a reconnect are delivered afterwards.
-        let (uplink_tx, mut uplink_rx) = mpsc::channel::<pb::AgentMessage>(256);
+        // The uplink window outlives individual connections: a message stays in
+        // it until the controller acknowledges it, so whatever a dying session
+        // failed to deliver is replayed over the next one.
+        let uplink = Arc::new(Uplink::new());
         let mut backoff = Duration::from_millis(500);
 
         while !shutdown.is_cancelled() {
             let outcome = match endpoint.connect().await {
                 Ok(channel) => {
-                    run_session(
-                        channel,
-                        &config,
-                        &agent_id,
-                        &current,
-                        &uplink_tx,
-                        &mut uplink_rx,
-                        &shutdown,
-                    )
-                    .await
+                    run_session(channel, &config, &agent_id, &current, &uplink, &shutdown).await
                 }
                 Err(e) => Err(AgentError::Transport(format!("connect failed: {e}"))),
             };
@@ -146,9 +185,15 @@ impl Agent {
             backoff = (backoff * 2).min(Duration::from_secs(15));
         }
 
-        if let Some(run) = current.lock().take() {
-            run.handle.kill("agent shutting down");
+        match current.lock().take() {
+            Some(RunPhase::Preparing { cancel, .. }) => cancel.store(true, Ordering::Relaxed),
+            Some(RunPhase::Armed(run)) => run.handle.kill("agent shutting down"),
+            None => {}
         }
+        // Release any producer parked on a full window. Without this an
+        // embedded agent (tests, a host process that outlives the run) would
+        // leave that task waiting for room nothing will ever free.
+        uplink.close();
         Ok(())
     }
 }
@@ -182,48 +227,88 @@ fn read_file(path: &Path) -> Result<Vec<u8>, AgentError> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Open one session and serve it until the stream ends or shutdown fires.
+///
+/// The uplink window is streamed by a dedicated writer task rather than from
+/// the session loop, so a stalled wire cannot stop the loop from reading the
+/// acknowledgements that free window room.
 async fn run_session(
     channel: Channel,
     config: &AgentConfig,
     agent_id: &str,
     current: &SharedRun,
-    uplink_tx: &mpsc::Sender<pb::AgentMessage>,
-    uplink_rx: &mut mpsc::Receiver<pb::AgentMessage>,
+    uplink: &Arc<Uplink>,
     shutdown: &CancellationToken,
 ) -> Result<SessionEnd, AgentError> {
     let mut client = CoordinationClient::new(channel);
-    let (tx, rx) = mpsc::channel::<pb::AgentMessage>(64);
+    // Shallow on purpose: the uplink window is the buffer, so this only needs
+    // room for the frames in flight plus a heartbeat.
+    let (tx, rx) = mpsc::channel::<pb::AgentMessage>(8);
 
     // Queue Register before opening the stream: the controller only answers
     // the Session call once it has read the registration.
-    let resume_run_id = current
-        .lock()
-        .as_ref()
-        .map(|r| r.run_id.clone())
-        .unwrap_or_default();
-    let register = pb::AgentMessage {
-        msg: Some(AgentMsg::Register(pb::Register {
-            agent_id: agent_id.to_string(),
-            agent_name: config.agent_name.clone(),
-            protocol_version: PROTOCOL_VERSION,
-            loadr_version: env!("CARGO_PKG_VERSION").to_string(),
-            cpu_cores: std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(1),
-            labels: config.labels.clone(),
-            resume_run_id,
-        })),
-    };
-    tx.try_send(register)
+    tx.try_send(register_message(config, agent_id, uplink, current))
         .map_err(|_| AgentError::Transport("could not queue register message".into()))?;
 
-    let mut inbound = client
+    let inbound = client
         .session(ReceiverStream::new(rx))
         .await
         .map_err(|e| AgentError::Transport(format!("session open failed: {e}")))?
         .into_inner();
 
+    let writer = SessionWriter::spawn(uplink.clone(), tx.clone());
+    let outcome = session_loop(inbound, &tx, config, current, uplink, shutdown).await;
+    // Stop the writer before returning: whatever it took from the window but
+    // never got onto the wire is still unacknowledged, so the next session
+    // replays it from the front.
+    writer.stop().await;
+    outcome
+}
+
+fn register_message(
+    config: &AgentConfig,
+    agent_id: &str,
+    uplink: &Uplink,
+    current: &SharedRun,
+) -> pb::AgentMessage {
+    // A run still preparing counts: the controller must know this agent holds
+    // the assignment so it can replay per phase instead of declaring it gone.
+    let resume_run_id = current
+        .lock()
+        .as_ref()
+        .map(|p| p.run_id().to_string())
+        .unwrap_or_default();
+    agent_msg(AgentMsg::Register(pb::Register {
+        agent_id: agent_id.to_string(),
+        agent_name: config.agent_name.clone(),
+        protocol_version: PROTOCOL_VERSION,
+        loadr_version: loadr_core::build_info::VERSION.to_string(),
+        cpu_cores: std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1),
+        labels: config.labels.clone(),
+        resume_run_id,
+        build_revision: loadr_core::build_info::GIT_REVISION.to_string(),
+        incarnation: uplink.incarnation().to_string(),
+    }))
+}
+
+/// Serve one open session.
+///
+/// Every arm here must stay non-blocking apart from `inbound.message()`.
+/// Acknowledgements arrive on `inbound`, so a loop that parks waiting for the
+/// wire or for uplink-window room could never be unparked. Assignments are
+/// only *accepted* here; their setup (file I/O, plugin loading, engine
+/// construction) runs detached on the blocking pool precisely so heartbeats
+/// and acknowledgements keep flowing however long preparation takes.
+async fn session_loop(
+    mut inbound: tonic::Streaming<pb::ControllerMessage>,
+    tx: &mpsc::Sender<pb::AgentMessage>,
+    config: &AgentConfig,
+    current: &SharedRun,
+    uplink: &Arc<Uplink>,
+    shutdown: &CancellationToken,
+) -> Result<SessionEnd, AgentError> {
     let mut registered = false;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -241,18 +326,10 @@ async fn run_session(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
-            msg = uplink_rx.recv() => {
-                if let Some(m) = msg {
-                    if tx.send(m).await.is_err() {
-                        return end(registered);
-                    }
-                }
-            }
             res = inbound.message() => {
                 match res {
                     Ok(Some(cm)) => {
-                        handle_controller_message(cm, config, current, uplink_tx, &mut registered)
-                            .await;
+                        handle_controller_message(cm, config, current, uplink, &mut registered);
                     }
                     Ok(None) => return end(registered),
                     Err(status) => {
@@ -262,19 +339,27 @@ async fn run_session(
                 }
             }
             _ = heartbeat.tick() => {
-                if tx.send(make_heartbeat(current)).await.is_err() {
-                    return end(registered);
+                // A heartbeat describes the moment it is built, so it is never
+                // windowed and never replayed. When the outbound channel is
+                // congested, skip the tick rather than block: the traffic
+                // already in flight refreshes controller liveness anyway.
+                match tx.try_send(make_heartbeat(current)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => return end(registered),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!("outbound stream congested; skipping a heartbeat");
+                    }
                 }
             }
         }
     }
 }
 
-async fn handle_controller_message(
+fn handle_controller_message(
     cm: pb::ControllerMessage,
     config: &AgentConfig,
     current: &SharedRun,
-    uplink_tx: &mpsc::Sender<pb::AgentMessage>,
+    uplink: &Arc<Uplink>,
     registered: &mut bool,
 ) {
     match cm.msg {
@@ -291,70 +376,179 @@ async fn handle_controller_message(
         }
         Some(CtrlMsg::Assignment(a)) => {
             let run_id = a.run_id.clone();
-            if let Err(detail) = handle_assignment(a, config, current, uplink_tx) {
-                tracing::warn!(run_id = %run_id, error = %detail, "assignment failed");
-                let _ = uplink_tx
-                    .send(run_event(&run_id, "failed", detail, Vec::new()))
-                    .await;
+            if let Err(detail) = arm_assignment(a, config, current, uplink) {
+                tracing::warn!(run_id = %run_id, error = %detail, "assignment rejected");
+                // Non-blocking: this runs on the session loop, and the
+                // acknowledgements that would free window room arrive there too.
+                if !uplink.try_enqueue(run_event(&run_id, "prep_failed", detail, Vec::new())) {
+                    tracing::warn!(run_id = %run_id, "uplink window full; rejection dropped");
+                }
             }
         }
         Some(CtrlMsg::Start(s)) => {
             let mut cur = current.lock();
-            if let Some(run) = cur.as_mut() {
-                if run.run_id == s.run_id {
+            match cur.as_mut() {
+                Some(RunPhase::Armed(run)) if run.run_id == s.run_id => {
                     if let Some(start_tx) = run.start_tx.take() {
                         let _ = start_tx.send(s.start_unix_ms);
                     }
                 }
+                Some(RunPhase::Preparing {
+                    run_id,
+                    pending_start,
+                    ..
+                }) if *run_id == s.run_id => {
+                    // A Start ahead of our readiness report is a replay of an
+                    // earlier barrier decision; honor it once armed.
+                    *pending_start = Some(s.start_unix_ms);
+                }
+                _ => {}
             }
         }
         Some(CtrlMsg::Control(c)) => {
-            let handle = current
-                .lock()
-                .as_ref()
-                .filter(|r| r.run_id == c.run_id)
-                .map(|r| r.handle.clone());
-            let Some(handle) = handle else {
-                tracing::debug!(run_id = %c.run_id, "control for unknown run ignored");
-                return;
-            };
-            match c.action.as_str() {
-                "stop" => handle.stop("controller requested stop"),
-                "kill" => handle.kill("controller requested kill"),
-                "pause" => handle.pause(true),
-                "resume" => handle.pause(false),
-                "scale" => {
-                    if let Err(e) = handle.scale(&c.scenario, c.value) {
-                        tracing::warn!(scenario = %c.scenario, error = %e, "scale failed");
+            let stopish = matches!(c.action.as_str(), "stop" | "kill");
+            let handle = {
+                let mut cur = current.lock();
+                enum Action {
+                    CancelPrep,
+                    Disarm,
+                    Drive(RunHandle),
+                    Preparing,
+                    Unknown,
+                }
+                let action = match cur.as_ref() {
+                    Some(RunPhase::Preparing { run_id, cancel, .. }) if *run_id == c.run_id => {
+                        if stopish {
+                            cancel.store(true, Ordering::Relaxed);
+                            Action::CancelPrep
+                        } else {
+                            Action::Preparing
+                        }
+                    }
+                    Some(RunPhase::Armed(run)) if run.run_id == c.run_id => {
+                        if stopish && run.start_tx.is_some() {
+                            Action::Disarm
+                        } else {
+                            Action::Drive(run.handle.clone())
+                        }
+                    }
+                    _ => Action::Unknown,
+                };
+                match action {
+                    Action::CancelPrep => {
+                        // Free the slot now: the controller has settled this
+                        // run and may reassign the agent immediately. The flag
+                        // makes the preparation task discard its engine.
+                        *cur = None;
+                        drop(cur);
+                        enqueue_control_ack(uplink, &c, Ok(()));
+                        return;
+                    }
+                    Action::Disarm => {
+                        // Armed but never started: `RunHandle::stop`/`kill`
+                        // only cancel tokens — `run()` was never called, so
+                        // the parked run task would wait forever for a Start
+                        // that will not come. Dropping `start_tx` wakes it.
+                        let disarmed = cur.take();
+                        drop(cur);
+                        if let Some(RunPhase::Armed(run)) = disarmed {
+                            run.handle.kill("controller requested stop before start");
+                        }
+                        enqueue_control_ack(uplink, &c, Ok(()));
+                        return;
+                    }
+                    Action::Drive(handle) => handle,
+                    Action::Preparing => {
+                        // pause/resume/scale address a running engine; none
+                        // exists yet. Acknowledge truthfully so the control
+                        // barrier reports it rather than timing out.
+                        drop(cur);
+                        enqueue_control_ack(
+                            uplink,
+                            &c,
+                            Err("run is still preparing on this agent".to_string()),
+                        );
+                        return;
+                    }
+                    Action::Unknown => {
+                        drop(cur);
+                        enqueue_control_ack(
+                            uplink,
+                            &c,
+                            Err("run is not active on this agent".to_string()),
+                        );
+                        return;
                     }
                 }
-                other => tracing::warn!(action = other, "unknown control action"),
+            };
+            let result = match c.action.as_str() {
+                "stop" => {
+                    handle.stop("controller requested stop");
+                    Ok(())
+                }
+                "kill" => {
+                    handle.kill("controller requested kill");
+                    Ok(())
+                }
+                "pause" => {
+                    handle.pause(true);
+                    Ok(())
+                }
+                "resume" => {
+                    handle.pause(false);
+                    Ok(())
+                }
+                "scale" => handle.scale(&c.scenario, c.value),
+                other => Err(format!("unknown control action `{other}`")),
+            };
+            if let Err(error) = &result {
+                tracing::warn!(action = %c.action, scenario = %c.scenario, %error, "control failed");
             }
+            enqueue_control_ack(uplink, &c, result);
         }
+        Some(CtrlMsg::UplinkAck(ack)) => uplink.ack(ack.seq),
         None => {}
     }
 }
 
-/// Materialize an assignment, build the engine and arm it behind the start
-/// barrier. Returns a human-readable failure reason on error.
-fn handle_assignment(
+/// Report a control command's outcome through the uplink window.
+///
+/// Windowed rather than ephemeral: unlike a heartbeat, this describes what
+/// happened to one `command_id`, so replaying it after a reconnect still tells
+/// the controller something true. Non-blocking because this runs on the session
+/// loop, which is also where the acknowledgements that free window room arrive.
+fn enqueue_control_ack(uplink: &Uplink, control: &pb::Control, result: Result<(), String>) {
+    let (applied, detail) = match result {
+        Ok(()) => (true, String::new()),
+        Err(detail) => (false, detail),
+    };
+    let msg = agent_msg(AgentMsg::ControlAck(pb::ControlAck {
+        run_id: control.run_id.clone(),
+        command_id: control.command_id,
+        action: control.action.clone(),
+        scenario: control.scenario.clone(),
+        value: control.value,
+        applied,
+        detail,
+    }));
+    if !uplink.try_enqueue(msg) {
+        tracing::warn!(
+            run_id = %control.run_id,
+            command_id = control.command_id,
+            "uplink window full; control ack dropped"
+        );
+    }
+}
+
+/// Accept an assignment: claim the slot and hand the heavy setup to the
+/// blocking pool. Runs on the session loop, so it must stay cheap — the
+/// dedup/busy decision and validations only.
+fn arm_assignment(
     a: pb::Assignment,
     config: &AgentConfig,
     current: &SharedRun,
-    uplink_tx: &mpsc::Sender<pb::AgentMessage>,
+    uplink: &Arc<Uplink>,
 ) -> Result<(), String> {
-    {
-        let cur = current.lock();
-        if let Some(run) = cur.as_ref() {
-            if run.run_id == a.run_id {
-                // Duplicate assignment (e.g. after a resume): keep the run.
-                return Ok(());
-            }
-            if !matches!(run.handle.status(), RunStatus::Finished { .. }) {
-                return Err(format!("agent is busy with run {}", run.run_id));
-            }
-        }
-    }
     if a.partition_count == 0 || a.partition_index >= a.partition_count {
         return Err(format!(
             "invalid partition {}/{}",
@@ -362,6 +556,131 @@ fn handle_assignment(
         ));
     }
     validate_run_id(&a.run_id).map_err(|e| e.to_string())?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut cur = current.lock();
+        match cur.as_ref() {
+            // Duplicate assignment (e.g. a controller replay after a
+            // reconnect): the run is already preparing or armed; keep it.
+            Some(phase) if phase.run_id() == a.run_id => return Ok(()),
+            Some(RunPhase::Preparing { run_id, .. }) => {
+                return Err(format!("agent is busy with run {run_id}"));
+            }
+            Some(RunPhase::Armed(run))
+                if !matches!(run.handle.status(), RunStatus::Finished { .. }) =>
+            {
+                return Err(format!("agent is busy with run {}", run.run_id));
+            }
+            _ => {}
+        }
+        *cur = Some(RunPhase::Preparing {
+            run_id: a.run_id.clone(),
+            cancel: cancel.clone(),
+            pending_start: None,
+        });
+    }
+    tokio::spawn(prepare_assignment(
+        a,
+        config.clone(),
+        current.clone(),
+        uplink.clone(),
+        cancel,
+    ));
+    Ok(())
+}
+
+/// Drive one assignment's preparation off the session loop: build the engine
+/// on the blocking pool, then arm the run and report readiness — or report a
+/// preparation failure.
+async fn prepare_assignment(
+    a: pb::Assignment,
+    config: AgentConfig,
+    current: SharedRun,
+    uplink: Arc<Uplink>,
+    cancel: Arc<AtomicBool>,
+) {
+    let run_id = a.run_id.clone();
+    let partition_index = a.partition_index;
+    let output_uplink = uplink.clone();
+    let result = tokio::task::spawn_blocking(move || prepare_engine(a, &config, output_uplink))
+        .await
+        .unwrap_or_else(|e| Err(format!("assignment preparation panicked: {e}")));
+
+    let engine = match result {
+        Ok(engine) => engine,
+        Err(detail) => {
+            {
+                let mut cur = current.lock();
+                if matches!(
+                    cur.as_ref(),
+                    Some(RunPhase::Preparing { run_id: id, .. }) if *id == run_id
+                ) {
+                    *cur = None;
+                }
+            }
+            if cancel.load(Ordering::Relaxed) {
+                tracing::debug!(run_id = %run_id, "cancelled preparation failed quietly");
+                return;
+            }
+            tracing::warn!(run_id = %run_id, error = %detail, "assignment preparation failed");
+            report_run_event(&uplink, &run_id, "prep_failed", detail, Vec::new()).await;
+            return;
+        }
+    };
+
+    let (start_tx, start_rx) = oneshot::channel::<i64>();
+    {
+        let mut cur = current.lock();
+        if !matches!(
+            cur.as_ref(),
+            Some(RunPhase::Preparing { run_id: id, .. }) if *id == run_id
+        ) {
+            // The slot was cancelled-and-freed or re-owned while we built the
+            // engine. The controller has already settled this run: discard
+            // the engine and say nothing.
+            tracing::debug!(run_id = %run_id, "prepared assignment discarded");
+            return;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            *cur = None;
+            tracing::debug!(run_id = %run_id, "prepared assignment discarded: cancelled");
+            return;
+        }
+        let latched_start = match cur.as_ref() {
+            Some(RunPhase::Preparing { pending_start, .. }) => *pending_start,
+            _ => None,
+        };
+        let mut start_tx = Some(start_tx);
+        if let Some(start_ms) = latched_start {
+            if let Some(tx) = start_tx.take() {
+                let _ = tx.send(start_ms);
+            }
+        }
+        *cur = Some(RunPhase::Armed(ActiveRun {
+            run_id: run_id.clone(),
+            handle: engine.handle(),
+            start_tx,
+        }));
+    }
+    spawn_run(engine, start_rx, run_id.clone(), uplink.clone(), current);
+    // Durable and allowed to park: readiness is what the controller's start
+    // barrier waits for, and the window replays it across reconnects.
+    if !uplink
+        .enqueue(assignment_ready(&run_id, partition_index))
+        .await
+    {
+        tracing::debug!(run_id = %run_id, "readiness dropped: agent shutting down");
+    }
+}
+
+/// The blocking half of preparation: filesystem materialization, plan
+/// loading, factory construction and engine setup. Runs on the blocking pool
+/// so the session loop keeps heartbeating however long this takes.
+fn prepare_engine(
+    a: pb::Assignment,
+    config: &AgentConfig,
+    uplink: Arc<Uplink>,
+) -> Result<Engine, String> {
     let run_dir = config.work_dir.join(&a.run_id);
     std::fs::create_dir_all(&run_dir)
         .map_err(|e| format!("cannot create {}: {e}", run_dir.display()))?;
@@ -377,7 +696,11 @@ fn handle_assignment(
         .map_err(|e| format!("invalid plan: {e}"))?;
     let plan = loaded.plan;
 
-    let protocols = (config.deps.protocols)(&plan.defaults.http, &run_dir)?;
+    let protocols = (config.deps.protocols)(&plan, &run_dir)?;
+    let data_sources = match &config.deps.data_sources {
+        Some(factory) => factory(&plan.plugins, &run_dir)?,
+        None => HashMap::new(),
+    };
     let script = match (&plan.js, &config.deps.script) {
         (Some(js), Some(factory)) => Some(factory(js, &run_dir)?),
         (Some(_), None) => {
@@ -391,10 +714,9 @@ fn handle_assignment(
 
     let output = DeltaOutput {
         run_id: a.run_id.clone(),
-        agg: Aggregator::new(),
-        uplink: uplink_tx.clone(),
+        uplink,
     };
-    let engine = Engine::new(
+    Engine::new(
         plan,
         run_dir,
         EngineOptions {
@@ -405,25 +727,10 @@ fn handle_assignment(
             partition: Some((a.partition_index, a.partition_count)),
             extra_tags,
             snapshot_interval: Duration::from_millis(500),
+            data_sources,
         },
     )
-    .map_err(|e| format!("engine setup failed: {e}"))?;
-
-    let handle = engine.handle();
-    let (start_tx, start_rx) = oneshot::channel::<i64>();
-    *current.lock() = Some(ActiveRun {
-        run_id: a.run_id.clone(),
-        handle,
-        start_tx: Some(start_tx),
-    });
-    spawn_run(
-        engine,
-        start_rx,
-        a.run_id,
-        uplink_tx.clone(),
-        current.clone(),
-    );
-    Ok(())
+    .map_err(|e| format!("engine setup failed: {e}"))
 }
 
 /// Hold the engine ready, wait for the synchronized start, run to completion
@@ -432,13 +739,15 @@ fn spawn_run(
     engine: Engine,
     start_rx: oneshot::Receiver<i64>,
     run_id: String,
-    uplink: mpsc::Sender<pb::AgentMessage>,
+    uplink: Arc<Uplink>,
     current: SharedRun,
 ) {
     tokio::spawn(async move {
+        // Clear only the exact run this task armed: a Preparing entry (or an
+        // Armed entry for another run) belongs to a newer assignment.
         let clear = |current: &SharedRun, run_id: &str| {
             let mut cur = current.lock();
-            if cur.as_ref().map(|r| r.run_id == run_id).unwrap_or(false) {
+            if matches!(cur.as_ref(), Some(RunPhase::Armed(r)) if r.run_id == run_id) {
                 *cur = None;
             }
         };
@@ -451,9 +760,7 @@ fn spawn_run(
         if start_ms > now {
             tokio::time::sleep(Duration::from_millis((start_ms - now) as u64)).await;
         }
-        let _ = uplink
-            .send(run_event(&run_id, "started", String::new(), Vec::new()))
-            .await;
+        report_run_event(&uplink, &run_id, "started", String::new(), Vec::new()).await;
         match engine.run().await {
             Ok(result) => {
                 let summary_json = serde_json::to_vec(&result.summary).unwrap_or_default();
@@ -461,34 +768,64 @@ fn spawn_run(
                     Some(reason) => ("aborted", reason),
                     None => ("finished", String::new()),
                 };
-                let _ = uplink
-                    .send(run_event(&run_id, kind, detail, summary_json))
-                    .await;
+                report_run_event(&uplink, &run_id, kind, detail, summary_json).await;
             }
             Err(e) => {
-                let _ = uplink
-                    .send(run_event(&run_id, "failed", e.to_string(), Vec::new()))
-                    .await;
+                report_run_event(&uplink, &run_id, "failed", e.to_string(), Vec::new()).await;
             }
         }
         clear(&current, &run_id);
     });
 }
 
+/// Queue a lifecycle event, waiting for window room. Run events are the
+/// controller's only completion signal, so they are worth parking a detached run
+/// task for; the sole failure is a shutdown that already closed the uplink.
+async fn report_run_event(
+    uplink: &Uplink,
+    run_id: &str,
+    kind: &str,
+    detail: String,
+    summary_json: Vec<u8>,
+) {
+    if !uplink
+        .enqueue(run_event(run_id, kind, detail, summary_json))
+        .await
+    {
+        tracing::debug!(run_id = %run_id, kind, "run event dropped: agent shutting down");
+    }
+}
+
 fn run_event(run_id: &str, kind: &str, detail: String, summary_json: Vec<u8>) -> pb::AgentMessage {
+    agent_msg(AgentMsg::Event(pb::RunEvent {
+        run_id: run_id.to_string(),
+        kind: kind.to_string(),
+        detail,
+        summary_json,
+    }))
+}
+
+fn assignment_ready(run_id: &str, partition_index: u64) -> pb::AgentMessage {
+    agent_msg(AgentMsg::AssignmentReady(pb::AssignmentReady {
+        run_id: run_id.to_string(),
+        partition_index,
+    }))
+}
+
+/// An unsequenced message. [`Uplink`] stamps `seq` when it admits one into its
+/// window; the messages that bypass the window — `Register` and `Heartbeat` —
+/// keep 0 and are never replayed.
+fn agent_msg(msg: AgentMsg) -> pb::AgentMessage {
     pb::AgentMessage {
-        msg: Some(AgentMsg::Event(pb::RunEvent {
-            run_id: run_id.to_string(),
-            kind: kind.to_string(),
-            detail,
-            summary_json,
-        })),
+        msg: Some(msg),
+        seq: 0,
     }
 }
 
 fn make_heartbeat(current: &SharedRun) -> pb::AgentMessage {
     let (run_id, run_state, active_vus) = match current.lock().as_ref() {
-        Some(run) => {
+        Some(RunPhase::Preparing { run_id, .. }) => (run_id.clone(), "preparing".to_string(), 0),
+        Some(RunPhase::Armed(run)) => {
             let state = match run.handle.status() {
                 RunStatus::Pending => "pending",
                 RunStatus::Running => "running",
@@ -505,14 +842,12 @@ fn make_heartbeat(current: &SharedRun) -> pb::AgentMessage {
         }
         None => (String::new(), "idle".to_string(), 0),
     };
-    pb::AgentMessage {
-        msg: Some(AgentMsg::Heartbeat(pb::Heartbeat {
-            active_vus,
-            cpu_load: 0.0,
-            run_id,
-            run_state,
-        })),
-    }
+    agent_msg(AgentMsg::Heartbeat(pb::Heartbeat {
+        active_vus,
+        cpu_load: 0.0,
+        run_id,
+        run_state,
+    }))
 }
 
 /// Validate a data-file relative path: it must be relative and contain only
@@ -561,24 +896,22 @@ fn materialize_files(dir: &Path, files: &[pb::DataFile]) -> Result<(), AgentErro
     Ok(())
 }
 
-/// An [`Output`] that owns its own [`Aggregator`], records every sample into
-/// it and ships drained [`loadr_core::MetricsDelta`]s to the controller on
-/// each engine snapshot (plus one final flush at the end of the run).
+/// An [`Output`] that ships the engine aggregator's drained [`MetricsDelta`]s
+/// to the controller: `wants_delta` opts in, so the engine takes the delta
+/// directly from its own `Aggregator` instead of this output keeping a
+/// second one just to re-record every sample.
 struct DeltaOutput {
     run_id: String,
-    agg: Aggregator,
-    uplink: mpsc::Sender<pb::AgentMessage>,
+    uplink: Arc<Uplink>,
 }
 
 impl DeltaOutput {
-    fn batch(&self, delta: &loadr_core::MetricsDelta) -> Option<pb::AgentMessage> {
+    fn batch(&self, delta: &MetricsDelta) -> Option<pb::AgentMessage> {
         let delta_json = serde_json::to_vec(delta).ok()?;
-        Some(pb::AgentMessage {
-            msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
-                run_id: self.run_id.clone(),
-                delta_json,
-            })),
-        })
+        Some(agent_msg(AgentMsg::Metrics(pb::MetricsBatch {
+            run_id: self.run_id.clone(),
+            delta_json,
+        })))
     }
 }
 
@@ -588,34 +921,115 @@ impl Output for DeltaOutput {
         "controller-delta"
     }
 
-    async fn on_samples(&mut self, samples: &[Sample]) {
-        for sample in samples {
-            self.agg.record(sample);
-        }
+    fn wants_samples(&self) -> bool {
+        false
     }
 
-    async fn on_snapshot(&mut self, _snapshot: &Snapshot) {
-        let delta = self.agg.take_delta();
-        if delta.series.is_empty() {
-            return;
+    fn wants_delta(&self) -> bool {
+        true
+    }
+
+    async fn on_delta(&mut self, delta: &MetricsDelta, last: bool) -> bool {
+        if !last && self.uplink.is_full() {
+            // Reject before serializing rather than serialize just to be
+            // refused: through a long disconnect this runs every flush over a
+            // payload that only grows. The engine restores the delta, so it
+            // coalesces into the next one.
+            return false;
         }
-        let Some(msg) = self.batch(&delta) else {
-            return;
+        let Some(msg) = self.batch(delta) else {
+            // Not retryable: the data can't be serialized, ever.
+            return true;
         };
-        // Never block the aggregator: when the uplink is congested (e.g. a
-        // reconnect in progress) fold the delta back in and retry next flush.
-        if self.uplink.try_send(msg).is_err() {
-            self.agg.merge_delta(&delta);
+        if last {
+            // The run is ending: wait for window room so the final delta is
+            // durable rather than best-effort. Nobody would retry a rejection
+            // here, so report acceptance either way.
+            if !self.uplink.enqueue(msg).await {
+                tracing::warn!(run_id = %self.run_id, "final metrics delta dropped: agent shutting down");
+            }
+            true
+        } else {
+            // Never block the aggregator: when the unacknowledged window is
+            // full (e.g. a reconnect in progress) report rejection so the
+            // engine can restore the delta and retry next tick. Nothing is
+            // lost, only temporal resolution.
+            self.uplink.try_enqueue(msg)
         }
     }
+}
 
-    async fn finish(&mut self, _summary: &Summary) {
-        let delta = self.agg.take_delta();
-        if delta.series.is_empty() {
-            return;
-        }
-        if let Some(msg) = self.batch(&delta) {
-            let _ = self.uplink.send(msg).await;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loadr_core::{Aggregator, MetricKind, Sample, Tags};
+
+    /// A one-series delta, built the same way the engine's aggregator would.
+    fn one_delta() -> MetricsDelta {
+        let mut agg = Aggregator::new();
+        agg.record(&Sample {
+            metric: Arc::from("http_reqs"),
+            kind: MetricKind::Counter,
+            value: 1.0,
+            tags: Arc::new(Tags::new()),
+            timestamp_ms: 0,
+        });
+        agg.take_delta()
+    }
+
+    fn filler() -> pb::AgentMessage {
+        agent_msg(AgentMsg::Heartbeat(pb::Heartbeat::default()))
+    }
+
+    #[tokio::test]
+    async fn delta_output_backpressure() {
+        // A one-message window, so a single unacknowledged entry fills it.
+        // Streaming an entry does not free it — only an acknowledgement does —
+        // so a session writer here just lets the test read the payload.
+        let uplink = Arc::new(Uplink::with_limits(1, 1));
+        let (tx, mut rx) = mpsc::channel(8);
+        let _writer = SessionWriter::spawn(uplink.clone(), tx);
+        let mut output = DeltaOutput {
+            run_id: "run-1".to_string(),
+            uplink: uplink.clone(),
+        };
+        let delta = one_delta();
+
+        // Congested: the window's one slot holds an unacknowledged message, so
+        // a non-final delta must be rejected (never block the aggregator).
+        assert!(uplink.try_enqueue(filler()), "prefill");
+        assert!(
+            !output.on_delta(&delta, false).await,
+            "on_delta should report rejection when the uplink window is full"
+        );
+        assert_eq!(rx.recv().await.expect("filler").seq, 1);
+
+        // Acknowledged: room is free, so the same delta is now accepted and
+        // decodes back to the same delta JSON.
+        uplink.ack(1);
+        assert!(output.on_delta(&delta, false).await);
+        let msg = rx.recv().await.expect("delta message");
+        let Some(AgentMsg::Metrics(batch)) = msg.msg else {
+            panic!("expected a Metrics message");
+        };
+        assert_eq!(batch.run_id, "run-1");
+        assert_eq!(batch.delta_json, serde_json::to_vec(&delta).unwrap());
+
+        // Final flush: seq 2 is still unacknowledged, so the window is full
+        // again. on_delta must block rather than drop the last delta...
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), output.on_delta(&delta, true))
+                .await
+                .is_err(),
+            "on_delta(last=true) should block while the window is full"
+        );
+        // ...and go through once an acknowledgement frees room.
+        uplink.ack(2);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), output.on_delta(&delta, true))
+                .await
+                .expect("the final delta should be admitted once room frees up"),
+            "final delta should be accepted"
+        );
     }
 }

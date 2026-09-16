@@ -367,6 +367,7 @@ impl SseHandler {
                 "last_event": last_event.to_json(),
                 "events": capped,
             }),
+            grpc_protobuf_outcomes: Vec::new(),
         })
     }
 }

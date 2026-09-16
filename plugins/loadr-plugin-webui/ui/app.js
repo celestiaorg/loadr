@@ -85,6 +85,15 @@
       if (d < 86400) return Math.floor(d / 3600) + 'h ago';
       return Math.floor(d / 86400) + 'd ago';
     },
+    age(ms) {
+      if (ms == null || !isFinite(ms)) return '–';
+      const d = Math.max(0, ms) / 1000;
+      if (d < 5) return 'just now';
+      if (d < 60) return Math.floor(d) + 's ago';
+      if (d < 3600) return Math.floor(d / 60) + 'm ago';
+      if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+      return Math.floor(d / 86400) + 'd ago';
+    },
   };
 
   // -------------------------------------------------------------------------
@@ -98,24 +107,49 @@
     return s;
   }
 
-  // Flatten a failures breakdown object into CSV rows: category, cause, count, share.
+  function responseStatusLabel(row) {
+    const status = row && row.status != null ? String(row.status) : String((row && row.key) || '');
+    if (status === 'other') return status;
+    const protocol = row && row.protocol;
+    const protocolLabel =
+      {
+        http: 'HTTP',
+        grpc: 'gRPC',
+        graphql: 'GraphQL',
+        sse: 'SSE',
+        browser: 'Browser',
+        ws: 'WebSocket',
+      }[protocol] || protocol;
+    const detail = row && row.status_name ? row.status_name + ' (' + status + ')' : status;
+    return protocolLabel ? protocolLabel + ' · ' + detail : detail;
+  }
+
+  function failureEventTotal(f) {
+    if (!f) return 0;
+    return (f.event_total != null ? f.event_total : f.total) || 0;
+  }
+
+  // Flatten a failures breakdown object into CSV rows:
+  // category, protocol, cause, count, share, category denominator.
   function failuresToCsv(f) {
-    const lines = ['category,cause,count,share_pct'];
+    const lines = ['category,protocol,cause,count,share_pct,denominator_count'];
     if (f) {
       const groups = [
-        ['http_status', f.by_status],
-        ['transport_error', f.by_error_kind],
-        ['failed_check', f.by_check],
-        ['script_exception', f.by_exception],
+        ['response_status', f.by_status, true],
+        ['transport_error', f.by_error_kind, false],
+        ['failed_check', f.by_check, false],
+        ['script_exception', f.by_exception, false],
       ];
-      for (const [category, rows] of groups) {
+      for (const [category, rows, isStatus] of groups) {
         for (const r of rows || []) {
           lines.push(
             [
               csvField(category),
-              csvField(r.key),
+              csvField(isStatus ? r.protocol : ''),
+              csvField(isStatus && r.status != null ? r.status : r.key),
               csvField(r.count),
               csvField(((r.share || 0) * 100).toFixed(2)),
+              csvField(r.denominator),
             ].join(',')
           );
         }
@@ -128,13 +162,14 @@
   function failuresToHtml(f, runLabel) {
     const esc = (s) =>
       String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-    const section = (title, rows) => {
+    const section = (title, rows, label = (row) => row.key) => {
+      const denominator = rows && rows.length ? rows[0].denominator : 0;
       const body = (rows || []).length
         ? (rows || [])
             .map(
               (r) =>
                 '<tr><td>' +
-                esc(r.key) +
+                esc(label(r)) +
                 '</td><td class="n">' +
                 esc(r.count) +
                 '</td><td class="n">' +
@@ -145,13 +180,13 @@
         : '<tr><td colspan="3" class="muted">none</td></tr>';
       return (
         '<h2>' +
-        esc(title) +
+        esc(title + ' — share of ' + denominator + ' category events') +
         '</h2><table><thead><tr><th>Cause</th><th class="n">Count</th><th class="n">Share</th></tr></thead><tbody>' +
         body +
         '</tbody></table>'
       );
     };
-    const total = (f && f.total) || 0;
+    const total = failureEventTotal(f);
     return (
       '<!doctype html><html><head><meta charset="utf-8"><title>loadr failure breakdown</title>' +
       '<style>body{font:14px system-ui,sans-serif;margin:2rem;color:#111;background:#fff}' +
@@ -165,10 +200,10 @@
       esc(runLabel || '') +
       (runLabel ? ' · ' : '') +
       esc(total) +
-      ' total failures · generated ' +
+      ' failure events. Categories may overlap; each percentage uses its own category total. Generated ' +
       esc(new Date().toLocaleString()) +
       '</p>' +
-      section('HTTP status (4xx / 5xx)', f && f.by_status) +
+      section('Failed response status', f && f.by_status, responseStatusLabel) +
       section('Transport / error kind', f && f.by_error_kind) +
       section('Failed checks', f && f.by_check) +
       section('Script exceptions', f && f.by_exception) +
@@ -192,12 +227,12 @@
   }
 
   function downloadFailuresCsv(f) {
-    if (!f || !f.total) return;
+    if (!failureEventTotal(f)) return;
     triggerDownload('loadr-failures-' + fileStamp() + '.csv', failuresToCsv(f), 'text/csv;charset=utf-8');
   }
 
   function downloadFailuresHtml(f, runLabel) {
-    if (!f || !f.total) return;
+    if (!failureEventTotal(f)) return;
     triggerDownload('loadr-failures-' + fileStamp() + '.html', failuresToHtml(f, runLabel), 'text/html;charset=utf-8');
   }
 
@@ -205,8 +240,8 @@
     let cls = state;
     let label = state;
     if (state === 'finished') {
-      cls = passed === false ? 'failed' : 'passed';
-      label = passed === false ? 'failed' : 'passed';
+      cls = passed == null ? 'finished' : passed === false ? 'failed' : 'passed';
+      label = passed == null ? 'finished' : passed === false ? 'thresholds failed' : 'passed';
     }
     return h('span', { class: 'pill pill-' + cls }, label);
   }
@@ -245,6 +280,13 @@
         this.submit();
       });
       API.on('unauthorized', () => this.show());
+      const logout = $('#logout');
+      logout.classList.toggle('hidden', !API.hasAuth());
+      logout.addEventListener('click', () => {
+        API.setAuth(null);
+        logout.classList.add('hidden');
+        this.show();
+      });
     },
     setMode(mode) {
       this.mode = mode;
@@ -281,6 +323,7 @@
         if (res.status === 401) throw new Error('Invalid credentials');
         if (!res.ok) throw new Error('Server error ' + res.status);
         API.setAuth(header);
+        $('#logout').classList.remove('hidden');
         this.hide();
         Toast.ok('Signed in');
         App.route(); // re-mount the current page with auth in place
@@ -304,8 +347,20 @@
   };
 
   function createLiveDash(root) {
+    let currentRunId = null;
+    let lastReceivedMs = 0;
+    let expectedFreshMs = 5000;
+    let lastIntervalSecs = null;
+    let lastMetricState = 'pending';
+    let lastPaused = false;
+    const liveBanner = h('div', { class: 'live-banner' }, 'PENDING · waiting for the first complete interval');
+    const streamBanner = h('div', { class: 'banner banner-warn hidden' });
+    const completenessBanner = h('div', { class: 'banner banner-warn hidden' });
+    const contractLine = h('div', { class: 'muted mono data-rates' });
     const cards = {
-      rps: null,
+      attempts: null,
+      successful: null,
+      failed: null,
       vus: null,
       err: null,
       p95: null,
@@ -314,10 +369,12 @@
       'div',
       { class: 'stat-grid' },
       ...Object.entries({
-        rps: 'Requests / sec',
+        attempts: 'Request attempts/s',
+        successful: 'Successful requests/s',
+        failed: 'Failed requests/s',
+        err: 'Request error rate',
+        p95: 'p95 latency (run-to-date)',
         vus: 'Active VUs',
-        err: 'Error rate',
-        p95: 'p95 latency',
       }).map(([key, label]) => {
         const value = h('div', { class: 'stat-value mono' }, '–');
         cards[key] = value;
@@ -358,6 +415,7 @@
     const checksBar = h('div', { class: 'checks-bar-fill' });
     const checksText = h('span', { class: 'mono muted' }, 'no checks yet');
     const scenarioBody = h('tbody');
+    const agentBody = h('tbody');
     const thresholdList = h('div', { class: 'threshold-list' });
     const dataRates = h('div', { class: 'muted mono data-rates' }, '');
 
@@ -373,14 +431,17 @@
     const failSummary = h('span', { class: 'mono muted' }, 'no failures yet');
     const failGroupCard = (key, title) =>
       h('div', { class: 'fail-group' }, h('h4', null, title), failGroups[key]);
+    // Start disabled: there is nothing to export until a snapshot reports
+    // failures, and an enabled button that silently no-ops reads as broken.
+    const noFailuresTip = 'No failures recorded yet — enabled once the run reports failures';
     const dlCsvBtn = h(
       'button',
-      { class: 'btn btn-ghost btn-sm', type: 'button', title: 'Download breakdown as CSV' },
+      { class: 'btn btn-ghost btn-sm', type: 'button', disabled: true, title: noFailuresTip },
       '↓ CSV'
     );
     const dlHtmlBtn = h(
       'button',
-      { class: 'btn btn-ghost btn-sm', type: 'button', title: 'Download breakdown as an HTML report' },
+      { class: 'btn btn-ghost btn-sm', type: 'button', disabled: true, title: noFailuresTip },
       '↓ Report'
     );
     dlCsvBtn.addEventListener('click', () => downloadFailuresCsv(lastFailures));
@@ -397,7 +458,7 @@
       h(
         'div',
         { class: 'fail-grid' },
-        failGroupCard('by_status', 'HTTP status'),
+        failGroupCard('by_status', 'Response status'),
         failGroupCard('by_error_kind', 'Transport / error'),
         failGroupCard('by_check', 'Failed checks'),
         failGroupCard('by_exception', 'Script exceptions')
@@ -405,18 +466,21 @@
     );
 
     root.append(
+      liveBanner,
+      streamBanner,
+      completenessBanner,
       cardRow,
       chartToolbar,
       h(
         'div',
         { class: 'chart-grid' },
-        h('div', { class: 'card' }, h('h3', null, 'Throughput'), rpsCanvas),
-        h('div', { class: 'card' }, h('h3', null, 'Latency percentiles'), latCanvas)
+        h('div', { class: 'card' }, h('h3', null, 'Throughput — last interval'), rpsCanvas),
+        h('div', { class: 'card' }, h('h3', null, 'Latency percentiles — run-to-date'), latCanvas)
       ),
       h(
         'div',
         { class: 'chart-grid' },
-        h('div', { class: 'card' }, h('h3', null, 'Error rate'), errCanvas),
+        h('div', { class: 'card' }, h('h3', null, 'Error rate — last interval'), errCanvas),
         h(
           'div',
           { class: 'card' },
@@ -432,30 +496,62 @@
         { class: 'card' },
         h('h3', null, 'Scenarios'),
         h(
-          'table',
-          { class: 'table' },
+          'div',
+          { class: 'table-scroll' },
           h(
-            'thead',
-            null,
+            'table',
+            { class: 'table' },
             h(
-              'tr',
+              'thead',
               null,
-              h('th', null, 'Scenario'),
-              h('th', { class: 'num' }, 'RPS'),
+              h(
+                'tr',
+                null,
+                h('th', null, 'Scenario'),
+                h('th', { class: 'num' }, 'Attempts/s'),
+                h('th', { class: 'num' }, 'Failed/s'),
+                h('th', { class: 'num' }, 'avg'),
+                h('th', { class: 'num' }, 'p95'),
+                h('th', { class: 'num' }, 'Error rate')
+              )
+            ),
+            scenarioBody
+          )
+        ),
+        dataRates,
+        contractLine
+      ),
+      h(
+        'div',
+        { class: 'card agent-contributions hidden' },
+        h('h3', null, 'Agent contribution — run-to-date'),
+        h(
+          'div',
+          { class: 'table-scroll' },
+          h(
+            'table',
+            { class: 'table' },
+            h('thead', null, h('tr', null,
+              h('th', null, 'Agent'),
+              h('th', { class: 'num' }, 'Requests'),
+              h('th', { class: 'num' }, 'Active VUs'),
               h('th', { class: 'num' }, 'avg'),
               h('th', { class: 'num' }, 'p95'),
               h('th', { class: 'num' }, 'Errors')
-            )
-          ),
-          scenarioBody
-        ),
-        dataRates
+            )),
+            agentBody
+          )
+        )
       ),
       failuresCard
     );
 
     const rpsChart = new TimeChart(rpsCanvas, {
-      series: [{ label: 'req/s', color: COLORS.blue, fill: true }],
+      series: [
+        { label: 'attempts/s', color: COLORS.blue, fill: true },
+        { label: 'successful/s', color: COLORS.green },
+        { label: 'failed/s', color: COLORS.red },
+      ],
       type: chartType,
     });
     const latChart = new TimeChart(latCanvas, {
@@ -489,19 +585,78 @@
       b.addEventListener('click', () => applyChartType(b.getAttribute('data-type')))
     );
 
+    function updateLiveBanner() {
+      const age = lastReceivedMs ? Math.max(0, Date.now() - lastReceivedMs) : null;
+      const state = lastPaused
+        ? 'PAUSED'
+        : lastMetricState === 'stopping'
+          ? 'STOPPING'
+          : lastMetricState === 'pending'
+            ? 'PENDING'
+            : 'LIVE';
+      const interval = lastIntervalSecs != null
+        ? Math.max(0, lastIntervalSecs).toFixed(2) + 's interval'
+        : 'interval unavailable';
+      const freshness = age == null ? 'waiting for data' : age < 1500 ? 'fresh now' : 'updated ' + fmt.age(age);
+      liveBanner.textContent = state + ' · ' + interval + ' · ' + freshness;
+      liveBanner.className = 'live-banner live-banner-' + state.toLowerCase();
+    }
+
     function update(m) {
       if (!m) return;
-      cards.rps.textContent = fmt.num(m.rps, 1);
+      if (currentRunId && m.run_id && currentRunId !== m.run_id) {
+        rpsChart.clear();
+        latChart.clear();
+        errChart.clear();
+      }
+      currentRunId = m.run_id || currentRunId;
+      lastReceivedMs = Date.now();
+      expectedFreshMs = Math.max(5000, ((m.interval_secs || 1) * 3000));
+      lastIntervalSecs = m.interval_secs == null ? null : m.interval_secs;
+      lastMetricState = m.state || lastMetricState;
+      lastPaused = m.paused === true;
+      setConnection('open');
+      updateLiveBanner();
+      cards.attempts.textContent = fmt.num(m.attempts_per_second, 1);
+      cards.successful.textContent = fmt.num(m.successful_per_second, 1);
+      cards.failed.textContent = fmt.num(m.failed_per_second, 1);
       cards.vus.textContent = fmt.num(m.active_vus, 0);
-      cards.err.textContent = fmt.pct(m.error_rate == null ? 0 : m.error_rate);
-      cards.err.classList.toggle('stat-bad', (m.error_rate || 0) > 0.01);
+      cards.err.textContent = m.request_error_rate == null ? '–' : fmt.pct(m.request_error_rate);
+      cards.err.classList.toggle('stat-bad', m.request_error_rate != null && m.request_error_rate > 0.01);
+      cards.failed.classList.toggle('stat-bad', m.failed_per_second != null && m.failed_per_second > 0);
       cards.p95.textContent = fmt.ms(m.latency && m.latency.p95);
 
       const t = m.ts || Date.now();
-      rpsChart.push(t, [m.rps]);
+      rpsChart.push(t, [m.attempts_per_second, m.successful_per_second, m.failed_per_second]);
       const lat = m.latency || {};
       latChart.push(t, [lat.p50, lat.p90, lat.p95, lat.p99]);
-      errChart.push(t, [(m.error_rate || 0) * 100]);
+      errChart.push(t, [m.request_error_rate == null ? null : m.request_error_rate * 100]);
+
+      const lost = m.lost_agents || [];
+      const contributing = new Set(m.contributing_agents || []);
+      const missing = (m.assigned_agents || []).filter((agent) => !contributing.has(agent));
+      completenessBanner.classList.toggle('hidden', m.complete !== false);
+      if (m.complete === false) {
+        if (lost.length) {
+          completenessBanner.textContent =
+            'Incomplete fleet data — lost agent' +
+            (lost.length === 1 ? ': ' : 's: ') +
+            lost.join(', ') +
+            '. Do not treat this result as a complete pass.';
+        } else if (['pending', 'running', 'stopping'].includes(m.state)) {
+          completenessBanner.textContent =
+            'Fleet data is not complete yet — waiting for metrics from: ' +
+            (missing.join(', ') || 'assigned agents') +
+            '.';
+        } else {
+          completenessBanner.textContent =
+            'Incomplete fleet data — no metrics were received from: ' +
+            (missing.join(', ') || 'one or more assigned agents') +
+            '. Do not treat this result as a complete pass.';
+        }
+      } else {
+        completenessBanner.textContent = '';
+      }
 
       // Checks.
       const checks = m.checks || { passes: 0, fails: 0 };
@@ -524,7 +679,9 @@
               h(
                 'div',
                 { class: 'threshold-row' },
-                h('span', { class: 'pill ' + (th.passed ? 'pill-passed' : 'pill-failed') }, th.passed ? 'pass' : 'fail'),
+                h('span', {
+                  class: 'pill ' + (th.observed == null ? 'pill-pending' : th.passed ? 'pill-passed' : 'pill-failed'),
+                }, th.observed == null ? 'no data' : th.passed ? 'pass' : 'fail'),
                 h('span', { class: 'mono' }, th.metric + ': ' + th.expression),
                 h(
                   'span',
@@ -544,17 +701,39 @@
                 'tr',
                 null,
                 h('td', null, s.scenario),
-                h('td', { class: 'num mono' }, fmt.num(s.rps, 1)),
+                h('td', { class: 'num mono' }, fmt.num(s.attempts_per_second, 1)),
+                h('td', { class: 'num mono' }, fmt.num(s.failed_per_second, 1)),
                 h('td', { class: 'num mono' }, fmt.ms(s.avg)),
                 h('td', { class: 'num mono' }, fmt.ms(s.p95)),
-                h('td', { class: 'num mono' }, fmt.pct(s.error_rate == null ? 0 : s.error_rate))
+                h('td', { class: 'num mono' }, s.error_rate == null ? '–' : fmt.pct(s.error_rate))
               )
             )
-          : [h('tr', null, h('td', { colspan: 5, class: 'muted' }, 'no scenario data yet'))])
+          : [h('tr', null, h('td', { colspan: 6, class: 'muted' }, 'no scenario data yet'))])
       );
 
       dataRates.textContent =
-        '↑ ' + fmt.bytes(m.data_sent_ps) + '/s    ↓ ' + fmt.bytes(m.data_received_ps) + '/s    total reqs ' + fmt.num(m.http_reqs_total, 0);
+        '↑ ' + fmt.bytes(m.data_sent_ps) + '/s    ↓ ' + fmt.bytes(m.data_received_ps) + '/s    total requests ' + fmt.num(m.request_reqs_total, 0);
+
+      const contract = m.metric_contract || {};
+      contractLine.textContent =
+        'Request rates: one ' + fmt.num(m.interval_secs, 2) + 's fleet interval · ' +
+        'latency: ' + (contract.latency_window || 'unknown') +
+        ' (' + (contract.latency_quality || 'unknown') + ') · average: ' +
+        (contract.latency_average_quality || 'unknown');
+
+      const contributions = m.per_agent || [];
+      const agentCard = root.querySelector('.agent-contributions');
+      agentCard.classList.toggle('hidden', contributions.length === 0);
+      agentBody.replaceChildren(...contributions.map((agent) => h(
+        'tr',
+        null,
+        h('td', null, agent.name, ' ', h('span', { class: 'mono muted', title: agent.id }, agent.id)),
+        h('td', { class: 'num mono' }, fmt.num(agent.requests, 0)),
+        h('td', { class: 'num mono' }, fmt.num(agent.active_vus, 0)),
+        h('td', { class: 'num mono' }, fmt.ms(agent.latency_avg)),
+        h('td', { class: 'num mono' }, fmt.ms(agent.latency_p95)),
+         h('td', { class: 'num mono' }, agent.error_rate == null ? '–' : fmt.pct(agent.error_rate))
+       )));
 
       updateFailures(m.failures);
     }
@@ -562,11 +741,11 @@
     // Render the failure breakdown groups and refresh the download buttons.
     function updateFailures(f) {
       lastFailures = f || null;
-      const total = (f && f.total) || 0;
+      const total = failureEventTotal(f);
       if (total > 0) {
         failSummary.textContent =
           fmt.num(total, 0) +
-          ' failures — ' +
+          ' failure events — ' +
           fmt.num(f.failed_requests || 0, 0) +
           ' req · ' +
           fmt.num(f.failed_checks || 0, 0) +
@@ -580,6 +759,8 @@
       }
       dlCsvBtn.disabled = total === 0;
       dlHtmlBtn.disabled = total === 0;
+      dlCsvBtn.title = total === 0 ? noFailuresTip : 'Download breakdown as CSV';
+      dlHtmlBtn.title = total === 0 ? noFailuresTip : 'Download breakdown as an HTML report';
 
       const renderGroup = (key) => {
         const rows = (f && f[key]) || [];
@@ -588,16 +769,22 @@
           return;
         }
         failGroups[key].replaceChildren(
-          ...rows.map((r) =>
-            h(
+          h(
+            'div',
+            { class: 'muted fail-denominator' },
+            'Percent of ' + fmt.num(rows[0].denominator, 0) + ' events in this category'
+          ),
+          ...rows.map((r) => {
+            const label = key === 'by_status' ? responseStatusLabel(r) : r.key;
+            return h(
               'div',
-              { class: 'fail-row', title: r.key },
+              { class: 'fail-row', title: label },
               h('div', { class: 'fail-bar' }, h('div', { class: 'fail-bar-fill', style: 'width:' + Math.max(2, (r.share || 0) * 100).toFixed(1) + '%' })),
-              h('span', { class: 'fail-key mono' }, r.key),
+              h('span', { class: 'fail-key mono' }, label),
               h('span', { class: 'fail-count mono' }, fmt.num(r.count, 0)),
               h('span', { class: 'fail-share mono muted' }, ((r.share || 0) * 100).toFixed(1) + '%')
-            )
-          )
+            );
+          })
         );
       };
       renderGroup('by_status');
@@ -607,12 +794,165 @@
     }
 
     function destroy() {
+      clearInterval(freshnessTimer);
       rpsChart.destroy();
       latChart.destroy();
       errChart.destroy();
     }
 
-    return { update, destroy };
+    function setConnection(state) {
+      if (state === 'open') {
+        streamBanner.classList.add('hidden');
+        streamBanner.textContent = '';
+      } else {
+        cards.attempts.textContent = '–';
+        cards.successful.textContent = '–';
+        cards.failed.textContent = '–';
+        cards.err.textContent = '–';
+        streamBanner.classList.remove('hidden');
+        streamBanner.textContent = state === 'stale'
+          ? 'Live data is stale. Values below are the last received snapshot and must not be treated as current.'
+          : 'Live stream disconnected; reconnecting. Displayed values may be stale.';
+      }
+    }
+
+    const freshnessTimer = setInterval(() => {
+      updateLiveBanner();
+      if (lastReceivedMs && Date.now() - lastReceivedMs > expectedFreshMs) setConnection('stale');
+    }, 1000);
+
+    return { update, destroy, setConnection };
+  }
+
+  function statCard(label, value, bad) {
+    return h(
+      'div',
+      { class: 'card stat-card' },
+      h('div', { class: 'stat-label' }, label),
+      h('div', { class: 'stat-value mono' + (bad ? ' stat-bad' : '') }, value)
+    );
+  }
+
+  function finalFailureCard(failures, runLabel) {
+    const total = failureEventTotal(failures);
+    const groups = [
+      ['by_status', 'Response status', true],
+      ['by_error_kind', 'Transport / error', false],
+      ['by_check', 'Failed checks', false],
+      ['by_exception', 'Script exceptions', false],
+    ];
+    const csv = h('button', { class: 'btn btn-ghost btn-sm', disabled: total ? null : true }, '↓ CSV');
+    const html = h('button', { class: 'btn btn-ghost btn-sm', disabled: total ? null : true }, '↓ Report');
+    csv.addEventListener('click', () => downloadFailuresCsv(failures));
+    html.addEventListener('click', () => downloadFailuresHtml(failures, runLabel));
+    return h(
+      'div',
+      { class: 'card fail-card' },
+      h(
+        'div',
+        { class: 'fail-head' },
+        h('h3', null, 'Failure breakdown — full observed run'),
+        h(
+          'div',
+          { class: 'fail-actions' },
+          h('span', { class: 'mono muted' }, fmt.num(total, 0) + ' failure events'),
+          csv,
+          html
+        )
+      ),
+      h(
+        'div',
+        { class: 'muted failure-contract' },
+        'Request failures, failed checks, and exceptions are separate. Categories may overlap; every percentage below uses its own category total.'
+      ),
+      h(
+        'div',
+        { class: 'fail-grid' },
+        ...groups.map(([key, title, isStatus]) => {
+          const rows = (failures && failures[key]) || [];
+          const denominator = rows.length ? rows[0].denominator : 0;
+          return h(
+            'div',
+            { class: 'fail-group' },
+            h('h4', null, title),
+            h('div', { class: 'muted fail-denominator' }, 'Share of ' + denominator + ' category events'),
+            rows.length
+              ? rows.map((row) =>
+                  h(
+                    'div',
+                    { class: 'fail-row' },
+                    h(
+                      'div',
+                      { class: 'fail-bar' },
+                      h('div', {
+                        class: 'fail-bar-fill',
+                        style: 'width:' + Math.max(2, (row.share || 0) * 100).toFixed(1) + '%',
+                      })
+                    ),
+                    h('span', { class: 'fail-key mono' }, isStatus ? responseStatusLabel(row) : row.key),
+                    h('span', { class: 'fail-count mono' }, fmt.num(row.count, 0)),
+                    h('span', { class: 'fail-share mono muted' }, ((row.share || 0) * 100).toFixed(1) + '%')
+                  )
+                )
+              : h('div', { class: 'muted fail-empty' }, 'none')
+          );
+        })
+      )
+    );
+  }
+
+  function finalMetricsView(final, runLabel) {
+    if (!final) {
+      return h('div', { class: 'card muted' }, 'Final metrics are unavailable for this run.');
+    }
+    const contract = final.metric_contract || {};
+    return h(
+      'div',
+      null,
+      h(
+        'div',
+        { class: 'final-banner' },
+        'FINAL — full observed run · ' +
+          fmt.dateTime(final.started_ms) +
+          ' to ' +
+          fmt.dateTime(final.ended_ms)
+      ),
+      final.complete === false
+        ? h(
+            'div',
+            { class: 'banner banner-warn' },
+            'Incomplete fleet result — these values only describe received data and are unsafe for a complete pass/fail decision.'
+          )
+        : '',
+      h(
+        'div',
+        { class: 'stat-grid' },
+        statCard('Duration', fmt.duration(final.duration_secs)),
+        statCard('Request attempts', fmt.num(final.attempts, 0)),
+        statCard('Successful requests', fmt.num(final.successful_requests, 0)),
+        statCard('Failed requests', fmt.num(final.failed_requests, 0), final.failed_requests > 0),
+        statCard('Avg attempts/s', fmt.num(final.average_attempts_per_second, 1)),
+        statCard('Avg successful/s', fmt.num(final.average_successful_per_second, 1)),
+        statCard('Avg failed/s', fmt.num(final.average_failed_per_second, 1), final.average_failed_per_second > 0),
+        statCard('Request error rate', fmt.pct(final.request_error_rate), final.request_error_rate > 0),
+        statCard('p95 latency · run-to-date', fmt.ms(final.latency && final.latency.p95))
+      ),
+      h(
+        'div',
+        { class: 'card metric-contract' },
+        h('strong', null, 'Metric contract'),
+        h(
+          'div',
+          { class: 'muted' },
+          'Rates use the full observed duration. Latency includes successful and failed requests. Fleet p95 is ' +
+            (contract.latency_percentile_quality || 'unavailable') +
+            '; distributed average quality is ' +
+            (contract.latency_average_quality || 'unknown') +
+            '.'
+        )
+      ),
+      finalFailureCard(final.failures, runLabel)
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -624,10 +964,27 @@
     mount(main) {
       const runLine = h('div', { class: 'page-sub muted' }, 'Waiting for data…');
       const dashRoot = h('div');
-      main.append(h('div', { class: 'page-head' }, h('h1', null, 'Overview'), runLine), dashRoot);
+      const finalRoot = h('div', { class: 'hidden' });
+      const emptyRoot = h(
+        'div',
+        { class: 'card empty-state hidden' },
+        h('div', { class: 'empty-icon' }, '▶'),
+        h('h3', null, 'No runs yet'),
+        h('div', { class: 'muted' }, 'Start a test to see live fleet metrics and a decision-safe final result.'),
+        h('a', { href: '#/tests', class: 'btn btn-primary mt' }, 'Open Tests')
+      );
+      main.append(
+        h('div', { class: 'page-head' }, h('h1', null, 'Overview'), runLine),
+        dashRoot,
+        finalRoot,
+        emptyRoot
+      );
 
       const dash = createLiveDash(dashRoot);
       const stream = API.sse('/api/stream', {
+        open: () => dash.setConnection('open'),
+        reconnecting: () => dash.setConnection('reconnecting'),
+        error: () => dash.setConnection('reconnecting'),
         overview: (o) => {
           if (o.run) {
             runLine.replaceChildren(
@@ -636,8 +993,22 @@
               h('a', { href: '#/runs/' + o.run.run_id }, 'view run'),
               h('span', { class: 'muted' }, '  ·  ' + o.live_runs + ' live / ' + o.total_runs + ' total runs')
             );
-            dash.update(o.metrics);
+            emptyRoot.classList.add('hidden');
+            if (['pending', 'running', 'stopping'].includes(o.run.state)) {
+              dashRoot.classList.remove('hidden');
+              finalRoot.classList.add('hidden');
+              dash.update(o.metrics);
+            } else {
+              dashRoot.classList.add('hidden');
+              finalRoot.classList.remove('hidden');
+              finalRoot.replaceChildren(
+                finalMetricsView(o.final_metrics, o.run.name || o.run.run_id)
+              );
+            }
           } else {
+            dashRoot.classList.add('hidden');
+            finalRoot.classList.add('hidden');
+            emptyRoot.classList.remove('hidden');
             runLine.replaceChildren(
               h('span', null, 'No runs yet — start one from the '),
               h('a', { href: '#/tests' }, 'Tests'),
@@ -662,23 +1033,27 @@
           'div',
           { class: 'card' },
           h(
-            'table',
-            { class: 'table table-click' },
+            'div',
+            { class: 'table-scroll' },
             h(
-              'thead',
-              null,
+              'table',
+              { class: 'table table-click' },
               h(
-                'tr',
+                'thead',
                 null,
-                h('th', null, 'Status'),
-                h('th', null, 'Name'),
-                h('th', null, 'Run id'),
-                h('th', null, 'Scenarios'),
-                h('th', null, 'Started'),
-                h('th', { class: 'num' }, 'Duration')
-              )
+                h(
+                  'tr',
+                  null,
+                  h('th', null, 'Status'),
+                  h('th', null, 'Name'),
+                  h('th', null, 'Run id'),
+                  h('th', null, 'Scenarios'),
+                  h('th', null, 'Started'),
+                  h('th', { class: 'num' }, 'Duration')
+                )
+              ),
+              tbody
             ),
-            tbody
           )
         )
       );
@@ -686,16 +1061,28 @@
       async function refresh() {
         try {
           const runs = await API.get('/api/runs');
+          runs.sort((a, b) => b.started_ms - a.started_ms || a.run_id.localeCompare(b.run_id));
           tbody.replaceChildren(
             ...(runs.length
               ? runs.map((r) => {
                   const dur = r.ended_ms
                     ? (r.ended_ms - r.started_ms) / 1000
-                    : (Date.now() - r.started_ms) / 1000;
+                    : ((r.observed_ms || Date.now()) - r.started_ms) / 1000;
                   return h(
                     'tr',
                     { onclick: () => (location.hash = '#/runs/' + r.run_id) },
-                    h('td', null, statePill(r.state, r.passed)),
+                    h(
+                      'td',
+                      null,
+                      statePill(r.state, r.passed),
+                      r.complete === false
+                        ? h(
+                            'span',
+                            { class: 'pill ' + (['pending', 'running', 'stopping'].includes(r.state) ? 'pill-pending' : 'pill-degraded') },
+                            ['pending', 'running', 'stopping'].includes(r.state) ? 'awaiting agent data' : 'fleet incomplete'
+                          )
+                        : ''
+                    ),
                     h('td', null, r.name || h('span', { class: 'muted' }, 'unnamed')),
                     h('td', { class: 'mono muted' }, r.run_id.slice(0, 8)),
                     h('td', { class: 'muted' }, r.scenarios.join(', ')),
@@ -726,6 +1113,7 @@
       let finishedShown = false;
 
       function renderHead(run, paused) {
+        const pauseLabel = paused === true ? ' · PAUSED' : paused == null ? ' · PAUSE STATE UNKNOWN' : '';
         head.replaceChildren(
           h(
             'h1',
@@ -739,15 +1127,15 @@
           h(
             'div',
             { class: 'page-sub muted mono' },
-            run.run_id + ' · started ' + fmt.dateTime(run.started_ms) + (paused ? ' · PAUSED' : '')
+            run.run_id + ' · started ' + fmt.dateTime(run.started_ms) + pauseLabel
           )
         );
       }
 
       async function act(label, fn) {
         try {
-          await fn();
-          Toast.ok(label);
+          const result = await fn();
+          Toast.ok(result && result.confirmed === false ? label + ' (not agent-confirmed)' : label);
         } catch (e) {
           Toast.error(label + ' failed: ' + e.message);
         }
@@ -759,12 +1147,15 @@
           controls.replaceChildren();
           return;
         }
-        const paused = detail.is_paused;
+        const paused = detail.is_paused === true;
+        const pauseUnknown = detail.is_paused == null;
+        const stopping = detail.run.state === 'stopping';
         const kids = [
           h(
             'button',
             {
               class: 'btn',
+              disabled: stopping ? '' : null,
               onclick: () => act('Stop requested', () => API.post('/api/runs/' + runId + '/stop', { kill: false })),
             },
             'Stop'
@@ -781,16 +1172,26 @@
             'button',
             {
               class: 'btn',
+              disabled: stopping ? '' : null,
               onclick: () =>
                 act(paused ? 'Resumed' : 'Paused', () =>
-                  API.post('/api/runs/' + runId + '/pause', { paused: !paused }).then(load)
+                  API.post('/api/runs/' + runId + '/pause', { paused: !paused }).then(async (result) => {
+                    await load();
+                    return result;
+                  })
                 ),
             },
-            paused ? 'Resume' : 'Pause'
+            paused ? 'Resume' : pauseUnknown ? 'Pause all' : 'Pause'
           ),
         ];
         for (const scenario of detail.externally_controlled || []) {
-          const input = h('input', { class: 'input input-small mono', type: 'number', min: '0', placeholder: 'VUs' });
+          const input = h('input', {
+            class: 'input input-small mono',
+            type: 'number',
+            min: '0',
+            placeholder: 'VUs',
+            disabled: stopping ? '' : null,
+          });
           kids.push(
             h(
               'span',
@@ -801,6 +1202,7 @@
                 'button',
                 {
                   class: 'btn',
+                  disabled: stopping ? '' : null,
                   onclick: () => {
                     const vus = parseInt(input.value, 10);
                     if (isNaN(vus) || vus < 0) {
@@ -826,11 +1228,24 @@
         body.append(dashRoot);
         dash = createLiveDash(dashRoot);
         stream = API.sse('/api/runs/' + runId + '/stream', {
+          open: () => dash.setConnection('open'),
+          reconnecting: () => dash.setConnection('reconnecting'),
+          error: () => dash.setConnection('reconnecting'),
           snapshot: (m) => dash.update(m),
           status: (s) => {
-            if (['finished', 'failed'].includes(s.state) && !finishedShown) {
+            if (['finished', 'degraded', 'aborted', 'failed'].includes(s.state) && !finishedShown) {
               finishedShown = true;
-              Toast.ok('Run ' + (s.passed === false ? 'finished: thresholds FAILED' : 'finished'));
+              const outcome = s.state === 'degraded'
+                ? 'finished with incomplete fleet data'
+                : s.state === 'aborted'
+                  ? 'aborted'
+                  : s.state === 'failed'
+                    ? 'failed'
+                    : s.passed === false
+                      ? 'finished: thresholds FAILED'
+                      : 'finished';
+              const notify = s.state !== 'finished' || s.passed === false ? Toast.error.bind(Toast) : Toast.ok.bind(Toast);
+              notify('Run ' + outcome);
               setTimeout(load, 400);
             }
           },
@@ -876,44 +1291,44 @@
           dash = null;
         }
         body.replaceChildren();
-        const cards = h(
-          'div',
-          { class: 'stat-grid' },
-          statCard('Duration', fmt.duration(summary.duration_secs)),
-          statCard('Requests', fmt.num(sumMetric(summary, 'http_reqs'), 0)),
-          statCard('Avg RPS', fmt.num(perSecMetric(summary, 'http_reqs'), 1)),
-          statCard('p95 latency', fmt.ms(aggOf(summary, 'http_req_duration', 'p95')))
+        const finalView = finalMetricsView(
+          summary.final_metrics,
+          detail.run.name || detail.run.run_id
         );
 
         const metricsTable = h(
-          'table',
-          { class: 'table' },
+          'div',
+          { class: 'table-scroll' },
           h(
-            'thead',
-            null,
+            'table',
+            { class: 'table' },
             h(
-              'tr',
+              'thead',
               null,
-              h('th', null, 'Metric'),
-              h('th', { class: 'num' }, 'count'),
-              h('th', { class: 'num' }, 'avg / rate'),
-              h('th', { class: 'num' }, 'min'),
-              h('th', { class: 'num' }, 'med'),
-              h('th', { class: 'num' }, 'p90'),
-              h('th', { class: 'num' }, 'p95'),
-              h('th', { class: 'num' }, 'p99'),
-              h('th', { class: 'num' }, 'max')
-            )
-          ),
-          h(
-            'tbody',
-            null,
-            summary.metrics.map((m) =>
               h(
                 'tr',
                 null,
-                h('td', { class: 'mono' }, m.metric, ' ', h('span', { class: 'muted' }, m.kind)),
-                ...metricRow(m).map((cell) => h('td', { class: 'num mono' }, cell))
+                h('th', null, 'Metric'),
+                h('th', { class: 'num' }, 'count'),
+                h('th', { class: 'num' }, 'avg / rate'),
+                h('th', { class: 'num' }, 'min'),
+                h('th', { class: 'num' }, 'med'),
+                h('th', { class: 'num' }, 'p90'),
+                h('th', { class: 'num' }, 'p95'),
+                h('th', { class: 'num' }, 'p99'),
+                h('th', { class: 'num' }, 'max')
+              )
+            ),
+            h(
+              'tbody',
+              null,
+              summary.metrics.map((m) =>
+                h(
+                  'tr',
+                  null,
+                  h('td', { class: 'mono' }, m.metric, ' ', h('span', { class: 'muted' }, m.kind)),
+                  ...metricRow(m).map((cell) => h('td', { class: 'num mono' }, cell))
+                )
               )
             )
           )
@@ -943,7 +1358,9 @@
                 h(
                   'div',
                   { class: 'threshold-row' },
-                  h('span', { class: 'pill ' + (t.passed ? 'pill-passed' : 'pill-failed') }, t.passed ? 'pass' : 'fail'),
+                  h('span', {
+                    class: 'pill ' + (t.observed == null ? 'pill-pending' : t.passed ? 'pill-passed' : 'pill-failed'),
+                  }, t.observed == null ? 'no data' : t.passed ? 'pass' : 'fail'),
                   h('span', { class: 'mono' }, t.metric + ': ' + t.expression),
                   h(
                     'span',
@@ -956,9 +1373,34 @@
         );
 
         body.append(
+          detail.run.complete === false
+            ? h(
+                'div',
+                { class: 'banner banner-warn' },
+                ((detail.run.lost_agents || []).length
+                  ? 'Incomplete fleet result — lost agents: ' + (detail.run.lost_agents || []).join(', ')
+                  : 'Incomplete fleet result — no metrics received from: ' +
+                    ((detail.run.agents || [])
+                      .filter((agent) => !(detail.run.contributing_agents || []).includes(agent))
+                      .join(', ') || 'one or more assigned agents')) +
+                  '. Thresholds below only describe received data.'
+              )
+            : '',
           summary.aborted ? h('div', { class: 'banner banner-warn' }, 'Run aborted: ' + summary.aborted) : '',
-          cards,
-          h('div', { class: 'card' }, h('h3', null, 'Metrics'), metricsTable),
+          finalView,
+          h(
+            'div',
+            { class: 'card' },
+            h('h3', null, 'Raw metrics'),
+            detail.run.agents && detail.run.agents.length
+              ? h(
+                  'div',
+                  { class: 'muted metric-note' },
+                  'Distributed trend averages are histogram-reconstructed approximations; merged percentiles are exact.'
+                )
+              : '',
+            metricsTable
+          ),
           h(
             'div',
             { class: 'chart-grid' },
@@ -966,30 +1408,6 @@
             h('div', { class: 'card' }, h('h3', null, 'Thresholds'), thresholds)
           )
         );
-      }
-
-      function statCard(label, value) {
-        return h(
-          'div',
-          { class: 'card stat-card' },
-          h('div', { class: 'stat-label' }, label),
-          h('div', { class: 'stat-value mono' }, value)
-        );
-      }
-      function metric(summary, name) {
-        return (summary.metrics || []).find((m) => m.metric === name);
-      }
-      function sumMetric(summary, name) {
-        const m = metric(summary, name);
-        return m ? m.agg.sum : null;
-      }
-      function perSecMetric(summary, name) {
-        const m = metric(summary, name);
-        return m ? m.agg.per_second : null;
-      }
-      function aggOf(summary, name, field) {
-        const m = metric(summary, name);
-        return m ? m.agg[field] : null;
       }
 
       async function load() {
@@ -1197,6 +1615,10 @@
         }
       }
 
+      const validateBtn = h('button', { class: 'btn', onclick: validate }, 'Validate');
+      const saveBtn = h('button', { class: 'btn btn-primary', onclick: save }, 'Save');
+      const runBtn = h('button', { class: 'btn btn-ok', onclick: run }, '▶ Run');
+      const deleteBtn = h('button', { class: 'btn btn-danger', onclick: remove }, 'Delete');
       main.append(
         h('div', { class: 'page-head' }, h('h1', null, 'Tests')),
         h(
@@ -1211,10 +1633,10 @@
               { class: 'editor-toolbar' },
               nameInput,
               envInput,
-              h('button', { class: 'btn', onclick: validate }, 'Validate'),
-              h('button', { class: 'btn btn-primary', onclick: save }, 'Save'),
-              h('button', { class: 'btn btn-ok', onclick: run }, '▶ Run'),
-              h('button', { class: 'btn btn-danger', onclick: remove }, 'Delete')
+              validateBtn,
+              saveBtn,
+              runBtn,
+              deleteBtn
             ),
             h('div', { class: 'editor' }, gutter, textarea),
             diagBox
@@ -1223,6 +1645,17 @@
       );
       loadTest(null);
       refresh();
+      API.get('/api/capabilities').then((capabilities) => {
+        saveBtn.disabled = !capabilities.can_edit_tests;
+        deleteBtn.disabled = !capabilities.can_edit_tests;
+        runBtn.disabled = !capabilities.can_start_runs;
+        if (!capabilities.can_edit_tests) {
+          saveBtn.title = deleteBtn.title = 'This UI is read-only in single-run mode';
+        }
+        if (!capabilities.can_start_runs) {
+          runBtn.title = 'This UI is attached to one existing run';
+        }
+      }).catch(() => {});
       return () => {};
     },
   };
@@ -1256,15 +1689,43 @@
                   'div',
                   { class: 'agent-head' },
                   h('span', { class: 'health-dot ' + (a.healthy ? 'ok' : 'bad') }),
-                  h('strong', null, a.name),
-                  h('span', { class: 'muted mono' }, a.id.slice(0, 8))
+                  h('strong', { title: a.name }, a.name),
+                  h(
+                    'span',
+                    { class: 'pill ' + (a.healthy ? 'pill-passed' : 'pill-failed') },
+                    a.healthy ? 'healthy' : 'disconnected'
+                  )
                 ),
+                h('div', { class: 'muted mono agent-id', title: a.id }, a.id),
                 h(
                   'div',
                   { class: 'agent-stats mono' },
-                  h('span', null, fmt.num(a.active_vus, 0) + ' VUs'),
+                  h(
+                    'span',
+                    null,
+                    fmt.num(a.active_vus, 0) +
+                      (a.healthy ? ' active VUs' : ' VUs last reported')
+                  ),
                   h('span', null, a.cores + ' cores'),
-                  h('span', { class: 'muted' }, 'seen ' + fmt.ago(a.last_heartbeat_ms))
+                  h(
+                    'span',
+                    { class: 'muted' },
+                    'seen ' +
+                      (a.last_heartbeat_age_ms == null
+                        ? fmt.ago(a.last_heartbeat_ms)
+                        : fmt.age(a.last_heartbeat_age_ms))
+                  )
+                ),
+                h(
+                  'div',
+                  { class: 'agent-meta mono' },
+                  h(
+                    'span',
+                    { class: 'muted', title: a.peer_addr || 'peer unavailable' },
+                    'peer ' + (a.peer_addr || 'unavailable')
+                  ),
+                  h('span', { class: 'muted' }, a.version ? 'v' + a.version : 'version unavailable'),
+                  h('span', { class: 'muted' }, 'rev ' + (a.revision || 'unavailable'))
                 ),
                 h(
                   'div',
@@ -1287,6 +1748,7 @@
   Pages.logs = {
     mount(main) {
       let paused = false;
+      let available = true;
       const pauseBtn = h(
         'button',
         {
@@ -1305,7 +1767,7 @@
       );
 
       async function refresh() {
-        if (paused) return;
+        if (paused || !available) return;
         try {
           const logs = await API.get('/api/logs');
           const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
@@ -1329,7 +1791,19 @@
           }
         }
       }
-      refresh();
+      API.get('/api/capabilities').then((capabilities) => {
+        available = capabilities.logs_available;
+        if (!available) {
+          pauseBtn.disabled = true;
+          box.replaceChildren(h(
+            'div',
+            { class: 'muted' },
+            'Backend log capture is not available in ' + capabilities.mode.replace('_', ' ') + ' mode.'
+          ));
+        } else {
+          refresh();
+        }
+      }).catch(refresh);
       const timer = setInterval(refresh, 2000);
       return () => clearInterval(timer);
     },
@@ -1384,9 +1858,21 @@
     });
   }
 
+  async function initBuildVersion() {
+    try {
+      const info = await API.get('/api/version');
+      if (info && info.version && info.revision) {
+        $('#build-version').textContent = `loadr ${info.version} (${info.revision})`;
+      }
+    } catch (e) {
+      /* Keep the static footer label if build metadata cannot be loaded. */
+    }
+  }
+
   window.addEventListener('hashchange', () => App.route());
   document.addEventListener('DOMContentLoaded', () => {
     initTheme();
+    initBuildVersion();
     Login.init();
     App.route();
   });

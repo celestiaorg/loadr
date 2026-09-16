@@ -674,11 +674,11 @@ DEMOS = [
         "category": "Adopt loadr",
         "tagline": "Watch a distributed controller + agents drive one run from the Web UI.",
         "description": "Point the Web UI at a distributed run and watch the whole fleet at once \u2014 each agent's contribution and the merged, true-percentile result. The distributed engine with a live face.",
-        "command": "loadr run examples/15-distributed.yaml --ui",
+        "command": "loadr controller --ui-bind 127.0.0.1:6464",
         "highlights": [
             "Controller + agents in one view",
             "Merged HDR percentiles, live",
-            "Distributed load with a UI",
+            "Acknowledged controls + fleet completeness",
         ],
         "docs": "/docs/distributed/overview.html",
         "video": "10-agent-fleet",

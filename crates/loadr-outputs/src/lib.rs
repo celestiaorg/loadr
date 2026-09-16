@@ -63,17 +63,22 @@ pub fn build_outputs(
                 listen,
                 remote_write_url,
                 interval,
+                final_scrape_grace,
             } => {
                 if listen.is_none() && remote_write_url.is_none() {
                     return Err(EngineError::Config(
                         "prometheus output requires `listen` and/or `remote_write_url`".to_string(),
                     ));
                 }
-                outputs.push(Box::new(PrometheusOutput::new(
+                let mut output = PrometheusOutput::new(
                     listen.clone(),
                     remote_write_url.clone(),
                     interval_or_default(interval),
-                )));
+                );
+                if let Some(grace) = final_scrape_grace {
+                    output = output.with_final_scrape_grace(grace.as_duration());
+                }
+                outputs.push(Box::new(output));
             }
             OutputConfig::Influxdb {
                 url,
@@ -184,6 +189,7 @@ mod tests {
                 listen: Some("127.0.0.1:0".into()),
                 remote_write_url: None,
                 interval: None,
+                final_scrape_grace: None,
             },
             OutputConfig::Influxdb {
                 url: "http://127.0.0.1:8086".into(),
@@ -221,6 +227,7 @@ mod tests {
             listen: None,
             remote_write_url: None,
             interval: None,
+            final_scrape_grace: None,
         }];
         match build_outputs(&configs, std::path::Path::new(".")) {
             Err(EngineError::Config(msg)) => {

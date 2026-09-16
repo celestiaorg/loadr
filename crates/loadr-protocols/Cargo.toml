@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-description = "Built-in protocol handlers for loadr: HTTP/1.1+HTTP/2, GraphQL, WebSocket, gRPC, raw TCP/UDP"
+description = "Built-in protocol handlers for loadr: HTTP/1.1+HTTP/2, GraphQL, WebSocket, gRPC, raw TCP/UDP, no-op self-test"
 
 [dependencies]
 loadr-core = { workspace = true }
@@ -19,6 +19,7 @@ hyper-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
 pin-project-lite = { workspace = true }
 
 rustls = { workspace = true }
@@ -50,3 +51,4 @@ loadr-testserver = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 indexmap = { workspace = true }
+base64 = { workspace = true }

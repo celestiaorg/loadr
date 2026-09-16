@@ -333,6 +333,7 @@ loadr_plugin_api::export_loadr_plugin! {
         make_output: RSome(make_output),
         make_protocol: RNone,
         make_service: RNone,
+        make_data_source: RNone,
     }
 }
 

@@ -1,6 +1,7 @@
 //! `loadr run` — standalone runs (optionally with the live web UI) and
 //! submission to a distributed controller.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,12 +53,17 @@ pub struct RunArgs {
     /// Dump full HTTP requests and responses (verbose; sets LOADR_HTTP_DEBUG).
     #[arg(long)]
     pub http_debug: bool,
+    /// Tokio worker threads for the run (default: number of CPUs)
+    #[arg(long, env = "LOADR_WORKER_THREADS")]
+    pub worker_threads: Option<usize>,
 }
 
 pub fn execute(args: RunArgs, quiet: bool) -> anyhow::Result<i32> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = args.worker_threads {
+        builder.worker_threads(n.max(1));
+    }
+    let runtime = builder.enable_all().build()?;
     runtime.block_on(async move {
         match &args.controller {
             Some(addr) => submit_remote(&args, addr).await,
@@ -142,6 +148,7 @@ pub fn build_engine(
         .unwrap_or_else(loadr_plugin_api::default_plugins_dir);
     let mut outputs = extra_outputs;
     let mut services: Vec<Box<dyn loadr_plugin_api::ServicePlugin>> = Vec::new();
+    let mut data_sources: HashMap<String, Box<dyn loadr_core::DataSourcePlugin>> = HashMap::new();
     for plugin_ref in &plan.plugins {
         if !plugin_ref.enabled {
             continue;
@@ -151,7 +158,20 @@ pub fn build_engine(
         match loaded {
             loadr_plugin_api::LoadedPlugin::Protocol(handler) => protocols.register(handler),
             loadr_plugin_api::LoadedPlugin::Output(output) => outputs.push(output),
-            loadr_plugin_api::LoadedPlugin::Service(service) => services.push(service),
+            loadr_plugin_api::LoadedPlugin::Service {
+                service,
+                data_source,
+            } => {
+                if let Some(service) = service {
+                    services.push(service);
+                }
+                if let Some(data_source) = data_source {
+                    // Keyed by the plan's `plugins:` name, not the plugin's
+                    // self-reported `info().name` -- that's what
+                    // `data.<name>.source` and validation refer to.
+                    data_sources.insert(plugin_ref.name.clone(), data_source);
+                }
+            }
             loadr_plugin_api::LoadedPlugin::Extractor(_)
             | loadr_plugin_api::LoadedPlugin::Assertion(_) => {
                 tracing::info!(
@@ -191,6 +211,7 @@ pub fn build_engine(
             protocols,
             script,
             outputs,
+            data_sources,
             ..Default::default()
         },
     )?;
@@ -496,7 +517,7 @@ async fn submit_remote(args: &RunArgs, controller: &str) -> anyhow::Result<i32> 
             .or_else(|| info["state"].as_str())
             .unwrap_or("unknown");
         match state {
-            "finished" | "failed" => {
+            "finished" | "degraded" | "aborted" | "failed" => {
                 let summary = crate::commands::controller::http_json(
                     &client,
                     http::Method::GET,
@@ -549,13 +570,31 @@ impl loadr_plugin_webui::UiBackend for SingleRunBackend {
     }
 
     fn runs(&self) -> Vec<loadr_plugin_webui::RunInfo> {
-        let (state, passed) = match self.handle.status() {
+        let (mut state, mut passed) = match self.handle.status() {
             loadr_core::RunStatus::Pending => ("pending", None),
             loadr_core::RunStatus::Running => ("running", None),
             loadr_core::RunStatus::Stopping => ("stopping", None),
             loadr_core::RunStatus::Finished { passed } => ("finished", Some(passed)),
         };
         let summary = self.summary.lock();
+        if summary
+            .as_ref()
+            .is_some_and(|summary| summary.aborted.is_some())
+        {
+            state = "aborted";
+            passed = Some(false);
+        }
+        if state == "finished"
+            && summary.as_ref().is_none_or(|summary| {
+                summary.thresholds.is_empty()
+                    || summary
+                        .thresholds
+                        .iter()
+                        .any(|threshold| threshold.observed.is_none())
+            })
+        {
+            passed = None;
+        }
         vec![loadr_plugin_webui::RunInfo {
             run_id: self.handle.run_id.to_string(),
             name: Some(self.name.clone()),
@@ -563,11 +602,16 @@ impl loadr_plugin_webui::UiBackend for SingleRunBackend {
             passed,
             started_ms: self.started_ms,
             ended_ms: summary.as_ref().map(|s| s.ended_ms),
+            observed_ms: loadr_core::metrics::now_millis(),
             scenarios: summary
                 .as_ref()
                 .map(|s| s.scenarios.clone())
                 .unwrap_or_default(),
             agents: Vec::new(),
+            contributing_agents: Vec::new(),
+            lost_agents: Vec::new(),
+            complete: None,
+            on_agent_loss: None,
         }]
     }
 
@@ -642,5 +686,15 @@ impl loadr_plugin_webui::UiBackend for SingleRunBackend {
 
     fn recent_logs(&self) -> Vec<loadr_plugin_webui::LogLine> {
         Vec::new()
+    }
+
+    fn capabilities(&self) -> loadr_plugin_webui::UiCapabilities {
+        loadr_plugin_webui::UiCapabilities {
+            mode: "single_run".to_string(),
+            can_start_runs: false,
+            can_edit_tests: false,
+            logs_available: false,
+            persistent_history: false,
+        }
     }
 }

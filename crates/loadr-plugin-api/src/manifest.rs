@@ -112,6 +112,12 @@ struct ManifestPlugin {
     /// scheme to this plugin once installed.
     #[serde(default)]
     schemes: Vec<String>,
+    /// Informational capability list (e.g. `["data_source"]` for a
+    /// `kind = "service"` plugin). Authoritative capability detection is
+    /// the loaded module's `make_data_source`/`make_service` presence, not
+    /// this field.
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 /// A parsed, resolved plugin manifest.
@@ -132,6 +138,8 @@ pub struct PluginManifest {
     /// Empty for non-protocol plugins or protocol plugins routed only by an
     /// explicit `protocol:` matching the plugin name.
     pub schemes: Vec<String>,
+    /// Informational capability list from `[plugin].capabilities`.
+    pub capabilities: Vec<String>,
     /// The plugin's installation directory.
     pub dir: PathBuf,
     /// False when a `disabled` marker file is present in `dir`.
@@ -162,6 +170,7 @@ impl PluginManifest {
             entry: dir.join(&p.entry),
             description: p.description,
             schemes: p.schemes,
+            capabilities: p.capabilities,
             default_config,
             dir: dir.to_path_buf(),
             enabled: !dir.join(crate::registry::DISABLED_MARKER).exists(),
@@ -259,6 +268,27 @@ schemes = ["mongodb", "mongo"]
     fn schemes_default_empty() {
         let m = PluginManifest::parse(MANIFEST, Path::new("/p/x")).expect("parses");
         assert!(m.schemes.is_empty());
+    }
+
+    #[test]
+    fn capabilities_default_empty_and_parse_when_present() {
+        let m = PluginManifest::parse(MANIFEST, Path::new("/p/x")).expect("parses");
+        assert!(m.capabilities.is_empty());
+
+        let m = PluginManifest::parse(
+            r#"
+[plugin]
+name = "tx-signer"
+version = "0.1.0"
+kind = "service"
+type = "native"
+entry = "libtx_signer.so"
+capabilities = ["data_source"]
+"#,
+            Path::new("/p/tx-signer"),
+        )
+        .expect("manifest parses");
+        assert_eq!(m.capabilities, vec!["data_source".to_string()]);
     }
 
     #[test]

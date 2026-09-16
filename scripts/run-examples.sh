@@ -84,6 +84,7 @@ build_install_plugin loadr-plugin-postgres      loadr_plugin_postgres      loadr
 build_install_plugin loadr-plugin-mysql         loadr_plugin_mysql         loadr-plugin-mysql         29-mysql.yaml
 build_install_plugin loadr-plugin-elasticsearch loadr_plugin_elasticsearch loadr-plugin-elasticsearch 33-elasticsearch.yaml
 build_install_plugin loadr-plugin-rabbitmq loadr_plugin_rabbitmq loadr-plugin-rabbitmq 32-rabbitmq.yaml
+build_install_plugin loadr-plugin-example-native-data-source native_data_source examples/native-data-source '50/51-plugin-data-source.yaml'
 
 # The C-ABI example plugin (`c-echo`) is built with the system C compiler, not
 # cargo — it proves a non-Rust protocol plugin loads over the frozen C ABI.
@@ -161,7 +162,7 @@ run_one() {  # $1 = example file (in RUNDIR), $2.. = extra loadr args
   local base; base="$(basename "$f")"
   repoint < "$f" > "$f.local" && mv "$f.local" "$f"
   local out; out="$("$LOADR" run "$@" "$f" 2>&1)"; local code=$?
-  local reqs; reqs="$(echo "$out" | grep -oE '(http_reqs|plugin_reqs|grpc_reqs|postgres_reqs|mysql_reqs|mongo_reqs|redis_reqs|kafka_reqs|rabbitmq_reqs|elasticsearch_reqs|ws_msgs_received)\.+: [0-9]+' | grep -oE '[0-9]+' | head -1)"
+  local reqs; reqs="$(echo "$out" | grep -oE '(http_reqs|plugin_reqs|grpc_reqs|noop_reqs|postgres_reqs|mysql_reqs|mongo_reqs|redis_reqs|kafka_reqs|rabbitmq_reqs|elasticsearch_reqs|ws_msgs_received)\.+: [0-9]+' | grep -oE '[0-9]+' | head -1)"
   NAMES+=("$base"); EXITS+=("$code"); NOTE+=("${reqs:-0} reqs")
 }
 

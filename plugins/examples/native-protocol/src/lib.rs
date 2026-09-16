@@ -115,5 +115,6 @@ loadr_plugin_api::export_loadr_plugin! {
         make_output: RNone,
         make_protocol: RSome(make_protocol),
         make_service: RNone,
+        make_data_source: RNone,
     }
 }

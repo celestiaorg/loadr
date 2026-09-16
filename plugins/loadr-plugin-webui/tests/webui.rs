@@ -164,7 +164,10 @@ impl TestServer {
             let (status, detail) = self.call("GET", &format!("/api/runs/{run_id}"), None).await;
             assert_eq!(status, http::StatusCode::OK, "run detail: {detail}");
             let state = detail["run"]["state"].as_str().unwrap_or("").to_string();
-            if state == "finished" || state == "failed" {
+            if matches!(
+                state.as_str(),
+                "finished" | "degraded" | "aborted" | "failed"
+            ) {
                 return detail;
             }
             assert!(
@@ -234,6 +237,12 @@ async fn auth_basic_bearer_and_401() {
     assert_eq!(status, http::StatusCode::OK);
     assert_eq!(&body[..], b"ok");
 
+    // Build metadata is public so the pre-authentication UI can render it.
+    let (status, version) = server.call("GET", "/api/version", None).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(version["version"], loadr_core::build_info::VERSION);
+    assert_eq!(version["revision"], loadr_core::build_info::GIT_REVISION);
+
     // Wrong basic → 401.
     use base64::Engine as _;
     let bad = format!(
@@ -280,10 +289,10 @@ async fn run_lifecycle_and_summary() {
 
     let detail = server.wait_finished(&run_id, Duration::from_secs(15)).await;
     assert_eq!(detail["run"]["state"], "finished");
-    assert_eq!(detail["run"]["passed"], true);
+    assert!(detail["run"]["passed"].is_null());
     assert_eq!(detail["run"]["scenarios"][0], "hit");
 
-    // Run list shows it finished and passed.
+    // A run without thresholds is finished, not presented as a gated pass.
     let (status, runs) = server.call("GET", "/api/runs", None).await;
     assert_eq!(status, http::StatusCode::OK);
     let run = runs
@@ -292,8 +301,12 @@ async fn run_lifecycle_and_summary() {
         .expect("run in list")
         .clone();
     assert_eq!(run["state"], "finished");
-    assert_eq!(run["passed"], true);
+    assert!(run["passed"].is_null());
     assert_eq!(run["name"], "tiny");
+    assert!(
+        run["ended_ms"].as_u64().expect("ended_ms")
+            >= run["started_ms"].as_u64().expect("started_ms")
+    );
 
     // Summary: exactly 20 requests.
     let (status, summary) = server
@@ -306,6 +319,18 @@ async fn run_lifecycle_and_summary() {
         .find(|m| m["metric"] == "http_reqs")
         .expect("http_reqs metric");
     assert_eq!(http_reqs["agg"]["sum"], 20.0);
+    let request_reqs = metrics
+        .iter()
+        .find(|m| m["metric"] == "request_reqs")
+        .expect("canonical request rollup");
+    assert_eq!(request_reqs["agg"]["sum"], 20.0);
+    assert_eq!(summary["final_metrics"]["attempts"], 20);
+    assert_eq!(summary["final_metrics"]["successful_requests"], 20);
+    assert_eq!(summary["final_metrics"]["failed_requests"], 0);
+    assert_eq!(
+        summary["final_metrics"]["metric_contract"]["rate_denominator"],
+        "full observed duration"
+    );
 
     // Snapshot endpoint serves the last-known snapshot for finished runs.
     let (status, snapshot) = server
@@ -314,17 +339,23 @@ async fn run_lifecycle_and_summary() {
     assert_eq!(status, http::StatusCode::OK);
     assert!(snapshot["series"].as_array().is_some_and(|s| !s.is_empty()));
 
-    // Overview metrics carry the failure breakdown the UI panel renders.
+    // Finished Overview uses frozen full-run metrics, never a live interval.
     let (status, overview) = server.call("GET", "/api/overview", None).await;
     assert_eq!(status, http::StatusCode::OK);
-    let failures = &overview["metrics"]["failures"];
+    assert!(overview["metrics"].is_null());
+    let failures = &overview["final_metrics"]["failures"];
     assert!(
         failures.is_object(),
         "failures breakdown present: {overview}"
     );
-    assert!(failures["total"].is_number());
+    assert!(failures["event_total"].is_number());
+    assert!(failures["failed_requests"].is_number());
     assert!(failures["by_status"].is_array());
     assert!(failures["by_exception"].is_array());
+    assert_eq!(
+        overview["final_metrics"]["metric_contract"]["latency_percentile_quality"],
+        "exact_merged_histogram"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -455,7 +486,7 @@ async fn sse_stream_emits_snapshots() {
         .to_string();
     assert!(content_type.contains("text/event-stream"), "{content_type}");
 
-    // Read frames until we have ≥2 parsed snapshot events with an rps field.
+    // Read frames until we have multiple parsed snapshot events.
     let mut body = res.into_body();
     let mut buf = String::new();
     let mut snapshots: Vec<serde_json::Value> = Vec::new();
@@ -490,15 +521,21 @@ async fn sse_stream_emits_snapshots() {
         snapshots.len()
     );
     for snap in &snapshots {
-        assert!(snap["rps"].is_number(), "snapshot missing rps: {snap}");
+        assert!(
+            snap["rps"].is_number() || snap["rps"].is_null(),
+            "invalid rps compatibility field: {snap}"
+        );
         assert!(snap["latency"].is_object());
         assert!(snap["state"].is_string());
     }
-    // At least one mid-run snapshot should show actual traffic.
+    // At least one mid-run snapshot should show one compatible request sample.
     assert!(
-        snapshots
-            .iter()
-            .any(|s| s["rps"].as_f64().unwrap_or(0.0) > 0.0),
+        snapshots.iter().any(|snapshot| {
+            snapshot["attempts_per_second"].as_f64().unwrap_or(0.0) > 0.0
+                && snapshot["successful_per_second"].is_number()
+                && snapshot["failed_per_second"].is_number()
+                && snapshot["request_error_rate"].is_number()
+        }),
         "no snapshot showed traffic"
     );
 
@@ -626,6 +663,12 @@ async fn stop_endpoint_ends_run_early() {
 async fn overview_shape() {
     let server = TestServer::start(AuthConfig::default(), None).await;
 
+    let (status, capabilities) = server.call("GET", "/api/capabilities", None).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(capabilities["mode"], "standalone");
+    assert_eq!(capabilities["logs_available"], true);
+    assert_eq!(capabilities["persistent_history"], true);
+
     // Empty backend: nulls and zero counts.
     let (status, overview) = server.call("GET", "/api/overview", None).await;
     assert_eq!(status, http::StatusCode::OK);
@@ -648,11 +691,14 @@ async fn overview_shape() {
     assert_eq!(overview["run"]["name"], "ov-test");
     assert_eq!(overview["total_runs"], 1);
     assert_eq!(overview["live_runs"], 0);
-    let metrics = &overview["metrics"];
-    assert!(metrics["latency"].is_object(), "{overview}");
-    assert!(metrics["rps"].is_number());
-    assert!(metrics["per_scenario"].is_array());
-    assert!(metrics["checks"]["passes"].is_number());
+    assert!(overview["metrics"].is_null());
+    let metrics = &overview["final_metrics"];
+    assert_eq!(metrics["window"], "full_observed_run");
+    assert_eq!(metrics["attempts"], 20);
+    assert_eq!(metrics["successful_requests"], 20);
+    assert_eq!(metrics["failed_requests"], 0);
+    assert!(metrics["average_attempts_per_second"].is_number());
+    assert!(metrics["latency"]["p95"].is_number());
 
     // Logs captured backend activity.
     let (_, logs) = server.call("GET", "/api/logs", None).await;
@@ -676,6 +722,7 @@ async fn static_spa_served_with_content_types() {
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains("loadr"), "index.html must contain 'loadr'");
     assert!(html.contains("app.js"));
+    assert!(html.contains("id=\"build-version\""));
 
     let (status, headers, body) = server.raw("/app.js").await;
     assert_eq!(status, http::StatusCode::OK);
@@ -685,6 +732,21 @@ async fn static_spa_served_with_content_types() {
         .unwrap_or("");
     assert!(ct.contains("javascript"), "{ct}");
     assert!(!body.is_empty());
+    let app_js = String::from_utf8_lossy(&body);
+    assert!(app_js.contains("/api/version"));
+    assert!(app_js.contains("title: a.name"));
+    assert!(app_js.contains("title: a.id"));
+    assert!(app_js.contains("a.peer_addr"));
+    assert!(app_js.contains("Response status"));
+    assert!(app_js.contains("response_status"));
+    assert!(app_js.contains("category,protocol,cause,count,share_pct,denominator_count"));
+    assert!(app_js.contains("Request attempts/s"));
+    assert!(app_js.contains("FINAL — full observed run"));
+    assert!(app_js.contains("thresholds failed"));
+    assert!(app_js.contains("failureEventTotal"));
+    assert!(app_js.contains("No failures recorded yet"));
+    assert!(!app_js.contains("Failed HTTP status"));
+    assert!(!app_js.contains("failGroupCard('by_status', 'HTTP status')"));
 
     let (status, headers, _) = server.raw("/style.css").await;
     assert_eq!(status, http::StatusCode::OK);

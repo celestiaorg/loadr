@@ -7,6 +7,7 @@
 //! abstractions the other crates plug into.
 
 pub mod aggregate;
+pub mod build_info;
 pub mod conditions;
 pub mod cookies;
 pub mod data;
@@ -25,9 +26,10 @@ pub mod thresholds;
 pub mod vu;
 
 pub use aggregate::{AggValues, Aggregator, MetricsDelta, SeriesSnapshot, Snapshot};
+pub use data::{DataSourcePlugin, PluginRowCtx, PluginRowResult, RowIdentity, VuPlacement};
 pub use engine::{Engine, EngineOptions, RunHandle, RunResult, RunStatus};
 pub use error::{EngineError, ProtocolError, ScriptError};
-pub use executor::partition_spec;
+pub use executor::{partition_spec, vu_capacity};
 pub use flow::{FlowRunner, IterationOutcome, ScenarioProgram};
 pub use metrics::{MetricKind, MetricRegistry, MetricsBus, Sample, Tags};
 pub use output::{ChannelOutput, Output};

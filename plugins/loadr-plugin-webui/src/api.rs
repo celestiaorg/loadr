@@ -37,8 +37,22 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Public build metadata used by the embedded UI footer.
+pub(crate) async fn version() -> Json<Value> {
+    Json(json!({
+        "version": loadr_core::build_info::VERSION,
+        "revision": loadr_core::build_info::GIT_REVISION,
+    }))
+}
+
 pub(crate) async fn overview(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(overview_json(state.backend.as_ref()))
+}
+
+pub(crate) async fn capabilities(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::UiCapabilities> {
+    Json(state.backend.capabilities())
 }
 
 pub(crate) async fn list_runs(State(state): State<Arc<AppState>>) -> Json<Vec<crate::RunInfo>> {
@@ -68,6 +82,14 @@ pub(crate) async fn start_run(
     if let Err(e) = loadr_config::load_str(&body.yaml, &opts) {
         return Err(ApiError::Unprocessable(config_error_diagnostics(e)));
     }
+    if let Err(message) = state
+        .backend
+        .validate_references(&body.yaml, body.env.as_deref())
+    {
+        return Err(ApiError::Unprocessable(vec![Diagnostic::error(
+            "files", message,
+        )]));
+    }
     let run_id = state
         .backend
         .start_test(body.name, body.yaml, body.env)
@@ -87,15 +109,13 @@ pub(crate) async fn run_detail(
         .find(|r| r.run_id == id)
         .ok_or_else(|| ApiError::NotFound(format!("run `{id}` not found")))?;
     let thresholds = state.backend.run_thresholds(&id);
-    let (externally_controlled, is_paused) = match state.backend.run_handle(&id) {
-        Some(h) => (h.externally_controlled_scenarios(), h.is_paused()),
-        None => (Vec::new(), false),
-    };
+    let control = state.backend.run_control_state(&id);
     Ok(Json(json!({
         "run": info,
         "thresholds": thresholds,
-        "externally_controlled": externally_controlled,
-        "is_paused": is_paused,
+        "externally_controlled": control.externally_controlled,
+        "is_paused": control.is_paused,
+        "control_agent_confirmed": control.agent_confirmed,
     })))
 }
 
@@ -113,12 +133,21 @@ pub(crate) async fn run_snapshot(
 pub(crate) async fn run_summary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<loadr_core::Summary>, ApiError> {
-    state
+) -> Result<Json<Value>, ApiError> {
+    let summary = state
         .backend
         .run_summary(&id)
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound(format!("run `{id}` has no summary (still live?)")))
+        .ok_or_else(|| ApiError::NotFound(format!("run `{id}` has no summary (still live?)")))?;
+    let run = state
+        .backend
+        .runs()
+        .into_iter()
+        .find(|run| run.run_id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("run `{id}` not found")))?;
+    let mut payload = serde_json::to_value(&summary)
+        .map_err(|error| ApiError::Bad(format!("cannot serialize run summary: {error}")))?;
+    payload["final_metrics"] = crate::payload::final_payload(&summary, &run);
+    Ok(Json(payload))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -133,12 +162,15 @@ pub(crate) async fn stop_run(
     body: Option<Json<StopBody>>,
 ) -> Result<Json<Value>, ApiError> {
     let kill = body.map(|Json(b)| b.kill).unwrap_or(false);
+    let confirmed = state.backend.run_control_state(&id).agent_confirmed;
     state
         .backend
         .stop_run(&id, kill)
         .await
         .map_err(ApiError::Bad)?;
-    Ok(Json(json!({ "stopped": true, "kill": kill })))
+    Ok(Json(
+        json!({ "requested": true, "confirmed": confirmed, "kill": kill }),
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -151,12 +183,15 @@ pub(crate) async fn pause_run(
     Path(id): Path<String>,
     Json(body): Json<PauseBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let confirmed = state.backend.run_control_state(&id).agent_confirmed;
     state
         .backend
         .pause_run(&id, body.paused)
         .await
         .map_err(ApiError::Bad)?;
-    Ok(Json(json!({ "paused": body.paused })))
+    Ok(Json(
+        json!({ "paused": body.paused, "confirmed": confirmed }),
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -170,12 +205,15 @@ pub(crate) async fn scale_run(
     Path(id): Path<String>,
     Json(body): Json<ScaleBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let confirmed = state.backend.run_control_state(&id).agent_confirmed;
     state
         .backend
         .scale_run(&id, &body.scenario, body.vus)
         .await
         .map_err(ApiError::Bad)?;
-    Ok(Json(json!({ "scenario": body.scenario, "vus": body.vus })))
+    Ok(Json(
+        json!({ "scenario": body.scenario, "vus": body.vus, "confirmed": confirmed }),
+    ))
 }
 
 pub(crate) async fn agents(State(state): State<Arc<AppState>>) -> Json<Vec<crate::AgentView>> {
@@ -221,18 +259,29 @@ pub(crate) struct ValidateBody {
 }
 
 pub(crate) async fn validate(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<ValidateBody>,
 ) -> Json<Value> {
     let opts = LoadOptions {
-        env: body.env,
+        env: body.env.clone(),
         check_files: false,
         deny_errors: false,
     };
-    let diagnostics = match loadr_config::load_str(&body.yaml, &opts) {
+    let mut diagnostics = match loadr_config::load_str(&body.yaml, &opts) {
         Ok(loaded) => loaded.diagnostics,
         Err(e) => config_error_diagnostics(e),
     };
+    if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == loadr_config::Severity::Error)
+    {
+        if let Err(message) = state
+            .backend
+            .validate_references(&body.yaml, body.env.as_deref())
+        {
+            diagnostics.push(Diagnostic::error("files", message));
+        }
+    }
     Json(json!({ "diagnostics": diagnostics }))
 }
 
@@ -251,10 +300,14 @@ fn config_error_diagnostics(err: ConfigError) -> Vec<Diagnostic> {
             available,
         } => vec![Diagnostic::error(
             "env",
-            format!(
-                "unknown environment `{requested}`; available: {}",
-                available.join(", ")
-            ),
+            if available.is_empty() {
+                format!("unknown environment `{requested}`; no environments are defined")
+            } else {
+                format!(
+                    "unknown environment `{requested}`; available: {}",
+                    available.join(", ")
+                )
+            },
         )],
         other => vec![Diagnostic::error("", other.to_string())],
     }

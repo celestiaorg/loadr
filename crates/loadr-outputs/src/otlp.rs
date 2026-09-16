@@ -139,6 +139,10 @@ impl Output for OtlpOutput {
         "otlp"
     }
 
+    fn wants_samples(&self) -> bool {
+        false
+    }
+
     async fn start(&mut self) -> Result<(), EngineError> {
         let latest = self.latest.clone();
         let interval = self.interval;

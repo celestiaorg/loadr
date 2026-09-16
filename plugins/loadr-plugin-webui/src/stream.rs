@@ -44,7 +44,7 @@ pub(crate) async fn run_stream(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
     match state.backend.run_handle(&id) {
         Some(handle) => {
-            tokio::spawn(live_run_stream(handle, tx));
+            tokio::spawn(live_run_stream(handle, state.backend.clone(), id, tx));
         }
         None if matches!(info.state.as_str(), "pending" | "running" | "stopping") => {
             // No local handle (distributed run): poll the backend snapshot.
@@ -57,7 +57,15 @@ pub(crate) async fn run_stream(
                         break;
                     };
                     if let Some(snap) = backend.run_snapshot(&id) {
-                        let payload = live_payload(&snap, &backend.run_thresholds(&id), &run.state);
+                        let exact = backend.run_aggregate_snapshot(&id);
+                        let control = backend.run_control_state(&id);
+                        let payload = live_payload(
+                            &snap,
+                            exact.as_deref(),
+                            &backend.run_thresholds(&id),
+                            &run,
+                            &control,
+                        );
                         if tx.send(sse_event("snapshot", &payload)).await.is_err() {
                             break;
                         }
@@ -74,7 +82,15 @@ pub(crate) async fn run_stream(
         None => {
             // Finished run: replay the last-known state once, then end.
             if let Some(snap) = state.backend.run_snapshot(&id) {
-                let payload = live_payload(&snap, &state.backend.run_thresholds(&id), &info.state);
+                let exact = state.backend.run_aggregate_snapshot(&id);
+                let control = state.backend.run_control_state(&id);
+                let payload = live_payload(
+                    &snap,
+                    exact.as_deref(),
+                    &state.backend.run_thresholds(&id),
+                    &info,
+                    &control,
+                );
                 let _ = tx.try_send(sse_event("snapshot", &payload));
             }
             let _ = tx.try_send(sse_event(
@@ -86,17 +102,29 @@ pub(crate) async fn run_stream(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
-async fn live_run_stream(handle: RunHandle, tx: mpsc::Sender<Result<Event, Infallible>>) {
+async fn live_run_stream(
+    handle: RunHandle,
+    backend: Arc<dyn UiBackend>,
+    id: String,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) {
     let mut snapshots = handle.watch_snapshots();
     let mut status = handle.watch_status();
 
     let send_snapshot = |tx: &mpsc::Sender<Result<Event, Infallible>>,
                          handle: &RunHandle,
                          snap: Arc<loadr_core::Snapshot>| {
+        let Some(run) = backend.runs().into_iter().find(|run| run.run_id == id) else {
+            return false;
+        };
+        let exact = backend.run_aggregate_snapshot(&id);
+        let control = backend.run_control_state(&id);
         let payload = live_payload(
             &snap,
+            exact.as_deref(),
             &handle.threshold_statuses(),
-            status_string(&handle.status()),
+            &run,
+            &control,
         );
         tx.try_send(sse_event("snapshot", &payload)).is_ok()
     };
@@ -129,10 +157,17 @@ async fn live_run_stream(handle: RunHandle, tx: mpsc::Sender<Result<Event, Infal
                     break;
                 }
                 let snap = snapshots.borrow_and_update().clone();
+                let Some(run) = backend.runs().into_iter().find(|run| run.run_id == id) else {
+                    break;
+                };
+                let exact = backend.run_aggregate_snapshot(&id);
+                let control = backend.run_control_state(&id);
                 let payload = live_payload(
                     &snap,
+                    exact.as_deref(),
                     &handle.threshold_statuses(),
-                    status_string(&handle.status()),
+                    &run,
+                    &control,
                 );
                 if tx.send(sse_event("snapshot", &payload)).await.is_err() {
                     return;
@@ -143,7 +178,7 @@ async fn live_run_stream(handle: RunHandle, tx: mpsc::Sender<Result<Event, Infal
                     break;
                 }
                 let new_status = status.borrow_and_update().clone();
-                let passed = match &new_status {
+                let default_passed = match &new_status {
                     RunStatus::Finished { passed } => Some(*passed),
                     _ => None,
                 };
@@ -158,10 +193,17 @@ async fn live_run_stream(handle: RunHandle, tx: mpsc::Sender<Result<Event, Infal
                     let snap = snapshots.borrow_and_update().clone();
                     let _ = send_snapshot(&tx, &handle, snap);
                 }
+                let reported = finished
+                    .then(|| backend.runs().into_iter().find(|run| run.run_id == id))
+                    .flatten();
+                let (reported_state, reported_passed) = match reported {
+                    Some(run) => (run.state, run.passed),
+                    None => (status_string(&new_status).to_string(), default_passed),
+                };
                 if tx
                     .send(sse_event(
                         "status",
-                        &status_payload(status_string(&new_status), passed),
+                        &status_payload(&reported_state, reported_passed),
                     ))
                     .await
                     .is_err()

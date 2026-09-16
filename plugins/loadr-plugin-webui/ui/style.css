@@ -210,7 +210,7 @@ a:hover {
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr));
   gap: 14px;
   margin-bottom: 16px;
 }
@@ -234,7 +234,7 @@ a:hover {
 
 .chart-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
   gap: 16px;
 }
 canvas.chart {
@@ -310,10 +310,17 @@ canvas.chart-short {
   border-color: var(--accent);
 }
 .pill-pending,
-.pill-stopping {
+.pill-stopping,
+.pill-degraded,
+.pill-aborted {
   color: var(--warn);
   background: rgba(210, 153, 34, 0.12);
   border-color: var(--warn);
+}
+.pill-finished {
+  color: var(--muted);
+  background: var(--panel-2);
+  border-color: var(--border);
 }
 .pill-passed {
   color: var(--ok);
@@ -334,11 +341,40 @@ canvas.chart-short {
   color: var(--warn);
   background: rgba(210, 153, 34, 0.08);
 }
+.live-banner,
+.final-banner {
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.live-banner-paused,
+.live-banner-stopping,
+.live-banner-pending {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: rgba(210, 153, 34, 0.08);
+}
+.final-banner {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--panel-2);
+}
 
 /* Tables -------------------------------------------------------------------- */
 .table {
   width: 100%;
   border-collapse: collapse;
+}
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
 }
 .table th,
 .table td {
@@ -411,7 +447,8 @@ canvas.chart-short {
 .data-rates {
   margin-top: 10px;
   font-size: 12px;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Buttons / inputs ------------------------------------------------------------ */
@@ -636,6 +673,11 @@ canvas.chart-short {
   gap: 8px;
   margin-bottom: 8px;
 }
+.agent-id {
+  margin: -3px 0 8px 18px;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
 .health-dot {
   width: 10px;
   height: 10px;
@@ -654,6 +696,14 @@ canvas.chart-short {
   display: flex;
   gap: 14px;
   font-size: 13px;
+  margin-bottom: 8px;
+}
+.agent-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  overflow-wrap: anywhere;
+  font-size: 11px;
   margin-bottom: 8px;
 }
 .agent-labels {
@@ -836,7 +886,7 @@ canvas.chart-short {
     justify-content: center;
     padding: 14px 6px;
   }
-  .sidebar .logo span:not(.logo-mark) {
+  .sidebar .logo-text {
     display: none;
   }
   #nav a {
@@ -856,6 +906,45 @@ canvas.chart-short {
   }
   .tests-layout {
     grid-template-columns: 1fr;
+  }
+  #main {
+    padding: 18px 18px 48px;
+  }
+}
+
+@media (max-width: 520px) {
+  .sidebar {
+    width: 52px;
+  }
+  .sidebar .logo {
+    padding: 12px 4px;
+  }
+  #nav {
+    padding-inline: 5px;
+  }
+  #nav a {
+    padding-inline: 8px;
+  }
+  #main {
+    padding: 14px 12px 40px;
+  }
+  .card {
+    padding: 12px;
+  }
+  .page-head {
+    gap: 8px;
+  }
+  .page-actions {
+    margin-left: 0;
+  }
+  .stat-value {
+    font-size: 25px;
+  }
+  .fail-actions,
+  .run-controls,
+  .agent-stats {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 
@@ -886,7 +975,7 @@ canvas.chart-short {
 }
 .fail-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
   gap: 16px;
 }
 .fail-group h4 {
@@ -904,6 +993,19 @@ canvas.chart-short {
 .fail-empty {
   font-size: 12px;
   padding: 2px 0;
+}
+.fail-denominator,
+.failure-contract,
+.metric-note,
+.metric-contract {
+  font-size: 12px;
+}
+.fail-denominator {
+  margin-bottom: 5px;
+}
+.failure-contract,
+.metric-note {
+  margin-bottom: 12px;
 }
 .fail-row {
   position: relative;

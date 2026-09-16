@@ -57,4 +57,7 @@ Kubernetes manifests and a Helm chart live in
 | `externally-controlled` | scale commands split like VU counts |
 
 Stage *timings* are identical everywhere — only magnitudes scale — so global
-ramps are exact. A 2-second start barrier puts every agent on the same clock.
+ramps are exact. Every agent first acknowledges readiness (files
+materialized, engine built); the controller then sets a start timestamp a
+barrier delay ahead (default 2 s), so the whole fleet starts on the same
+clock no matter how long any agent's setup took.
