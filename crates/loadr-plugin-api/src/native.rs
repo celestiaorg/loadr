@@ -9,8 +9,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use abi_stable::library::lib_header_from_path;
+use abi_stable::abi_stability::abi_checking::{check_layout_compatibility, AbiInstability};
+use abi_stable::library::{lib_header_from_path, LibHeader};
 use abi_stable::std_types::{ROption, RResult, RString};
+use abi_stable::type_layout::{TLData, TLFieldOrFunction};
+use abi_stable::StableAbi;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -18,7 +21,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use loadr_core::data::{DataSourcePlugin, PluginRowCtx, PluginRowResult, Row};
+use loadr_core::data::{DataSourcePlugin, PluginRowCtx, PluginRowResult, Row, VuPlacement};
 use loadr_core::error::{EngineError, ProtocolError};
 use loadr_core::metrics::Sample;
 use loadr_core::{
@@ -87,6 +90,41 @@ impl std::fmt::Debug for NativePlugin {
     }
 }
 
+/// Whether the library's root module differs from this host's only by
+/// lacking trailing fields of prefix types: a plugin built before a suffix
+/// field or a defaulted trait method was added. Prefix-type accessors check
+/// the library's own field count at runtime, so such a plugin is safe to load
+/// even though the layout check rejects it.
+fn only_missing_suffix_fields(header: &LibHeader) -> bool {
+    let Some(implementation) = header.layout() else {
+        return false;
+    };
+    let Err(report) = check_layout_compatibility(PluginModRef::LAYOUT, implementation) else {
+        return false;
+    };
+    // The report also carries one empty entry per enclosing type on the path
+    // to each mismatch; only entries with errors say anything.
+    let mut mismatches = report
+        .errors
+        .iter()
+        .filter(|e| !e.errs.is_empty())
+        .peekable();
+    mismatches.peek().is_some()
+        && mismatches.all(|error| {
+            let layout = match error.stack_trace.last() {
+                Some(frame) => match &frame.expected {
+                    TLFieldOrFunction::Field(field) => field.layout(),
+                    TLFieldOrFunction::Function(_) => return false,
+                },
+                None => report.interface,
+            };
+            matches!(layout.data(), TLData::PrefixType(_))
+                && error.errs.iter().all(|e| {
+                    matches!(e, AbiInstability::FieldCountMismatch(count) if count.expected > count.found)
+                })
+        })
+}
+
 impl NativePlugin {
     /// Load a plugin dynamic library and validate its ABI.
     pub fn load(path: &Path) -> Result<NativePlugin, PluginError> {
@@ -98,13 +136,28 @@ impl NativePlugin {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        let module: PluginModRef =
-            header
-                .init_root_module::<PluginModRef>()
-                .map_err(|e| PluginError::Load {
+        // A plugin built before a suffix field or defaulted trait method was
+        // added declares fewer fields than this host, and abi_stable's layout
+        // check rejects that outright even though prefix types handle it at
+        // runtime (a missing field reads as `RNone`, a missing defaulted
+        // method runs its default). Skip the check for exactly that case;
+        // any other mismatch is a real incompatibility and fails the load.
+        let module: PluginModRef = match header.init_root_module::<PluginModRef>() {
+            Ok(module) => module,
+            Err(strict) if only_missing_suffix_fields(header) => unsafe {
+                header.init_root_module_with_unchecked_layout()
+            }
+            .map_err(|e| PluginError::Load {
+                path: path.display().to_string(),
+                message: format!("{strict}; unchecked retry also failed: {e}"),
+            })?,
+            Err(strict) => {
+                return Err(PluginError::Load {
                     path: path.display().to_string(),
-                    message: e.to_string(),
-                })?;
+                    message: strict.to_string(),
+                })
+            }
+        };
         let version = module.abi_version();
         if version != LOADR_PLUGIN_ABI_VERSION {
             return Err(PluginError::AbiVersion {
@@ -492,6 +545,8 @@ impl ServicePlugin for NativeServiceAdapter {
 struct FfiDataSourceInit<'a> {
     plugin_config: &'a serde_json::Value,
     sources: &'a IndexMap<String, serde_json::Value>,
+    vus: u64,
+    vu_offset: u64,
 }
 
 /// JSON payload handed to [`crate::abi::FfiDataSource::next_row`].
@@ -520,6 +575,7 @@ struct FfiRowResponse {
 pub struct NativeDataSourceAdapter {
     name: String,
     config: serde_json::Value,
+    placement: VuPlacement,
     inner: FfiDataSourceBox,
 }
 
@@ -537,6 +593,7 @@ impl NativeDataSourceAdapter {
         NativeDataSourceAdapter {
             name,
             config,
+            placement: VuPlacement::default(),
             inner,
         }
     }
@@ -547,10 +604,16 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
         &self.name
     }
 
+    fn set_placement(&mut self, placement: VuPlacement) {
+        self.placement = placement;
+    }
+
     fn init(&mut self, source_configs: &IndexMap<String, serde_json::Value>) -> Result<(), String> {
         let payload = FfiDataSourceInit {
             plugin_config: &self.config,
             sources: source_configs,
+            vus: self.placement.vus,
+            vu_offset: self.placement.vu_offset,
         };
         let json =
             serde_json::to_string(&payload).map_err(|e| format!("cannot encode init: {e}"))?;
@@ -590,6 +653,14 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
             .collect();
         Ok(PluginRowResult::Row(row))
     }
+
+    fn wants_results(&self) -> bool {
+        self.inner.wants_results()
+    }
+
+    fn on_result(&self, result_json: String) {
+        self.inner.on_result(RString::from(result_json));
+    }
 }
 
 #[cfg(test)]
@@ -603,7 +674,7 @@ mod tests {
     use loadr_core::vu::RunContext;
     use loadr_core::RequestOptions;
 
-    use crate::abi::{FfiProtocol, FfiProtocol_TO};
+    use crate::abi::{FfiDataSource, FfiDataSource_TO, FfiProtocol, FfiProtocol_TO};
 
     struct SlowProtocol;
 
@@ -869,5 +940,43 @@ mod tests {
                 legacy_ns / cached_ns,
             );
         }
+    }
+
+    /// Records the `init_json` it is handed.
+    struct InitRecorder(Arc<parking_lot::Mutex<Option<String>>>);
+
+    impl FfiDataSource for InitRecorder {
+        fn name(&self) -> RString {
+            RString::from("recorder")
+        }
+
+        fn init(&mut self, init_json: RString) -> RResult<(), RString> {
+            *self.0.lock() = Some(init_json.into_string());
+            RResult::ROk(())
+        }
+
+        fn next_row(&self, _ctx_json: RString) -> RResult<RString, RString> {
+            RResult::RErr(RString::from("unused"))
+        }
+    }
+
+    #[test]
+    fn init_json_carries_vu_placement() {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let inner = FfiDataSource_TO::from_value(
+            InitRecorder(seen.clone()),
+            abi_stable::erased_types::TD_Opaque,
+        );
+        let mut adapter = NativeDataSourceAdapter::new(inner, serde_json::json!({"k": 1}));
+        adapter.set_placement(VuPlacement {
+            vus: 25,
+            vu_offset: 50,
+        });
+        adapter.init(&IndexMap::new()).expect("init");
+        let init: serde_json::Value =
+            serde_json::from_str(seen.lock().as_deref().expect("init called")).expect("json");
+        assert_eq!(init["plugin_config"], serde_json::json!({"k": 1}));
+        assert_eq!(init["vus"], 25);
+        assert_eq!(init["vu_offset"], 50);
     }
 }

@@ -2016,10 +2016,11 @@ pub enum DataSource {
         /// Source-level config passed to the plugin at init.
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         config: serde_json::Value,
-        /// Fetch this source's rows under `tokio::task::block_in_place`, so a
-        /// CPU-heavy (signing, hashing) or I/O-backed feeder cannot stall the
-        /// runtime's worker threads. Off by default: the bracket has a fixed
-        /// cost that a cheap in-memory generator should not pay.
+        /// Run this source's `next_row` and `on_result` calls under
+        /// `tokio::task::block_in_place`, so a CPU-heavy (signing, hashing) or
+        /// I/O-backed feeder cannot stall the runtime's worker threads. Off by
+        /// default: the bracket has a fixed cost that a cheap in-memory
+        /// generator should not pay.
         #[serde(default, skip_serializing_if = "is_false")]
         blocking: bool,
     },
@@ -2504,6 +2505,7 @@ flow:
                 source,
                 config,
                 blocking,
+                ..
             } => {
                 assert_eq!(source, "tx-signer");
                 assert_eq!(config["chain_id"], "t-1");

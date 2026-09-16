@@ -76,12 +76,42 @@ pub trait FfiDataSource: Send + Sync {
 
     /// Called once before VUs start. `init_json`:
     /// `{"plugin_config": <merged [config] + PluginRef.config>,
-    ///   "sources": {"<data name>": <data.<name>.config>, ...}}`
+    ///   "sources": {"<data name>": <data.<name>.config>, ...},
+    ///   "vus": <most VU ids this instance allocates>,
+    ///   "vu_offset": <sum of "vus" over the partitions before this one>}`
+    ///
+    /// The `vu` in `next_row`'s context is local, `1..=vus`; `vu_offset + vu`
+    /// is unique across every agent of a distributed run. `vus`/`vu_offset`
+    /// were added later and a host that predates them omits both: a plugin
+    /// that needs a fleet-unique id should fail init without them rather
+    /// than default to 0.
     fn init(&mut self, init_json: RString) -> RResult<(), RString>;
 
     /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
     /// Returns `{"row": {"col": <scalar>, ...}}` or `{"exhausted": true}`.
     fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
+
+    // Methods below were added after the first release. Each must keep its
+    // default body and new ones go after them: `sabi_trait` makes a
+    // defaulted method's vtable slot optional, so a plugin built before the
+    // method existed runs the default instead.
+
+    /// The full result of a request that used a row from this source, if
+    /// `wants_results` returned `true`. `result_json`:
+    /// `{"source","vu","iteration","seq","scenario","request"?,"row",
+    ///   "response":{"status","status_text","body","headers","duration_ms",
+    ///   "error","url","protocol"}}`.
+    ///
+    /// Called concurrently from VU threads, after the response; never called
+    /// for a request that was cancelled mid-flight.
+    fn on_result(&self, _result_json: RString) {}
+
+    /// Whether the host should call `on_result`. Asked once, after `init`.
+    /// Return `true` only if `on_result` is overridden: reporting serialises
+    /// every response (body included), which is wasted work otherwise.
+    fn wants_results(&self) -> bool {
+        false
+    }
 }
 
 /// Boxed trait objects as they cross the FFI boundary.
@@ -107,8 +137,10 @@ pub struct PluginMod {
     pub make_protocol: ROption<extern "C" fn() -> FfiProtocolBox>,
     #[sabi(last_prefix_field)]
     pub make_service: ROption<extern "C" fn() -> FfiServiceBox>,
-    /// Suffix field: plugins compiled before it existed still load; the
-    /// accessor then returns `RNone`. Not an ABI break — version stays 1.
+    /// Suffix field: a plugin compiled before it existed still loads and the
+    /// accessor returns `RNone`. Version stays 1 — but note that abi_stable's
+    /// layout check rejects a plugin with fewer fields than the host declares,
+    /// so `NativePlugin::load` retries without it (see the comment there).
     #[sabi(missing_field(default))]
     pub make_data_source: ROption<extern "C" fn() -> FfiDataSourceBox>,
 }

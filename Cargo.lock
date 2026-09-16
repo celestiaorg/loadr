@@ -3285,6 +3285,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "loadr-plugin-example-native-nonce-feeder"
+version = "1.0.0"
+dependencies = [
+ "abi_stable",
+ "loadr-plugin-api",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "loadr-plugin-example-native-output"
 version = "1.0.0"
 dependencies = [

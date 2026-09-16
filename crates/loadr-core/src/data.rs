@@ -40,10 +40,71 @@ pub struct PluginRowCtx<'a> {
     pub ts_ms: u64,
 }
 
+/// What a plugin's `on_result` receives for one row.
+#[derive(serde::Serialize)]
+struct ResultPayload<'a> {
+    source: &'a str,
+    vu: u64,
+    iteration: u64,
+    seq: u64,
+    scenario: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<&'a str>,
+    row: &'a Row,
+    response: ResponseView<'a>,
+}
+
+/// Serializes a response in place. Mirrors `flow::response_to_json`, but
+/// writes the body straight out of its `Bytes` instead of building an
+/// intermediate `serde_json::Value` and copying it.
+struct ResponseView<'a>(&'a crate::protocol::ProtocolResponse);
+
+impl serde::Serialize for ResponseView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let r = self.0;
+        let mut out = s.serialize_struct("response", 8)?;
+        out.serialize_field("status", &r.status)?;
+        out.serialize_field("status_text", &r.status_text)?;
+        out.serialize_field("body", &r.body_text())?;
+        out.serialize_field("headers", &Headers(&r.headers))?;
+        out.serialize_field("duration_ms", &r.timings.duration_ms)?;
+        out.serialize_field("error", &r.error)?;
+        out.serialize_field("url", &r.url)?;
+        out.serialize_field("protocol", &r.protocol_version)?;
+        out.end()
+    }
+}
+
+/// Header pairs as a lowercase-keyed map, matching `response_to_json`.
+struct Headers<'a>(&'a [(String, String)]);
+
+impl serde::Serialize for Headers<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(&k.to_ascii_lowercase(), v)?;
+        }
+        map.end()
+    }
+}
+
 /// Outcome of one on-demand row generation.
 pub enum PluginRowResult {
     Row(Row),
     Exhausted,
+}
+
+/// Where this instance's VUs sit in fleet-wide numbering. Local VU ids run
+/// `1..=vus`, so `vu_offset + vu` is unique across every agent of a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VuPlacement {
+    /// Most VU ids this instance allocates, summed over its scenarios.
+    pub vus: u64,
+    /// Sum of `vus` over the partitions before this one; 0 when not
+    /// distributed.
+    pub vu_offset: u64,
 }
 
 /// Core-facing `data_source` plugin capability. `next_row` runs on the
@@ -51,11 +112,28 @@ pub enum PluginRowResult {
 pub trait DataSourcePlugin: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Where this instance's VUs sit in fleet-wide numbering. Called once,
+    /// right before `init`. Default: ignored.
+    fn set_placement(&mut self, _placement: VuPlacement) {}
+
     /// One-time setup before VUs start. `source_configs` maps each
     /// `data.<name>` backed by this plugin to its `config:` value.
     fn init(&mut self, source_configs: &IndexMap<String, serde_json::Value>) -> Result<(), String>;
 
     fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String>;
+
+    /// Whether this plugin wants `on_result` calls. Asked once, after `init`.
+    /// Default: no — reporting serialises every response, which a plugin
+    /// that ignores results must not pay for.
+    fn wants_results(&self) -> bool {
+        false
+    }
+
+    /// Full result of a request that used one of this plugin's rows, if
+    /// `wants_results` said yes. Taken by value so the FFI hand-off is a
+    /// move, not a copy. Errors are the plugin's problem: a load test must not
+    /// fail on feedback.
+    fn on_result(&self, _result_json: String) {}
 }
 
 #[derive(Debug)]
@@ -74,6 +152,9 @@ enum Feed {
         /// Fetch rows under `block_in_place` so a slow feeder cannot stall
         /// the runtime (opt-in per source via `blocking: true`).
         blocking: bool,
+        /// Interned source name, so recording a pending row is a refcount
+        /// bump rather than an allocation.
+        name: Option<Arc<str>>,
     },
 }
 
@@ -81,7 +162,9 @@ impl std::fmt::Debug for Feed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Feed::Memory(feed) => feed.fmt(f),
-            Feed::Plugin { plugin, blocking } => {
+            Feed::Plugin {
+                plugin, blocking, ..
+            } => {
                 write!(f, "Feed::Plugin({}, blocking: {blocking})", plugin.name())
             }
         }
@@ -100,7 +183,7 @@ fn bracket_plugin_fetch(blocking: bool) -> bool {
 
 /// Per-VU feeder state: sequential cursors, per-VU shuffle orders, and
 /// plugin row sequence counters.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct VuFeedState {
     cursors: HashMap<String, usize>,
     shuffles: HashMap<String, Vec<usize>>,
@@ -111,6 +194,18 @@ pub struct VuFeedState {
     /// Branch-local cache of slots from `plugin_sequences`; steady-state
     /// fetches skip the lock and key allocation.
     local_sequences: HashMap<String, Arc<AtomicU64>>,
+    /// Rows pulled for the request being prepared, from plugins that want
+    /// results. Drained by `report_result`.
+    pending: Vec<PendingRow>,
+}
+
+/// One row awaiting the result of the request that used it.
+struct PendingRow {
+    source: Arc<str>,
+    seq: u64,
+    row: Arc<Row>,
+    plugin: Arc<dyn DataSourcePlugin>,
+    blocking: bool,
 }
 
 impl VuFeedState {
@@ -124,7 +219,18 @@ impl VuFeedState {
             shuffles: HashMap::new(),
             plugin_sequences: Arc::clone(&self.plugin_sequences),
             local_sequences: HashMap::new(),
+            pending: Vec::new(),
         }
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Drop rows no request will report: a prepare that failed, or rows left
+    /// over when an iteration ends.
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 
     fn next_plugin_seq(&mut self, source: &str) -> u64 {
@@ -155,6 +261,7 @@ impl VuFeedState {
 pub struct DataFeeds {
     feeds: HashMap<String, Feed>,
     has_on_demand: bool,
+    reports_results: bool,
 }
 
 /// Signalled when a `stop`-mode source is exhausted: the VU should retire.
@@ -165,11 +272,13 @@ pub struct EndOfData(pub String);
 impl DataFeeds {
     /// Load every source declared in the plan. CSV paths resolve against
     /// `base_dir`. `plugins` provides one loaded `data_source`-capable
-    /// plugin per name that a `type: plugin` source may reference.
+    /// plugin per name that a `type: plugin` source may reference, and each
+    /// is initialised with `placement`.
     pub fn load(
         sources: &IndexMap<String, DataSource>,
         base_dir: &Path,
         mut plugins: HashMap<String, Box<dyn DataSourcePlugin>>,
+        placement: VuPlacement,
     ) -> Result<DataFeeds, EngineError> {
         // Group plugin-backed sources by plugin name so each plugin's
         // `init` sees all `data.*` entries it backs in one call.
@@ -197,6 +306,7 @@ impl DataFeeds {
                     "plugin `{plugin_name}` is not loaded or does not provide the data_source capability"
                 ),
             })?;
+            plugin.set_placement(placement);
             plugin
                 .init(group_configs)
                 .map_err(|message| EngineError::Data {
@@ -207,6 +317,7 @@ impl DataFeeds {
         }
 
         let mut has_on_demand = false;
+        let mut reports_results = false;
         let mut feeds = HashMap::new();
         for (name, source) in sources {
             let feed = match source {
@@ -220,9 +331,12 @@ impl DataFeeds {
                         .get(plugin_name)
                         .expect("initialized above for every referenced plugin")
                         .clone();
+                    let reports = plugin.wants_results();
+                    reports_results |= reports;
                     Feed::Plugin {
                         plugin,
                         blocking: *blocking,
+                        name: reports.then(|| Arc::from(name.as_str())),
                     }
                 }
                 DataSource::Csv {
@@ -356,7 +470,42 @@ impl DataFeeds {
         Ok(DataFeeds {
             feeds,
             has_on_demand,
+            reports_results,
         })
+    }
+
+    /// Hand the result of a completed request to every plugin whose rows it
+    /// used. Drains `state`'s pending rows.
+    pub fn report_result(
+        &self,
+        state: &mut VuFeedState,
+        id: &RowIdentity<'_>,
+        response: &crate::protocol::ProtocolResponse,
+    ) {
+        for entry in state.pending.drain(..) {
+            let payload = ResultPayload {
+                source: &entry.source,
+                vu: id.vu,
+                iteration: id.iteration,
+                seq: entry.seq,
+                scenario: id.scenario,
+                request: id.request,
+                row: &entry.row,
+                response: ResponseView(response),
+            };
+            let json = match serde_json::to_string(&payload) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!(source = %entry.source, error = %e, "cannot encode result");
+                    continue;
+                }
+            };
+            if bracket_plugin_fetch(entry.blocking) {
+                tokio::task::block_in_place(|| entry.plugin.on_result(json));
+            } else {
+                entry.plugin.on_result(json);
+            }
+        }
     }
 
     pub fn has_source(&self, name: &str) -> bool {
@@ -370,6 +519,12 @@ impl DataFeeds {
     /// Whether any loaded source is plugin-backed (on-demand rows).
     pub fn has_on_demand(&self) -> bool {
         self.has_on_demand
+    }
+
+    /// Whether any source reports request results back to its plugin. Gates
+    /// response-body decoding, which `on_result` needs to read.
+    pub fn reports_results(&self) -> bool {
+        self.reports_results
     }
 
     /// Whether `name` is a plugin-backed (on-demand) source.
@@ -395,7 +550,11 @@ impl DataFeeds {
             .ok_or_else(|| NextRowError::UnknownSource(source.to_string()))?;
 
         let feed = match feed {
-            Feed::Plugin { plugin, blocking } => {
+            Feed::Plugin {
+                plugin,
+                blocking,
+                name,
+            } => {
                 let seq = state.next_plugin_seq(source);
                 let ctx = PluginRowCtx {
                     source,
@@ -415,7 +574,19 @@ impl DataFeeds {
                     plugin.next_row(&ctx)
                 };
                 return match fetched {
-                    Ok(PluginRowResult::Row(row)) => Ok(Arc::new(row)),
+                    Ok(PluginRowResult::Row(row)) => {
+                        let row = Arc::new(row);
+                        if let Some(name) = name {
+                            state.pending.push(PendingRow {
+                                source: name.clone(),
+                                seq,
+                                row: row.clone(),
+                                plugin: plugin.clone(),
+                                blocking: *blocking,
+                            });
+                        }
+                        Ok(row)
+                    }
                     Ok(PluginRowResult::Exhausted) => {
                         Err(NextRowError::Exhausted(EndOfData(source.to_string())))
                     }
@@ -524,6 +695,7 @@ mod tests {
     struct FakeHandle {
         calls: Arc<std::sync::atomic::AtomicU64>,
         seen_configs: Arc<std::sync::Mutex<Option<IndexMap<String, serde_json::Value>>>>,
+        seen_placement: Arc<std::sync::Mutex<Option<VuPlacement>>>,
     }
 
     enum FakeMode {
@@ -560,10 +732,18 @@ mod tests {
             &self.name
         }
 
+        fn set_placement(&mut self, placement: VuPlacement) {
+            *self.handle.seen_placement.lock().unwrap() = Some(placement);
+        }
+
         fn init(
             &mut self,
             source_configs: &IndexMap<String, serde_json::Value>,
         ) -> Result<(), String> {
+            assert!(
+                self.handle.seen_placement.lock().unwrap().is_some(),
+                "placement arrives before init"
+            );
             *self.handle.seen_configs.lock().unwrap() = Some(source_configs.clone());
             Ok(())
         }
@@ -606,7 +786,7 @@ mod tests {
                 blocking,
             },
         );
-        DataFeeds::load(&sources, Path::new("."), plugins).expect("load")
+        DataFeeds::load(&sources, Path::new("."), plugins, VuPlacement::default()).expect("load")
     }
 
     fn csv_feeds(
@@ -631,7 +811,7 @@ mod tests {
                 has_header: true,
             },
         );
-        DataFeeds::load(&sources, dir, HashMap::new()).expect("load")
+        DataFeeds::load(&sources, dir, HashMap::new(), VuPlacement::default()).expect("load")
     }
 
     #[test]
@@ -792,7 +972,8 @@ mod tests {
                 pick: PickStrategy::Sequential,
             },
         );
-        let feeds = DataFeeds::load(&sources, dir.path(), HashMap::new()).expect("load");
+        let feeds = DataFeeds::load(&sources, dir.path(), HashMap::new(), VuPlacement::default())
+            .expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
         let row = feeds
@@ -817,7 +998,13 @@ mod tests {
                 pick: PickStrategy::Sequential,
             },
         );
-        let feeds = DataFeeds::load(&sources, Path::new("."), HashMap::new()).expect("load");
+        let feeds = DataFeeds::load(
+            &sources,
+            Path::new("."),
+            HashMap::new(),
+            VuPlacement::default(),
+        )
+        .expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
         let row = feeds
@@ -844,7 +1031,8 @@ mod tests {
                 has_header: false,
             },
         );
-        let feeds = DataFeeds::load(&sources, dir.path(), HashMap::new()).expect("load");
+        let feeds = DataFeeds::load(&sources, dir.path(), HashMap::new(), VuPlacement::default())
+            .expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
         let row = feeds.next_row("d", &mut st, &mut r, &id()).expect("row");
@@ -870,8 +1058,13 @@ mod tests {
         let (plugin, _handle) = fake_plugin("signer", FakeMode::EchoSeq);
         let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        let feeds =
-            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let feeds = DataFeeds::load(
+            &plugin_source("signer"),
+            Path::new("."),
+            plugins,
+            VuPlacement::default(),
+        )
+        .expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
         let r1 = feeds
@@ -889,8 +1082,13 @@ mod tests {
         let (plugin, _handle) = fake_plugin("signer", FakeMode::EchoSeq);
         let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        let feeds =
-            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let feeds = DataFeeds::load(
+            &plugin_source("signer"),
+            Path::new("."),
+            plugins,
+            VuPlacement::default(),
+        )
+        .expect("load");
         let parent = VuFeedState::new();
         let mut branch_a = parent.fork_for_parallel();
         let mut branch_b = parent.fork_for_parallel();
@@ -974,8 +1172,13 @@ mod tests {
         let (plugin, _handle) = fake_plugin("signer", FakeMode::AlwaysErr("boom".to_string()));
         let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        let feeds =
-            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let feeds = DataFeeds::load(
+            &plugin_source("signer"),
+            Path::new("."),
+            plugins,
+            VuPlacement::default(),
+        )
+        .expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
         match feeds.next_row("signed", &mut st, &mut r, &id()) {
@@ -995,8 +1198,13 @@ mod tests {
         let (plugin, _handle) = fake_plugin("signer", FakeMode::AlwaysExhausted);
         let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        let feeds =
-            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load");
+        let feeds = DataFeeds::load(
+            &plugin_source("signer"),
+            Path::new("."),
+            plugins,
+            VuPlacement::default(),
+        )
+        .expect("load");
         let mut st = VuFeedState::new();
         let mut r = rng();
         assert!(matches!(
@@ -1007,8 +1215,13 @@ mod tests {
 
     #[test]
     fn missing_plugin_fails_at_load_naming_source() {
-        let err = DataFeeds::load(&plugin_source("signer"), Path::new("."), HashMap::new())
-            .expect_err("missing plugin should fail load");
+        let err = DataFeeds::load(
+            &plugin_source("signer"),
+            Path::new("."),
+            HashMap::new(),
+            VuPlacement::default(),
+        )
+        .expect_err("missing plugin should fail load");
         match err {
             EngineError::Data {
                 source_name,
@@ -1045,7 +1258,12 @@ mod tests {
         let (plugin, handle) = fake_plugin("signer", FakeMode::EchoSeq);
         let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        DataFeeds::load(&sources, Path::new("."), plugins).expect("load");
+        let placement = VuPlacement {
+            vus: 3,
+            vu_offset: 7,
+        };
+        DataFeeds::load(&sources, Path::new("."), plugins, placement).expect("load");
+        assert_eq!(*handle.seen_placement.lock().unwrap(), Some(placement));
         let configs = handle
             .seen_configs
             .lock()
@@ -1062,7 +1280,13 @@ mod tests {
         let mut plugins: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
         let feeds = Arc::new(
-            DataFeeds::load(&plugin_source("signer"), Path::new("."), plugins).expect("load"),
+            DataFeeds::load(
+                &plugin_source("signer"),
+                Path::new("."),
+                plugins,
+                VuPlacement::default(),
+            )
+            .expect("load"),
         );
 
         let workers: Vec<_> = (0..8u64)
@@ -1107,7 +1331,8 @@ mod tests {
                 pick: PickStrategy::Sequential,
             },
         );
-        let feeds = DataFeeds::load(&sources, Path::new("."), plugins).expect("load");
+        let feeds = DataFeeds::load(&sources, Path::new("."), plugins, VuPlacement::default())
+            .expect("load");
         assert!(feeds.has_on_demand());
         assert!(feeds.is_on_demand("signed"));
         assert!(!feeds.is_on_demand("static_rows"));

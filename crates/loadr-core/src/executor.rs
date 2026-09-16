@@ -988,6 +988,31 @@ async fn run_externally_controlled(
     scenario_cancel.cancel();
 }
 
+/// Most VU ids one scenario can allocate. Every executor creates a worker
+/// (and its id) per pool slot and keeps it, so a scenario never takes more
+/// ids than its largest pool.
+pub fn vu_capacity(spec: &ExecutorSpec) -> u64 {
+    match spec {
+        ExecutorSpec::ConstantVus { vus, .. }
+        | ExecutorSpec::PerVuIterations { vus, .. }
+        | ExecutorSpec::SharedIterations { vus, .. } => *vus,
+        ExecutorSpec::RampingVus { start_vus, stages } => {
+            stages.iter().map(|(_, t)| *t).fold(*start_vus, u64::max)
+        }
+        ExecutorSpec::ConstantArrivalRate {
+            pre_allocated_vus,
+            max_vus,
+            ..
+        }
+        | ExecutorSpec::RampingArrivalRate {
+            pre_allocated_vus,
+            max_vus,
+            ..
+        } => (*pre_allocated_vus).max(*max_vus),
+        ExecutorSpec::ExternallyControlled { max_vus, .. } => *max_vus,
+    }
+}
+
 /// Split an executor spec across `count` instances for distributed execution.
 /// VU counts and shared iteration budgets split with remainder going to the
 /// lowest indices; rates split fractionally so the global rate is exact.
@@ -1134,6 +1159,22 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 101);
+    }
+
+    #[test]
+    fn vu_capacity_is_the_largest_pool() {
+        let ramping = ExecutorSpec::RampingVus {
+            start_vus: 3,
+            stages: vec![(Duration::from_secs(1), 9), (Duration::from_secs(1), 0)],
+        };
+        assert_eq!(vu_capacity(&ramping), 9);
+        let arrival = ExecutorSpec::ConstantArrivalRate {
+            rate: 10.0,
+            duration: Duration::from_secs(10),
+            pre_allocated_vus: 5,
+            max_vus: 2,
+        };
+        assert_eq!(vu_capacity(&arrival), 5);
     }
 
     #[test]

@@ -102,6 +102,51 @@ delay timers and unrelated VUs, degrading the load shape itself. Leave it
 off (the default) for cheap in-memory generation: the bracket has a fixed
 per-call cost that a microsecond feeder should not pay.
 
+**Request results.** A plugin can ask for the full result of every request
+that used one of its rows, so a feeder can react to what the server said. There
+is nothing to configure: the plugin opts in itself (see
+[Developing plugins](../plugins/developing.md#reacting-to-request-results)),
+and a plugin that doesn't costs nothing — responses are only serialised for
+plugins that asked.
+
+The plugin receives one JSON payload per row the request used:
+
+```json
+{"source": "nonces", "vu": 7, "iteration": 3, "seq": 41,
+ "scenario": "submit", "request": "submit tx",
+ "row": {"account": "acct-12", "nonce": "17"},
+ "response": {"status": 200, "status_text": "OK", "body": "...",
+              "headers": {...}, "duration_ms": 12.4, "error": null,
+              "url": "...", "protocol": "HTTP/1.1"}}
+```
+
+The `row` is echoed back, so a plugin usually needs no pending-request
+bookkeeping of its own. `seq` identifies the row uniquely with `vu` and
+`source`. A streaming request that pulled N frames' worth of rows produces N
+payloads.
+
+Feedback must not be able to break a load test, so `on_result` returns nothing
+and a request cancelled mid-flight (a graceful stop) reports nothing at all — a
+plugin has to tolerate a row whose result never arrives.
+
+Only declarative `request:` steps report results. A row a JS step pulls and
+then sends with `http.*` is never reported, so a feeder that depends on results
+(like the nonce example) must be used from `request:` steps.
+
+Two costs worth knowing. The response body is serialised into the payload, so
+a source that reports results on requests with large responses pays that per
+request; and a gRPC streaming request that pulled N frames' worth of rows sends
+N payloads, each carrying the same response.
+
+`blocking: true` covers `on_result` as well as `next_row`. Leave it off for an
+`on_result` that just updates memory; turn it on if it does I/O, so a slow call
+can't stall the other VUs sharing its runtime thread. Either way the call runs
+inside the VU's own iteration, so its latency counts against that VU.
+
+See `plugins/examples/native-nonce-feeder` for a worked example: per-account
+blockchain nonces held in sharded maps, advanced only when the submission
+succeeded.
+
 **Freshness is per-request, not per-iteration.** CSV/JSON/inline sources
 cache one row per iteration (all references in the same iteration see the
 same row). Plugin-backed sources instead cache one row per **request

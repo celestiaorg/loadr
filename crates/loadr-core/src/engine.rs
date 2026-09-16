@@ -12,8 +12,9 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::aggregate::{Aggregator, MetricShards, Snapshot};
+use crate::data::VuPlacement;
 use crate::error::EngineError;
-use crate::executor::{partition_spec, run_scenario, ExecEnv, ScenarioRunSpec};
+use crate::executor::{partition_spec, run_scenario, vu_capacity, ExecEnv, ScenarioRunSpec};
 use crate::flow::{FlowRunner, ScenarioProgram};
 use crate::metrics::{BuiltinMetrics, MetricRegistry, MetricsBus, Sample, Tags};
 use crate::output::Output;
@@ -249,7 +250,9 @@ impl Engine {
         let builtins = Arc::new(BuiltinMetrics::resolve(&registry));
 
         // Data feeds.
-        let data = crate::data::DataFeeds::load(&plan.data, &base_dir, opts.data_sources)?;
+        let placement = vu_placement(&plan, opts.partition)?;
+        let data =
+            crate::data::DataFeeds::load(&plan.data, &base_dir, opts.data_sources, placement)?;
         let gauge_tags = Arc::new(plan.defaults.tags.clone());
 
         let run_ctx = Arc::new(RunContext {
@@ -915,6 +918,29 @@ async fn dispatch_delta(agg: &mut Aggregator, outputs: &mut [Box<dyn Output>], l
     }
 }
 
+/// Where this instance's VU ids sit among every partition of the run. Each
+/// agent derives the shares of all partitions from the same plan, so the
+/// offsets agree fleet-wide without any extra coordination.
+fn vu_placement(
+    plan: &TestPlan,
+    partition: Option<(u64, u64)>,
+) -> Result<VuPlacement, EngineError> {
+    let (index, count) = partition.unwrap_or((0, 1));
+    let mut shares = vec![0u64; count as usize];
+    for (name, scenario) in &plan.scenarios {
+        let spec = scenario
+            .executor_spec()
+            .map_err(|e| EngineError::Config(format!("scenario `{name}`: {e}")))?;
+        for (i, share) in (0u64..).zip(shares.iter_mut()) {
+            *share += vu_capacity(&partition_spec(&spec, i, count));
+        }
+    }
+    Ok(VuPlacement {
+        vus: shares[index as usize],
+        vu_offset: shares[..index as usize].iter().sum(),
+    })
+}
+
 fn resolve_static_value(
     value: &serde_json::Value,
     env: &HashMap<String, String>,
@@ -951,4 +977,70 @@ fn resolve_static_value(
         }
         other => other.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(yaml: &str) -> TestPlan {
+        loadr_config::load_str(yaml, &loadr_config::LoadOptions::new())
+            .expect("parse")
+            .plan
+    }
+
+    const TWO_SCENARIOS: &str = r#"
+scenarios:
+  a:
+    executor: constant-vus
+    vus: 10
+    duration: 1s
+    flow:
+      - request: { name: r, url: "http://example.test/" }
+  b:
+    executor: ramping-vus
+    start_vus: 0
+    stages:
+      - { duration: 1s, target: 5 }
+    flow:
+      - request: { name: r, url: "http://example.test/" }
+"#;
+
+    #[test]
+    fn placement_without_partition_covers_every_scenario() {
+        let p = vu_placement(&plan(TWO_SCENARIOS), None).expect("placement");
+        assert_eq!(
+            p,
+            VuPlacement {
+                vus: 15,
+                vu_offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn placement_offsets_tile_the_fleet_without_overlap() {
+        let plan = plan(TWO_SCENARIOS);
+        // a: 10 over 3 -> 4,3,3; b: 5 over 3 -> 2,2,1.
+        let placements: Vec<_> = (0..3)
+            .map(|i| vu_placement(&plan, Some((i, 3))).expect("placement"))
+            .collect();
+        assert_eq!(
+            placements,
+            vec![
+                VuPlacement {
+                    vus: 6,
+                    vu_offset: 0
+                },
+                VuPlacement {
+                    vus: 5,
+                    vu_offset: 6
+                },
+                VuPlacement {
+                    vus: 4,
+                    vu_offset: 11
+                },
+            ]
+        );
+    }
 }

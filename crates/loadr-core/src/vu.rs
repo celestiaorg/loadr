@@ -171,10 +171,14 @@ impl VuContext {
     }
 
     /// Begin a new iteration: bump the counter, clear per-iteration row cache.
+    /// Rows still waiting for a result are dropped: only a declarative
+    /// request reports them, so a row a JS step pulled and sent with
+    /// `http.*` would otherwise wait forever.
     pub fn begin_iteration(&mut self) {
         self.iteration += 1;
         self.current_rows.clear();
         self.current_request = None;
+        self.data_state.clear_pending();
     }
 
     /// Begin preparing a request: plugin-backed rows are per-request, so
@@ -185,6 +189,9 @@ impl VuContext {
             return;
         }
         self.current_request = Some(name.to_string());
+        // Rows from a request that never completed (a failed prepare) are
+        // not reported. Per-frame rows accumulate, so only clear here.
+        self.data_state.clear_pending();
         self.begin_message();
     }
 
@@ -294,8 +301,13 @@ mod tests {
                 pick: loadr_config::PickStrategy::Sequential,
             },
         );
-        let data =
-            DataFeeds::load(&sources, std::path::Path::new("."), HashMap::new()).expect("data");
+        let data = DataFeeds::load(
+            &sources,
+            std::path::Path::new("."),
+            HashMap::new(),
+            crate::data::VuPlacement::default(),
+        )
+        .expect("data");
         Arc::new(RunContext {
             variables,
             secrets,
@@ -481,6 +493,10 @@ mod tests {
             row.insert("n".to_string(), n.to_string());
             Ok(crate::data::PluginRowResult::Row(row))
         }
+
+        fn wants_results(&self) -> bool {
+            true
+        }
     }
 
     /// A run context with both a memory-backed `users` source and a
@@ -516,7 +532,13 @@ mod tests {
         );
         let mut plugins: HashMap<String, Box<dyn crate::data::DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        let data = DataFeeds::load(&sources, std::path::Path::new("."), plugins).expect("data");
+        let data = DataFeeds::load(
+            &sources,
+            std::path::Path::new("."),
+            plugins,
+            crate::data::VuPlacement::default(),
+        )
+        .expect("data");
         (
             Arc::new(RunContext {
                 variables: serde_json::Map::new(),
@@ -605,6 +627,19 @@ mod tests {
         let c = vu.resolve_expr("data.users.user").unwrap().unwrap();
         assert_eq!(a, b);
         assert_eq!(b, c, "memory-backed rows are not evicted by begin_request");
+    }
+
+    #[test]
+    fn unreported_rows_do_not_outlive_the_iteration() {
+        let (run, _handle) = run_ctx_with_plugin();
+        let mut vu = vu_with(run);
+        // A JS step pulls a row outside any declarative request, so nothing
+        // will ever report it.
+        vu.begin_iteration();
+        vu.data_row("signed").expect("row");
+        assert!(vu.data_state.has_pending());
+        vu.begin_iteration();
+        assert!(!vu.data_state.has_pending(), "left-over rows are dropped");
     }
 
     #[test]

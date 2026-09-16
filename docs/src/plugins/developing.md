@@ -334,7 +334,8 @@ impl FfiDataSource for MySource {
 
     /// Called once before VUs start.
     fn init(&mut self, init_json: RString) -> RResult<(), RString> {
-        // parse {"plugin_config": ..., "sources": {"<data name>": <config>, ...}}
+        // parse {"plugin_config": ..., "sources": {"<data name>": <config>, ...},
+        //        "vus": ..., "vu_offset": ...}
         ROk(())
     }
 
@@ -379,13 +380,69 @@ Key facts that shape the design:
   `[plugin]` — informational only. The host's authoritative check is
   whether `make_data_source` is present in the loaded module.
 
+### Reacting to request results
+
+A data source can also see what the server did with the rows it produced.
+Override `FfiDataSource::on_result`, and return `true` from `wants_results` so
+the host calls it:
+
+```rust
+impl FfiDataSource for MySource {
+    // name / init / next_row as above
+
+    /// Called concurrently, after the response.
+    fn on_result(&self, result_json: RString) {
+        // {"source","vu","iteration","seq","scenario","request"?,
+        //  "row": {...}, "response": {"status","body","headers",...}}
+    }
+
+    fn wants_results(&self) -> bool {
+        true
+    }
+}
+```
+
+The host asks `wants_results` once, after `init`, and only then records rows
+and serialises responses for this plugin — so a data source that doesn't
+override it pays nothing per request. Return `true` only when you override
+`on_result`.
+
+Both methods have default bodies (`false` and a no-op), so a data source that
+doesn't care about results needs no change. They sit at the end of the trait
+for a reason: a plugin compiled before they existed has no vtable slots for
+them, and abi_stable runs the defaults instead. (abi_stable's layout check
+rejects a library declaring fewer methods than the host, so the loader skips
+that check when missing trailing fields are the *only* difference. Any other
+layout mismatch still fails the load.)
+
+The row is echoed back in the payload, so a source usually needs no
+pending-request bookkeeping — read what you generated straight off
+`result_json`. State that `next_row` and `on_result` share lives on the data
+source itself; `plugins/examples/native-nonce-feeder` shows the pattern with
+sharded per-account nonces that only advance when the submission succeeded.
+
+`on_result` runs before the `afterRequest` hook, so a row the hook pulls is never
+misreported as belonging to the finished request. The payload's `request` is
+the request's name as `next_row` saw it (unrendered, e.g. `submit ${vars.kind}`),
+so the two can be matched.
+
+Only declarative `request:` steps report results. A row a JS step pulls and
+sends with `http.*` gets no `on_result`, and is dropped when the iteration
+ends.
+
+Results are best-effort by design: `on_result` returns nothing and a request
+cancelled mid-flight reports nothing at all. A plugin must tolerate a row whose
+result never arrives, and must not panic — it runs on a VU worker thread.
+
 ### Init / row JSON contracts
 
 ```jsonc
 // init_json (host -> plugin, once before VUs start)
 {
   "plugin_config": { "seed": 42 },              // merged [config] + PluginRef.config
-  "sources": { "signed_tx": { "chain_id": "testnet-1" } }  // one entry per data.<name> backed by this plugin
+  "sources": { "signed_tx": { "chain_id": "testnet-1" } }, // one entry per data.<name> backed by this plugin
+  "vus": 250,                                   // most VU ids this instance allocates
+  "vu_offset": 500                              // sum of "vus" over the agents before this one
 }
 
 // ctx_json (host -> plugin, per next_row call)
@@ -406,6 +463,19 @@ is the name of the request currently being prepared, or absent when the row
 is fetched outside request preparation (e.g. from a JS step). Row values
 cross as JSON scalars; strings map straight through, and a `bytes` protobuf
 field expects base64 (`prost-reflect` decodes it automatically).
+
+`vu` is local to one instance: in a distributed run every agent numbers its
+VUs from 1. Add `vu_offset` from `init_json` to get an id that is unique across
+the whole fleet, in `vu_offset + 1 ..= vu_offset + vus`. Every agent computes
+the same split from the same plan, so the ranges tile without overlap. `vus`
+counts the most VUs this agent can start (peak for ramping executors, the
+larger of `pre_allocated_vus` and `max_vus` for arrival-rate ones), not the
+number running right now.
+
+A host that predates these fields omits both. If your plugin needs a
+fleet-unique id to be correct, require `vu_offset` so init fails on such a
+host, as `native-nonce-feeder` does: defaulting it to 0 would put every agent's
+VUs on the same ids without any error.
 
 ### Testing
 
