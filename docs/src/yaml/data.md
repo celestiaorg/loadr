@@ -129,6 +129,10 @@ Feedback must not be able to break a load test, so `on_result` returns nothing
 and a request cancelled mid-flight (a graceful stop) reports nothing at all — a
 plugin has to tolerate a row whose result never arrives.
 
+Only declarative `request:` steps report results. A row a JS step pulls and
+then sends with `http.*` is never reported, so a feeder that depends on results
+(like the nonce example) must be used from `request:` steps.
+
 Two costs worth knowing. The response body is serialised into the payload, so
 a source that reports results on requests with large responses pays that per
 request; and a gRPC streaming request that pulled N frames' worth of rows sends

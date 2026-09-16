@@ -227,7 +227,8 @@ impl VuFeedState {
         !self.pending.is_empty()
     }
 
-    /// Drop rows whose request never completed (a prepare that failed).
+    /// Drop rows no request will report: a prepare that failed, or rows left
+    /// over when an iteration ends.
     pub(crate) fn clear_pending(&mut self) {
         self.pending.clear();
     }

@@ -9,8 +9,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use abi_stable::library::lib_header_from_path;
+use abi_stable::abi_stability::abi_checking::{check_layout_compatibility, AbiInstability};
+use abi_stable::library::{lib_header_from_path, LibHeader};
 use abi_stable::std_types::{ROption, RResult, RString};
+use abi_stable::type_layout::{TLData, TLFieldOrFunction};
+use abi_stable::StableAbi;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -87,6 +90,41 @@ impl std::fmt::Debug for NativePlugin {
     }
 }
 
+/// Whether the library's root module differs from this host's only by
+/// lacking trailing fields of prefix types: a plugin built before a suffix
+/// field or a defaulted trait method was added. Prefix-type accessors check
+/// the library's own field count at runtime, so such a plugin is safe to load
+/// even though the layout check rejects it.
+fn only_missing_suffix_fields(header: &LibHeader) -> bool {
+    let Some(implementation) = header.layout() else {
+        return false;
+    };
+    let Err(report) = check_layout_compatibility(PluginModRef::LAYOUT, implementation) else {
+        return false;
+    };
+    // The report also carries one empty entry per enclosing type on the path
+    // to each mismatch; only entries with errors say anything.
+    let mut mismatches = report
+        .errors
+        .iter()
+        .filter(|e| !e.errs.is_empty())
+        .peekable();
+    mismatches.peek().is_some()
+        && mismatches.all(|error| {
+            let layout = match error.stack_trace.last() {
+                Some(frame) => match &frame.expected {
+                    TLFieldOrFunction::Field(field) => field.layout(),
+                    TLFieldOrFunction::Function(_) => return false,
+                },
+                None => report.interface,
+            };
+            matches!(layout.data(), TLData::PrefixType(_))
+                && error.errs.iter().all(|e| {
+                    matches!(e, AbiInstability::FieldCountMismatch(count) if count.expected > count.found)
+                })
+        })
+}
+
 impl NativePlugin {
     /// Load a plugin dynamic library and validate its ABI.
     pub fn load(path: &Path) -> Result<NativePlugin, PluginError> {
@@ -98,21 +136,26 @@ impl NativePlugin {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        // A plugin built before a suffix field or trailing trait method was
+        // A plugin built before a suffix field or defaulted trait method was
         // added declares fewer fields than this host, and abi_stable's layout
         // check rejects that outright even though prefix types handle it at
         // runtime (a missing field reads as `RNone`, a missing defaulted
-        // method runs its default). Retry without the layout check;
-        // `abi_version` below is the contract.
+        // method runs its default). Skip the check for exactly that case;
+        // any other mismatch is a real incompatibility and fails the load.
         let module: PluginModRef = match header.init_root_module::<PluginModRef>() {
             Ok(module) => module,
+            Err(strict) if only_missing_suffix_fields(header) => unsafe {
+                header.init_root_module_with_unchecked_layout()
+            }
+            .map_err(|e| PluginError::Load {
+                path: path.display().to_string(),
+                message: format!("{strict}; unchecked retry also failed: {e}"),
+            })?,
             Err(strict) => {
-                unsafe { header.init_root_module_with_unchecked_layout() }.map_err(|e| {
-                    PluginError::Load {
-                        path: path.display().to_string(),
-                        message: format!("{strict}; unchecked retry also failed: {e}"),
-                    }
-                })?
+                return Err(PluginError::Load {
+                    path: path.display().to_string(),
+                    message: strict.to_string(),
+                })
             }
         };
         let version = module.abi_version();

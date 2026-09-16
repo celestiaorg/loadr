@@ -86,8 +86,8 @@ impl NonceMap {
 #[derive(Deserialize)]
 struct InitPayload {
     plugin_config: serde_json::Value,
-    /// Absent from hosts that predate it; 0 is right for a single instance.
-    #[serde(default)]
+    /// Required: defaulting to 0 would put every agent of a distributed run on
+    /// the same accounts.
     vu_offset: u64,
 }
 

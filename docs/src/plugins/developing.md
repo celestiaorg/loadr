@@ -411,9 +411,9 @@ Both methods have default bodies (`false` and a no-op), so a data source that
 doesn't care about results needs no change. They sit at the end of the trait
 for a reason: a plugin compiled before they existed has no vtable slots for
 them, and abi_stable runs the defaults instead. (abi_stable's layout check
-rejects a library declaring fewer methods than the host, so the loader retries
-without that check and falls back on the `abi_version` integer — the same
-contract it always enforced.)
+rejects a library declaring fewer methods than the host, so the loader skips
+that check when missing trailing fields are the *only* difference. Any other
+layout mismatch still fails the load.)
 
 The row is echoed back in the payload, so a source usually needs no
 pending-request bookkeeping — read what you generated straight off
@@ -422,7 +422,13 @@ source itself; `plugins/examples/native-nonce-feeder` shows the pattern with
 sharded per-account nonces that only advance when the submission succeeded.
 
 `on_result` runs before the `afterRequest` hook, so a row the hook pulls is never
-misreported as belonging to the finished request.
+misreported as belonging to the finished request. The payload's `request` is
+the request's name as `next_row` saw it (unrendered, e.g. `submit ${vars.kind}`),
+so the two can be matched.
+
+Only declarative `request:` steps report results. A row a JS step pulls and
+sends with `http.*` gets no `on_result`, and is dropped when the iteration
+ends.
 
 Results are best-effort by design: `on_result` returns nothing and a request
 cancelled mid-flight reports nothing at all. A plugin must tolerate a row whose
@@ -452,19 +458,24 @@ result never arrives, and must not panic — it runs on a VU worker thread.
 ```
 
 `seq` is a monotonic counter per (VU, source) — combine it with `vu` for
-lock-free uniqueness across VUs with no shared state on your side.
+lock-free uniqueness across VUs with no shared state on your side. `request`
+is the name of the request currently being prepared, or absent when the row
+is fetched outside request preparation (e.g. from a JS step). Row values
+cross as JSON scalars; strings map straight through, and a `bytes` protobuf
+field expects base64 (`prost-reflect` decodes it automatically).
 
 `vu` is local to one instance: in a distributed run every agent numbers its
 VUs from 1. Add `vu_offset` from `init_json` to get an id that is unique across
 the whole fleet, in `vu_offset + 1 ..= vu_offset + vus`. Every agent computes
 the same split from the same plan, so the ranges tile without overlap. `vus`
-counts the most VUs this agent can start (peak for ramping executors,
-`maxVUs` for arrival-rate ones), not the number running right now. A host that
-predates these fields omits them, so parse both as optional. `request`
-is the name of the request currently being prepared, or absent when the row
-is fetched outside request preparation (e.g. from a JS step). Row values
-cross as JSON scalars; strings map straight through, and a `bytes` protobuf
-field expects base64 (`prost-reflect` decodes it automatically).
+counts the most VUs this agent can start (peak for ramping executors, the
+larger of `pre_allocated_vus` and `max_vus` for arrival-rate ones), not the
+number running right now.
+
+A host that predates these fields omits both. If your plugin needs a
+fleet-unique id to be correct, require `vu_offset` so init fails on such a
+host, as `native-nonce-feeder` does: defaulting it to 0 would put every agent's
+VUs on the same ids without any error.
 
 ### Testing
 

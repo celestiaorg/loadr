@@ -82,8 +82,9 @@ pub trait FfiDataSource: Send + Sync {
     ///
     /// The `vu` in `next_row`'s context is local, `1..=vus`; `vu_offset + vu`
     /// is unique across every agent of a distributed run. `vus`/`vu_offset`
-    /// were added later: a host that predates them omits both, so read them
-    /// as optional.
+    /// were added later and a host that predates them omits both: a plugin
+    /// that needs a fleet-unique id should fail init without them rather
+    /// than default to 0.
     fn init(&mut self, init_json: RString) -> RResult<(), RString>;
 
     /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
@@ -91,9 +92,9 @@ pub trait FfiDataSource: Send + Sync {
     fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
 
     // Methods below were added after the first release. Each must keep its
-    // default body and new ones go after them: a plugin built before a
-    // method existed has no vtable slot for it, and abi_stable runs the
-    // default instead.
+    // default body and new ones go after them: `sabi_trait` makes a
+    // defaulted method's vtable slot optional, so a plugin built before the
+    // method existed runs the default instead.
 
     /// The full result of a request that used a row from this source, if
     /// `wants_results` returned `true`. `result_json`:

@@ -45,6 +45,8 @@ struct RecordingPlugin {
     counter: AtomicU64,
     wants: bool,
     results: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+    /// `ctx.request` of every `next_row` call.
+    requests: Arc<parking_lot::Mutex<Vec<Option<String>>>>,
 }
 
 impl DataSourcePlugin for RecordingPlugin {
@@ -59,7 +61,8 @@ impl DataSourcePlugin for RecordingPlugin {
         Ok(())
     }
 
-    fn next_row(&self, _ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String> {
+    fn next_row(&self, ctx: &PluginRowCtx<'_>) -> Result<PluginRowResult, String> {
+        self.requests.lock().push(ctx.request.map(str::to_string));
         let n = self.counter.fetch_add(1, Ordering::SeqCst).to_string();
         let mut row = loadr_core::data::Row::new();
         row.insert("n".to_string(), n);
@@ -77,11 +80,15 @@ impl DataSourcePlugin for RecordingPlugin {
     }
 }
 
-async fn run(wants: bool, status: i64) -> Vec<serde_json::Value> {
-    let loaded = loadr_config::load_str(PLAN, &loadr_config::LoadOptions::new()).expect("parse");
+/// Results the plugin received, and the request names `next_row` saw.
+type Observed = (Vec<serde_json::Value>, Vec<Option<String>>);
+
+async fn run_plan(plan: &str, wants: bool, status: i64) -> Observed {
+    let loaded = loadr_config::load_str(plan, &loadr_config::LoadOptions::new()).expect("parse");
     let mut protocols = ProtocolRegistry::new();
     protocols.register(Arc::new(StatusHandler { status }));
     let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut data_sources: HashMap<String, Box<dyn DataSourcePlugin>> = HashMap::new();
     data_sources.insert(
         "feeder".to_string(),
@@ -89,6 +96,7 @@ async fn run(wants: bool, status: i64) -> Vec<serde_json::Value> {
             counter: AtomicU64::new(0),
             wants,
             results: results.clone(),
+            requests: requests.clone(),
         }),
     );
     let engine = Engine::new(
@@ -102,8 +110,12 @@ async fn run(wants: bool, status: i64) -> Vec<serde_json::Value> {
     )
     .expect("engine");
     engine.run().await.expect("run");
-    let out = results.lock().clone();
-    out
+    let observed = (results.lock().clone(), requests.lock().clone());
+    observed
+}
+
+async fn run(wants: bool, status: i64) -> Vec<serde_json::Value> {
+    run_plan(PLAN, wants, status).await.0
 }
 
 const PLAN: &str = r#"
@@ -155,4 +167,35 @@ async fn on_result_sees_failed_requests_too() {
 async fn no_payloads_unless_plugin_wants_results() {
     let results = run(false, 200).await;
     assert!(results.is_empty(), "reporting is opt-in by the plugin");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_result_names_the_request_as_next_row_saw_it() {
+    const TEMPLATED: &str = r#"
+plugins:
+  - name: feeder
+    path: ./libfeeder.so
+variables:
+  kind: transfer
+data:
+  rows:
+    type: plugin
+    source: feeder
+scenarios:
+  s:
+    executor: per-vu-iterations
+    vus: 1
+    iterations: 1
+    flow:
+      - request:
+          name: "submit ${vars.kind}"
+          url: "http://example.test/tx?n=${data.rows.n}"
+"#;
+    let (results, requests) = run_plan(TEMPLATED, true, 200).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(requests, vec![Some("submit ${vars.kind}".to_string())]);
+    assert_eq!(
+        results[0]["request"], "submit ${vars.kind}",
+        "a plugin matching rows to results by request name must find a match"
+    );
 }

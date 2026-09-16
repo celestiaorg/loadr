@@ -1458,13 +1458,15 @@ impl FlowRunner {
 
         // 6. Feed the result back to plugins that generated rows for it.
         // Before the hook: a row an `afterRequest` hook pulls belongs to no
-        // request, and must not be reported against this one.
+        // request, and must not be reported against this one. The request is
+        // named as `next_row` saw it (the unrendered display name), so a
+        // plugin can match the two.
         if vu.data_state.has_pending() {
             let id = crate::data::RowIdentity {
                 vu: vu.vu_id,
                 iteration: vu.iteration.saturating_sub(1),
                 scenario: &vu.scenario,
-                request: Some(&prepared.name),
+                request: Some(&req.display_name),
             };
             vu.run
                 .data
