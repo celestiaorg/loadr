@@ -76,7 +76,14 @@ pub trait FfiDataSource: Send + Sync {
 
     /// Called once before VUs start. `init_json`:
     /// `{"plugin_config": <merged [config] + PluginRef.config>,
-    ///   "sources": {"<data name>": <data.<name>.config>, ...}}`
+    ///   "sources": {"<data name>": <data.<name>.config>, ...},
+    ///   "vus": <most VU ids this instance allocates>,
+    ///   "vu_offset": <sum of "vus" over the partitions before this one>}`
+    ///
+    /// The `vu` in `next_row`'s context is local, `1..=vus`; `vu_offset + vu`
+    /// is unique across every agent of a distributed run. `vus`/`vu_offset`
+    /// were added later: a host that predates them omits both, so read them
+    /// as optional.
     fn init(&mut self, init_json: RString) -> RResult<(), RString>;
 
     /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.

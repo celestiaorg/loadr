@@ -3324,7 +3324,13 @@ mod grpc_template_tests {
                 pick: PickStrategy::Sequential,
             },
         );
-        let data = DataFeeds::load(&sources, Path::new("."), HashMap::new()).expect("data feeds");
+        let data = DataFeeds::load(
+            &sources,
+            Path::new("."),
+            HashMap::new(),
+            crate::data::VuPlacement::default(),
+        )
+        .expect("data feeds");
         let run = Arc::new(RunContext {
             variables,
             secrets: HashMap::new(),

@@ -33,15 +33,18 @@ const DEFAULT_ACCOUNTS: u64 = 1000;
 struct NonceMap {
     shards: Vec<Mutex<HashMap<String, u64>>>,
     accounts: u64,
+    /// Where this agent's VUs start in fleet-wide numbering.
+    vu_offset: u64,
 }
 
 impl NonceMap {
-    fn new(shards: usize, accounts: u64) -> Self {
+    fn new(shards: usize, accounts: u64, vu_offset: u64) -> Self {
         NonceMap {
             shards: (0..shards.max(1))
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
             accounts: accounts.max(1),
+            vu_offset,
         }
     }
 
@@ -53,9 +56,10 @@ impl NonceMap {
 
     /// One account per VU: a nonce is a per-account sequence, so two VUs
     /// sharing an account would race for the same value and one of their
-    /// transactions would be rejected by the chain.
+    /// transactions would be rejected by the chain. `vu` is local to this
+    /// agent, so the offset keeps two agents' VUs off the same account.
     fn account_for(&self, vu: u64) -> String {
-        format!("acct-{}", vu % self.accounts)
+        format!("acct-{}", (self.vu_offset + vu) % self.accounts)
     }
 
     /// Current nonce, without advancing it: an unconfirmed transaction does
@@ -82,6 +86,9 @@ impl NonceMap {
 #[derive(Deserialize)]
 struct InitPayload {
     plugin_config: serde_json::Value,
+    /// Absent from hosts that predate it; 0 is right for a single instance.
+    #[serde(default)]
+    vu_offset: u64,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +133,7 @@ impl FfiDataSource for Feeder {
             .get("accounts")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_ACCOUNTS);
-        self.nonces = NonceMap::new(shards, accounts);
+        self.nonces = NonceMap::new(shards, accounts, payload.vu_offset);
         ROk(())
     }
 
@@ -173,7 +180,7 @@ extern "C" fn plugin_info() -> RString {
 
 extern "C" fn make_data_source() -> FfiDataSourceBox {
     let feeder = Feeder {
-        nonces: NonceMap::new(DEFAULT_SHARDS, DEFAULT_ACCOUNTS),
+        nonces: NonceMap::new(DEFAULT_SHARDS, DEFAULT_ACCOUNTS, 0),
     };
     FfiDataSource_TO::from_value(feeder, abi_stable::erased_types::TD_Opaque)
 }

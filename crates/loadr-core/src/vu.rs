@@ -297,8 +297,13 @@ mod tests {
                 pick: loadr_config::PickStrategy::Sequential,
             },
         );
-        let data =
-            DataFeeds::load(&sources, std::path::Path::new("."), HashMap::new()).expect("data");
+        let data = DataFeeds::load(
+            &sources,
+            std::path::Path::new("."),
+            HashMap::new(),
+            crate::data::VuPlacement::default(),
+        )
+        .expect("data");
         Arc::new(RunContext {
             variables,
             secrets,
@@ -519,7 +524,13 @@ mod tests {
         );
         let mut plugins: HashMap<String, Box<dyn crate::data::DataSourcePlugin>> = HashMap::new();
         plugins.insert("signer".to_string(), Box::new(plugin));
-        let data = DataFeeds::load(&sources, std::path::Path::new("."), plugins).expect("data");
+        let data = DataFeeds::load(
+            &sources,
+            std::path::Path::new("."),
+            plugins,
+            crate::data::VuPlacement::default(),
+        )
+        .expect("data");
         (
             Arc::new(RunContext {
                 variables: serde_json::Map::new(),

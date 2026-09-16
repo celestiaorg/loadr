@@ -334,7 +334,8 @@ impl FfiDataSource for MySource {
 
     /// Called once before VUs start.
     fn init(&mut self, init_json: RString) -> RResult<(), RString> {
-        // parse {"plugin_config": ..., "sources": {"<data name>": <config>, ...}}
+        // parse {"plugin_config": ..., "sources": {"<data name>": <config>, ...},
+        //        "vus": ..., "vu_offset": ...}
         ROk(())
     }
 
@@ -433,7 +434,9 @@ result never arrives, and must not panic — it runs on a VU worker thread.
 // init_json (host -> plugin, once before VUs start)
 {
   "plugin_config": { "seed": 42 },              // merged [config] + PluginRef.config
-  "sources": { "signed_tx": { "chain_id": "testnet-1" } }  // one entry per data.<name> backed by this plugin
+  "sources": { "signed_tx": { "chain_id": "testnet-1" } }, // one entry per data.<name> backed by this plugin
+  "vus": 250,                                   // most VU ids this instance allocates
+  "vu_offset": 500                              // sum of "vus" over the agents before this one
 }
 
 // ctx_json (host -> plugin, per next_row call)
@@ -449,7 +452,15 @@ result never arrives, and must not panic — it runs on a VU worker thread.
 ```
 
 `seq` is a monotonic counter per (VU, source) — combine it with `vu` for
-lock-free uniqueness across VUs with no shared state on your side. `request`
+lock-free uniqueness across VUs with no shared state on your side.
+
+`vu` is local to one instance: in a distributed run every agent numbers its
+VUs from 1. Add `vu_offset` from `init_json` to get an id that is unique across
+the whole fleet, in `vu_offset + 1 ..= vu_offset + vus`. Every agent computes
+the same split from the same plan, so the ranges tile without overlap. `vus`
+counts the most VUs this agent can start (peak for ramping executors,
+`maxVUs` for arrival-rate ones), not the number running right now. A host that
+predates these fields omits them, so parse both as optional. `request`
 is the name of the request currently being prepared, or absent when the row
 is fetched outside request preparation (e.g. from a JS step). Row values
 cross as JSON scalars; strings map straight through, and a `bytes` protobuf

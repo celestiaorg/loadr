@@ -16,7 +16,7 @@ plugins:
   - name: nonce-feeder
     config:
       shards: 256
-      accounts: 1000   # >= vus, so each VU owns an account
+      accounts: 1000   # >= vus across all agents, so each VU owns an account
 
 data:
   nonces:
