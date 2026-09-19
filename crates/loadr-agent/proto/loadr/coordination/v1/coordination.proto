@@ -68,6 +68,9 @@ message MetricsBatch {
   string run_id = 1;
   // serde_json encoding of loadr_core::MetricsDelta.
   bytes delta_json = 2;
+  // serde_json encoding of this agent's latest Vec<loadr_core::JobStatus>;
+  // empty when the run drives no jobs.
+  bytes jobs_json = 3;
 }
 
 message RunEvent {

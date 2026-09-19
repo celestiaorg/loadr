@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use futures::Stream;
 use loadr_core::thresholds::{compile_thresholds, evaluate_all, CompiledThreshold};
 use loadr_core::{
-    AggValues, Aggregator, MetricKind, MetricsDelta, Snapshot, Summary, ThresholdStatus,
-    TimelinePoint,
+    merge_job_statuses, AggValues, Aggregator, JobStatus, MetricKind, MetricsDelta, Snapshot,
+    Summary, ThresholdStatus, TimelinePoint,
 };
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch, Notify};
@@ -323,6 +323,8 @@ struct ControllerRun {
     pending_controls: Mutex<HashMap<u64, PendingControl>>,
     /// Per-agent summaries as reported.
     summaries: Mutex<Vec<Summary>>,
+    /// agent_id → that agent's latest job statuses, merged for the fleet view.
+    jobs: Mutex<HashMap<String, Vec<JobStatus>>>,
     /// Frozen fleet summary, created exactly once at terminal transition.
     merged_summary: Mutex<Option<Summary>>,
     threshold_statuses: Mutex<Vec<ThresholdStatus>>,
@@ -778,6 +780,19 @@ impl Inner {
                         }
                         run.contributing.lock().insert(agent_id.to_string());
                         run.agg.lock().merge_delta(&delta);
+                        if !batch.jobs_json.is_empty() {
+                            match serde_json::from_slice::<Vec<JobStatus>>(&batch.jobs_json) {
+                                Ok(jobs) => {
+                                    run.jobs.lock().insert(agent_id.to_string(), jobs);
+                                }
+                                Err(e) => tracing::warn!(
+                                    run_id = %batch.run_id,
+                                    agent = %agent_id,
+                                    error = %e,
+                                    "undecodable job statuses dropped"
+                                ),
+                            }
+                        }
                         // A delta can race the liveness sweep (or land after the
                         // agent's terminal event on a resumed stream). The sweep
                         // only zeroes *newly* lost agents, so re-zero here or the
@@ -895,6 +910,13 @@ impl Inner {
             "finished" | "aborted" | "failed" => {
                 if !ev.summary_json.is_empty() {
                     if let Ok(summary) = serde_json::from_slice::<Summary>(&ev.summary_json) {
+                        // The final word on this agent's jobs, even if its
+                        // last metrics batch was lost.
+                        if !summary.jobs.is_empty() {
+                            run.jobs
+                                .lock()
+                                .insert(agent_id.to_string(), summary.jobs.clone());
+                        }
                         run.summaries.lock().push(summary);
                     }
                 }
@@ -991,6 +1013,7 @@ impl Inner {
         summary.ended_ms = finished_ms;
         summary.duration_secs = finished_ms.saturating_sub(started_ms) as f64 / 1000.0;
         summary.snapshot = (*snapshot).clone();
+        summary.jobs = fleet_jobs(run);
         // Publish the frozen summary before exposing the terminal state so
         // state and summary remain one atomic observer-facing transition.
         *run.merged_summary.lock() = Some(summary);
@@ -1616,6 +1639,7 @@ impl ControllerHandle {
             paused: Mutex::new(Some(false)),
             pending_controls: Mutex::new(HashMap::new()),
             summaries: Mutex::new(Vec::new()),
+            jobs: Mutex::new(HashMap::new()),
             merged_summary: Mutex::new(None),
             threshold_statuses: Mutex::new(Vec::new()),
             abort_reason: Mutex::new(None),
@@ -1980,6 +2004,17 @@ impl ControllerHandle {
             .unwrap_or_default()
     }
 
+    /// Every job of a run across the fleet, merged from each agent's latest
+    /// report (empty for an unknown run or one without jobs).
+    pub fn run_jobs(&self, run_id: &str) -> Vec<JobStatus> {
+        self.inner
+            .runs
+            .lock()
+            .get(run_id)
+            .map(|run| fleet_jobs(run))
+            .unwrap_or_default()
+    }
+
     /// The merged end-of-run summary, built from the central aggregator once
     /// the run reached a terminal state.
     pub fn run_summary(&self, run_id: &str) -> Option<Summary> {
@@ -1995,6 +2030,17 @@ impl ControllerHandle {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+}
+
+/// The run's jobs as one fleet, from each agent's latest statuses.
+fn fleet_jobs(run: &ControllerRun) -> Vec<JobStatus> {
+    let jobs = run.jobs.lock();
+    merge_job_statuses(
+        run.assigned
+            .iter()
+            .filter_map(|agent| jobs.get(agent))
+            .map(Vec::as_slice),
+    )
 }
 
 #[cfg(test)]
@@ -2047,6 +2093,7 @@ mod test_support {
             paused: Mutex::new(Some(false)),
             pending_controls: Mutex::new(HashMap::new()),
             summaries: Mutex::new(Vec::new()),
+            jobs: Mutex::new(HashMap::new()),
             merged_summary: Mutex::new(None),
             threshold_statuses: Mutex::new(Vec::new()),
             abort_reason: Mutex::new(None),
@@ -2121,6 +2168,7 @@ mod test_support {
             msg: Some(AgentMsg::Metrics(pb::MetricsBatch {
                 run_id: run_id.to_string(),
                 delta_json: serde_json::to_vec(delta).expect("delta json"),
+                jobs_json: Vec::new(),
             })),
         }
     }
@@ -2262,6 +2310,76 @@ mod metrics_tests {
         // would prove nothing about the zeroing.
         inner.handle_agent_message("agent-a", 1, metrics_batch("run-1", 2, &delta));
         assert_eq!(fleet_vus(), Some(0.0));
+    }
+
+    fn job(state: loadr_core::JobState, done: f64) -> JobStatus {
+        JobStatus {
+            name: "gen".into(),
+            state,
+            done,
+            total: Some(100.0),
+            unit: Some("rows".into()),
+            rate: None,
+            eta_secs: None,
+            elapsed_secs: 1.0,
+            error: None,
+            metrics: Default::default(),
+        }
+    }
+
+    fn jobs_batch(run_id: &str, seq: u64, jobs: &[JobStatus]) -> pb::AgentMessage {
+        let mut msg = metrics_batch(run_id, seq, &MetricsDelta::default());
+        if let Some(AgentMsg::Metrics(batch)) = &mut msg.msg {
+            batch.jobs_json = serde_json::to_vec(jobs).expect("jobs json");
+        }
+        msg
+    }
+
+    #[test]
+    fn each_agents_latest_job_statuses_merge_into_one_fleet_view() {
+        use loadr_core::JobState::{Finished, Running};
+        let inner = test_inner();
+        let _a = register(&inner, "agent-a", "proc-1", 1);
+        let _b = register(&inner, "agent-b", "proc-1", 2);
+        let run = test_run("run-1", &["agent-a", "agent-b"]);
+        inner.runs.lock().insert("run-1".into(), run.clone());
+
+        inner.handle_agent_message("agent-a", 1, jobs_batch("run-1", 1, &[job(Running, 30.0)]));
+        inner.handle_agent_message("agent-b", 2, jobs_batch("run-1", 1, &[job(Running, 10.0)]));
+        let fleet = fleet_jobs(&run);
+        assert_eq!(fleet.len(), 1);
+        assert_eq!(
+            (fleet[0].state, fleet[0].done, fleet[0].total),
+            (Running, 40.0, Some(200.0))
+        );
+
+        // A newer report replaces the agent's previous one instead of adding to it.
+        inner.handle_agent_message(
+            "agent-a",
+            1,
+            jobs_batch("run-1", 2, &[job(Finished, 100.0)]),
+        );
+        assert_eq!(fleet_jobs(&run)[0].done, 110.0);
+
+        // The agent's final summary settles its jobs even without a last batch.
+        let mut summary = Summary::build(
+            None,
+            "run-1".into(),
+            0,
+            Vec::new(),
+            &mut Aggregator::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        summary.jobs = vec![job(Finished, 100.0)];
+        let mut finished = run_event("run-1", 2, "finished");
+        if let Some(AgentMsg::Event(event)) = &mut finished.msg {
+            event.summary_json = serde_json::to_vec(&summary).expect("summary json");
+        }
+        inner.handle_agent_message("agent-b", 2, finished);
+        let fleet = fleet_jobs(&run);
+        assert_eq!((fleet[0].state, fleet[0].done), (Finished, 200.0));
     }
 
     /// The terminal freeze and a delta's contributing-insert + merge must not

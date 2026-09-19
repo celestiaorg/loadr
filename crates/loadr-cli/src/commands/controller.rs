@@ -625,6 +625,19 @@ impl loadr_plugin_webui::UiBackend for ControllerBackend {
         }
     }
 
+    fn run_jobs(&self, run_id: &str) -> Vec<loadr_core::JobStatus> {
+        let current = self.controller.run_jobs(run_id);
+        if current.is_empty() {
+            self.history
+                .lock()
+                .get(run_id)
+                .map(|record| record.summary.jobs.clone())
+                .unwrap_or_default()
+        } else {
+            current
+        }
+    }
+
     fn run_summary(&self, run_id: &str) -> Option<loadr_core::Summary> {
         self.controller.run_summary(run_id).or_else(|| {
             self.history

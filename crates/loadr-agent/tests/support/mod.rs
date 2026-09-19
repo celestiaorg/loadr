@@ -609,6 +609,7 @@ pub fn metrics_batch(run_id: &str, seq: u64, count: u64) -> pb::AgentMessage {
         msg: Some(pb::agent_message::Msg::Metrics(pb::MetricsBatch {
             run_id: run_id.to_string(),
             delta_json: serde_json::to_vec(&agg.take_delta()).expect("delta json"),
+            jobs_json: Vec::new(),
         })),
     }
 }

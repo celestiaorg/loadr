@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -731,11 +731,13 @@ fn prepare_engine(
     let mut extra_tags = Tags::new();
     extra_tags.insert("instance".to_string(), config.agent_name.clone());
 
+    let handle = Arc::new(OnceLock::new());
     let output = DeltaOutput {
         run_id: a.run_id.clone(),
         uplink,
+        handle: Arc::clone(&handle),
     };
-    Engine::new(
+    let engine = Engine::new(
         plan,
         run_dir,
         EngineOptions {
@@ -750,7 +752,9 @@ fn prepare_engine(
             jobs,
         },
     )
-    .map_err(|e| format!("engine setup failed: {e}"))
+    .map_err(|e| format!("engine setup failed: {e}"))?;
+    let _ = handle.set(engine.handle());
+    Ok(engine)
 }
 
 /// Hold the engine ready, wait for the synchronized start, run to completion
@@ -923,14 +927,25 @@ fn materialize_files(dir: &Path, files: &[pb::DataFile]) -> Result<(), AgentErro
 struct DeltaOutput {
     run_id: String,
     uplink: Arc<Uplink>,
+    /// The engine this output belongs to, set once it exists: each batch also
+    /// carries its jobs' latest statuses for the controller's job view.
+    handle: Arc<OnceLock<RunHandle>>,
 }
 
 impl DeltaOutput {
     fn batch(&self, delta: &MetricsDelta) -> Option<pb::AgentMessage> {
         let delta_json = serde_json::to_vec(delta).ok()?;
+        let jobs_json = self
+            .handle
+            .get()
+            .map(RunHandle::job_statuses)
+            .filter(|jobs| !jobs.is_empty())
+            .and_then(|jobs| serde_json::to_vec(&*jobs).ok())
+            .unwrap_or_default();
         Some(agent_msg(AgentMsg::Metrics(pb::MetricsBatch {
             run_id: self.run_id.clone(),
             delta_json,
+            jobs_json,
         })))
     }
 }
@@ -1012,6 +1027,7 @@ mod tests {
         let mut output = DeltaOutput {
             run_id: "run-1".to_string(),
             uplink: uplink.clone(),
+            handle: Arc::default(),
         };
         let delta = one_delta();
 

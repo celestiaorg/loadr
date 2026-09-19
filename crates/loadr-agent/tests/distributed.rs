@@ -880,6 +880,15 @@ plugins:
         "each agent ran the job once, with its own index"
     );
 
+    // The controller merges both agents' job into one fleet status.
+    let jobs = handle.run_summary(&run_id).expect("summary").jobs;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(
+        (jobs[0].state, jobs[0].done, jobs[0].total),
+        (loadr_core::JobState::Finished, 2.0, Some(2.0))
+    );
+    assert_eq!(handle.run_jobs(&run_id), jobs);
+
     handle.shutdown();
 }
 

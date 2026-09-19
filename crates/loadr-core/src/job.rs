@@ -347,6 +347,75 @@ fn metric_key(key: &str) -> String {
         .collect()
 }
 
+/// One status per job for a distributed run, from each agent's latest report.
+/// Counts, rates and metrics add up across agents; a failure anywhere fails
+/// the job, and it is finished only once every agent finished it.
+pub fn merge_job_statuses<'a>(
+    reports: impl IntoIterator<Item = &'a [JobStatus]>,
+) -> Vec<JobStatus> {
+    let mut merged: Vec<(JobStatus, Vec<JobState>)> = Vec::new();
+    for report in reports {
+        for status in report {
+            match merged.iter_mut().find(|(job, _)| job.name == status.name) {
+                Some((job, states)) => {
+                    job.done += status.done;
+                    job.total = job.total.zip(status.total).map(|(a, b)| a + b);
+                    job.rate = sum_options(job.rate, status.rate);
+                    job.eta_secs = max_options(job.eta_secs, status.eta_secs);
+                    job.elapsed_secs = job.elapsed_secs.max(status.elapsed_secs);
+                    job.error = job.error.take().or_else(|| status.error.clone());
+                    for (key, value) in &status.metrics {
+                        *job.metrics.entry(key.clone()).or_insert(0.0) += value;
+                    }
+                    states.push(status.state);
+                }
+                None => merged.push((status.clone(), vec![status.state])),
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(mut job, states)| {
+            job.state = fleet_state(&states);
+            if job.state.is_terminal() {
+                job.eta_secs = None;
+            }
+            job
+        })
+        .collect()
+}
+
+fn fleet_state(states: &[JobState]) -> JobState {
+    let any = |state| states.contains(&state);
+    if any(JobState::Failed) {
+        JobState::Failed
+    } else if any(JobState::Running)
+        || (any(JobState::Pending) && states.iter().any(|s| s.is_terminal()))
+    {
+        JobState::Running
+    } else if any(JobState::Pending) {
+        JobState::Pending
+    } else if any(JobState::Stopped) {
+        JobState::Stopped
+    } else {
+        JobState::Finished
+    }
+}
+
+fn sum_options(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    }
+}
+
+fn max_options(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +451,56 @@ mod tests {
         assert_eq!(s.fraction(), None);
         s.total = Some(20.0);
         assert_eq!(s.fraction(), Some(0.25));
+    }
+
+    fn agent_status(state: JobState, done: f64, total: f64, rate: f64) -> JobStatus {
+        JobStatus {
+            state,
+            done,
+            total: Some(total),
+            unit: Some("rows".into()),
+            rate: Some(rate),
+            eta_secs: Some((total - done) / rate),
+            elapsed_secs: done / rate,
+            metrics: BTreeMap::from([("bytes".to_string(), done * 10.0)]),
+            ..JobStatus::pending("gen")
+        }
+    }
+
+    #[test]
+    fn agents_add_up_to_one_status_per_job() {
+        let a = [agent_status(JobState::Running, 40.0, 100.0, 10.0)];
+        let b = [agent_status(JobState::Finished, 100.0, 100.0, 20.0)];
+        let merged = merge_job_statuses([&a[..], &b[..]]);
+        assert_eq!(merged.len(), 1);
+        let job = &merged[0];
+        assert_eq!(
+            (job.state, job.done, job.total),
+            (JobState::Running, 140.0, Some(200.0))
+        );
+        assert_eq!(job.rate, Some(30.0));
+        assert_eq!(job.eta_secs, Some(6.0), "the slowest agent decides");
+        assert_eq!(job.elapsed_secs, 5.0);
+        assert_eq!(job.metrics["bytes"], 1400.0);
+    }
+
+    #[test]
+    fn the_fleet_state_waits_for_every_agent_and_any_failure_wins() {
+        let merged = |states: &[JobState]| {
+            let reports: Vec<Vec<JobStatus>> = states
+                .iter()
+                .map(|&state| vec![agent_status(state, 1.0, 1.0, 1.0)])
+                .collect();
+            merge_job_statuses(reports.iter().map(Vec::as_slice))[0].state
+        };
+        use JobState::*;
+        assert_eq!(merged(&[Finished, Finished]), Finished);
+        assert_eq!(merged(&[Finished, Running]), Running);
+        assert_eq!(merged(&[Pending, Finished]), Running);
+        assert_eq!(merged(&[Pending, Pending]), Pending);
+        assert_eq!(merged(&[Finished, Stopped]), Stopped);
+        assert_eq!(merged(&[Running, Failed]), Failed);
+        let finished = [agent_status(Finished, 1.0, 1.0, 1.0)];
+        assert_eq!(merge_job_statuses([&finished[..]])[0].eta_secs, None);
     }
 }

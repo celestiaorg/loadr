@@ -580,6 +580,13 @@ reserved: the host overwrites any value the plan sets for them. The job
 plugin must be installed on every agent host, the same as data-source
 plugins.
 
+Each agent reports its jobs' progress to the controller with its metrics,
+and the controller shows one card per job for the whole fleet: `done`,
+`total`, `rate` and `metrics` add up across agents, the ETA is the slowest
+agent's, and the job is finished only once every agent finished it (a
+failure on any agent fails it). The end-of-run summary carries the same
+merged status.
+
 ### Testing
 
 - Drive `start` / `progress` / `stop` directly in unit tests. The job doesn't

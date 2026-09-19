@@ -32,7 +32,9 @@ pub use engine::{Engine, EngineOptions, RunHandle, RunResult, RunStatus};
 pub use error::{EngineError, ProtocolError, ScriptError};
 pub use executor::{partition_spec, vu_capacity};
 pub use flow::{FlowRunner, IterationOutcome, ScenarioProgram};
-pub use job::{Job, JobPlacement, JobProgress, JobState, JobStatus, ReportedState};
+pub use job::{
+    merge_job_statuses, Job, JobPlacement, JobProgress, JobState, JobStatus, ReportedState,
+};
 pub use metrics::{MetricKind, MetricRegistry, MetricsBus, Sample, Tags};
 pub use output::{ChannelOutput, Output};
 pub use protocol::{
