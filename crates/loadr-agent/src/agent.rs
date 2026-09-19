@@ -56,6 +56,18 @@ pub type DataSourceFactory = Arc<
         + Sync,
 >;
 
+/// Builds the job plugins for one run from the plan's `plugins:`. Every
+/// agent runs every job; the engine tells each one its agent index and count
+/// at start so it can take its own share of the work.
+pub type JobFactory = Arc<
+    dyn Fn(
+            &[loadr_config::PluginRef],
+            &std::path::Path,
+        ) -> Result<Vec<Box<dyn loadr_core::Job>>, String>
+        + Send
+        + Sync,
+>;
+
 /// Injected runtime dependencies (keeps `loadr-agent` decoupled from the
 /// protocol and JS crates).
 #[derive(Clone)]
@@ -65,6 +77,9 @@ pub struct RunnerDeps {
     /// `None` means this agent build has no data-source plugin support: plans
     /// that declare `data.*: { type: plugin }` sources fail engine setup.
     pub data_sources: Option<DataSourceFactory>,
+    /// `None` means this agent build has no job support: a plan whose only
+    /// workload is jobs fails engine setup.
+    pub jobs: Option<JobFactory>,
 }
 
 /// TLS settings for the agent → controller channel.
@@ -701,6 +716,10 @@ fn prepare_engine(
         Some(factory) => factory(&plan.plugins, &run_dir)?,
         None => HashMap::new(),
     };
+    let jobs = match &config.deps.jobs {
+        Some(factory) => factory(&plan.plugins, &run_dir)?,
+        None => Vec::new(),
+    };
     let script = match (&plan.js, &config.deps.script) {
         (Some(js), Some(factory)) => Some(factory(js, &run_dir)?),
         (Some(_), None) => {
@@ -728,9 +747,7 @@ fn prepare_engine(
             extra_tags,
             snapshot_interval: Duration::from_millis(500),
             data_sources,
-            // Jobs are local-run only: splitting a plugin's own work across
-            // agents is the plugin's business, and nothing plumbs that yet.
-            jobs: Vec::new(),
+            jobs,
         },
     )
     .map_err(|e| format!("engine setup failed: {e}"))

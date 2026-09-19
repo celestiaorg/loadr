@@ -11,6 +11,10 @@
 //! generation runs in parallel and the file is never interleaved mid-line.
 //! Rows are a pure function of `(seed, index)`: same config, same rows (the
 //! order of batches in the file depends on scheduling).
+//!
+//! In a distributed run every agent runs the job. loadr adds `agent_index`
+//! and `agent_count` to the start config, and each agent writes only its
+//! contiguous slice of the row ids, so the fleet writes every row once.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -39,6 +43,21 @@ struct Config {
     threads: usize,
     batch: u64,
     seed: u64,
+    /// Set by loadr: this agent's 0-based index and the fleet size.
+    agent_index: u64,
+    agent_count: u64,
+}
+
+impl Config {
+    /// This agent's row ids: `rows` split into `agent_count` contiguous
+    /// slices, the first `rows % agent_count` one row longer.
+    fn share(&self) -> std::ops::Range<u64> {
+        let count = self.agent_count.max(1);
+        let index = self.agent_index.min(count - 1);
+        let (base, extra) = (self.rows / count, self.rows % count);
+        let start = index * base + index.min(extra);
+        start..start + base + u64::from(index < extra)
+    }
 }
 
 impl Default for Config {
@@ -49,6 +68,8 @@ impl Default for Config {
             threads: 0,
             batch: 10_000,
             seed: 42,
+            agent_index: 0,
+            agent_count: 1,
         }
     }
 }
@@ -56,6 +77,9 @@ impl Default for Config {
 /// State the workers and `progress` share. Everything `progress` reads is an
 /// atomic, so a poll never waits on a worker.
 struct Shared {
+    /// One past this agent's last row id.
+    end: u64,
+    /// Rows in this agent's share.
     rows: u64,
     batch: u64,
     seed: u64,
@@ -84,10 +108,10 @@ impl Shared {
         let mut buf = String::new();
         while !self.cancel.load(Ordering::Acquire) {
             let start = self.next.fetch_add(self.batch, Ordering::Relaxed);
-            if start >= self.rows {
+            if start >= self.end {
                 break;
             }
-            let end = start.saturating_add(self.batch).min(self.rows);
+            let end = start.saturating_add(self.batch).min(self.end);
             buf.clear();
             for index in start..end {
                 render_row(&mut buf, self.seed, index);
@@ -192,11 +216,13 @@ impl FfiService for FileGen {
         } else {
             config.threads
         };
+        let share = config.share();
         let shared = Arc::new(Shared {
-            rows: config.rows,
+            end: share.end,
+            rows: share.end - share.start,
             batch: config.batch.max(1),
             seed: config.seed,
-            next: AtomicU64::new(0),
+            next: AtomicU64::new(share.start),
             done: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             alive: AtomicUsize::new(threads),
@@ -343,6 +369,51 @@ mod tests {
         let mut gen = FileGen::default();
         let config = serde_json::json!({"path": "/nonexistent-dir/x.jsonl"});
         assert!(gen.start(RString::from(config.to_string())).is_err());
+    }
+
+    #[test]
+    fn shares_cover_every_row_once() {
+        for (rows, count) in [(10, 3), (2, 5), (1_000_003, 4), (0, 2)] {
+            let mut next = 0;
+            for index in 0..count {
+                let config = Config {
+                    rows,
+                    agent_index: index,
+                    agent_count: count,
+                    ..Config::default()
+                };
+                let share = config.share();
+                assert_eq!(share.start, next, "contiguous");
+                next = share.end;
+            }
+            assert_eq!(next, rows, "{rows} rows over {count}");
+        }
+    }
+
+    #[test]
+    fn an_agent_writes_only_its_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        let mut gen = FileGen::default();
+        let config = serde_json::json!({
+            "path": path, "rows": 10, "threads": 2, "batch": 2,
+            "agent_index": 1, "agent_count": 3,
+        });
+        assert!(gen.start(RString::from(config.to_string())).is_ok());
+        let p = run_to_end(&mut gen);
+        assert_eq!(p["state"], "finished");
+        assert_eq!(p["total"], 3);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut ids: Vec<u64> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["id"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![4, 5, 6]);
     }
 
     #[test]

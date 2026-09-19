@@ -16,7 +16,7 @@ use crate::data::VuPlacement;
 use crate::error::EngineError;
 use crate::executor::{partition_spec, run_scenario, vu_capacity, ExecEnv, ScenarioRunSpec};
 use crate::flow::{FlowRunner, ScenarioProgram};
-use crate::job::{Job, JobDriver, JobStatus};
+use crate::job::{Job, JobDriver, JobPlacement, JobStatus};
 use crate::metrics::{BuiltinMetrics, MetricRegistry, MetricsBus, Sample, Tags};
 use crate::output::Output;
 use crate::protocol::ProtocolRegistry;
@@ -199,6 +199,7 @@ pub struct Engine {
     status_tx: watch::Sender<RunStatus>,
     external_targets: HashMap<String, watch::Receiver<u64>>,
     jobs: Vec<Box<dyn Job>>,
+    job_placement: JobPlacement,
 }
 
 impl Engine {
@@ -371,6 +372,13 @@ impl Engine {
             status_tx,
             external_targets,
             jobs: opts.jobs,
+            job_placement: opts
+                .partition
+                .map(|(agent_index, agent_count)| JobPlacement {
+                    agent_index,
+                    agent_count,
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -588,6 +596,7 @@ impl Engine {
                 abort_tx: abort_tx.clone(),
                 status_tx: self.jobs_tx.clone(),
                 interval: self.snapshot_interval,
+                placement: self.job_placement,
             };
             Some(tokio::task::spawn_blocking(move || driver.run(jobs)))
         };

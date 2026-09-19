@@ -820,6 +820,70 @@ data:
 }
 
 // ---------------------------------------------------------------------------
+// Job plugins run on every agent, each told its agent index
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_runs_on_every_agent_with_its_index() {
+    let handle = start_controller(Duration::from_secs(6)).await;
+    let addr = format!("http://{}", handle.addr());
+
+    let placements = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let _a1 = spawn_agent_with_deps(
+        addr.clone(),
+        "j1",
+        None,
+        None,
+        mock_deps_with_jobs(&placements),
+    );
+    let _a2 = spawn_agent_with_deps(
+        addr.clone(),
+        "j2",
+        None,
+        None,
+        mock_deps_with_jobs(&placements),
+    );
+    wait_until(
+        || handle.agents().iter().filter(|a| a.healthy).count() == 2,
+        Duration::from_secs(10),
+        "2 agents registered",
+    )
+    .await;
+
+    // No scenarios: the job is the whole workload.
+    let plan = r#"
+name: dist-job
+plugins:
+  - name: gen
+"#;
+    let run_id = handle
+        .submit(plan.to_string(), quick_submit())
+        .await
+        .expect("submit");
+    wait_until(
+        || is_terminal(&run_state(&handle, &run_id)),
+        Duration::from_secs(30),
+        "run completion",
+    )
+    .await;
+    assert_eq!(run_state(&handle, &run_id), "finished");
+
+    let mut seen: Vec<(u64, u64)> = placements
+        .lock()
+        .iter()
+        .map(|p| (p.agent_index, p.agent_count))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![(0, 2), (1, 2)],
+        "each agent ran the job once, with its own index"
+    );
+
+    handle.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests: scale share math and path traversal rejection
 // ---------------------------------------------------------------------------
 

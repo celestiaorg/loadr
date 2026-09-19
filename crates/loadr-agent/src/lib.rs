@@ -42,7 +42,8 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 pub const PROTOCOL_VERSION: u32 = 4;
 
 pub use agent::{
-    Agent, AgentConfig, AgentTls, DataSourceFactory, ProtocolFactory, RunnerDeps, ScriptFactory,
+    Agent, AgentConfig, AgentTls, DataSourceFactory, JobFactory, ProtocolFactory, RunnerDeps,
+    ScriptFactory,
 };
 pub use controller::{
     AgentInfo, Controller, ControllerConfig, ControllerHandle, ControllerTls, FleetMetric,

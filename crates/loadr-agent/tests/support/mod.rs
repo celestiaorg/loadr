@@ -146,6 +146,7 @@ pub fn mock_deps() -> RunnerDeps {
         }),
         script: None,
         data_sources: None,
+        jobs: None,
     }
 }
 
@@ -176,6 +177,53 @@ pub fn mock_deps_with_data_sources(inits: &Arc<AtomicU64>, rows: &Arc<AtomicU64>
     }
 }
 
+/// A job that finishes on its first poll and records where it was placed.
+pub struct MockJob {
+    pub placements: Arc<Mutex<Vec<loadr_core::JobPlacement>>>,
+}
+
+impl loadr_core::Job for MockJob {
+    fn name(&self) -> &str {
+        "mock-job"
+    }
+
+    fn start(&mut self, placement: loadr_core::JobPlacement) -> Result<(), String> {
+        self.placements.lock().push(placement);
+        Ok(())
+    }
+
+    fn progress(&mut self) -> Result<loadr_core::JobProgress, String> {
+        Ok(loadr_core::JobProgress {
+            state: loadr_core::ReportedState::Finished,
+            done: 1.0,
+            total: Some(1.0),
+            ..Default::default()
+        })
+    }
+
+    fn stop(&mut self) {}
+}
+
+/// `mock_deps` plus a job factory that backs every declared plugin with a
+/// [`MockJob`] recording its placement.
+pub fn mock_deps_with_jobs(placements: &Arc<Mutex<Vec<loadr_core::JobPlacement>>>) -> RunnerDeps {
+    let placements = Arc::clone(placements);
+    RunnerDeps {
+        jobs: Some(Arc::new(move |plugin_refs, _base_dir| {
+            Ok(plugin_refs
+                .iter()
+                .filter(|p| p.enabled)
+                .map(|_| {
+                    Box::new(MockJob {
+                        placements: Arc::clone(&placements),
+                    }) as Box<dyn loadr_core::Job>
+                })
+                .collect())
+        })),
+        ..mock_deps()
+    }
+}
+
 /// Deps whose factory registers the `custom` handler only when the assigned
 /// plan declares it under `plugins:` — proving the full plan (including the
 /// plugins section) reaches the agent-side protocol factory.
@@ -193,6 +241,7 @@ pub fn plugin_gated_deps() -> RunnerDeps {
         }),
         script: None,
         data_sources: None,
+        jobs: None,
     }
 }
 

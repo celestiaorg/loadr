@@ -22,7 +22,9 @@ pub trait Job: Send {
     fn name(&self) -> &str;
 
     /// Begin the work (typically by spawning the plugin's own threads).
-    fn start(&mut self) -> Result<(), String>;
+    /// `placement` says which share of a distributed run this instance is:
+    /// every agent runs the job, so each must do only its own part.
+    fn start(&mut self, placement: JobPlacement) -> Result<(), String>;
 
     /// Where the work stands. An `Err` fails the job.
     fn progress(&mut self) -> Result<JobProgress, String>;
@@ -30,6 +32,23 @@ pub trait Job: Send {
     /// Cancel the work if still running, wait for it and flush. Called once,
     /// whether the job finished, failed or the run was stopped.
     fn stop(&mut self);
+}
+
+/// Where a job instance sits in a run: agent `agent_index` (0-based) of
+/// `agent_count`. A standalone run is agent 0 of 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPlacement {
+    pub agent_index: u64,
+    pub agent_count: u64,
+}
+
+impl Default for JobPlacement {
+    fn default() -> Self {
+        JobPlacement {
+            agent_index: 0,
+            agent_count: 1,
+        }
+    }
 }
 
 /// What a plugin reports about its own work.
@@ -135,6 +154,7 @@ pub(crate) struct JobDriver {
     pub abort_tx: mpsc::UnboundedSender<String>,
     pub status_tx: watch::Sender<Arc<Vec<JobStatus>>>,
     pub interval: Duration,
+    pub placement: JobPlacement,
 }
 
 /// How often the driver checks for a stop request between polls.
@@ -174,7 +194,7 @@ impl JobDriver {
         for slot in &mut slots {
             slot.started = Instant::now();
             slot.last_poll = slot.started;
-            match slot.job.start() {
+            match slot.job.start(self.placement) {
                 Ok(()) => slot.status.state = JobState::Running,
                 Err(e) => {
                     // Nothing ran, but the plugin may hold resources.

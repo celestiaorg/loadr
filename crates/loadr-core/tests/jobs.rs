@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use loadr_core::{Engine, EngineOptions, Job, JobProgress, JobState, ReportedState};
+use loadr_core::{Engine, EngineOptions, Job, JobPlacement, JobProgress, JobState, ReportedState};
 
 /// Counts to `total` on its own thread, one unit per millisecond.
 struct Counter {
@@ -16,6 +16,7 @@ struct Counter {
     cancel: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     stops: Arc<AtomicU64>,
+    placement: Arc<std::sync::Mutex<Option<JobPlacement>>>,
 }
 
 impl Counter {
@@ -27,6 +28,7 @@ impl Counter {
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
             stops: Arc::new(AtomicU64::new(0)),
+            placement: Arc::default(),
         }
     }
 }
@@ -36,7 +38,8 @@ impl Job for Counter {
         "counter"
     }
 
-    fn start(&mut self) -> Result<(), String> {
+    fn start(&mut self, placement: JobPlacement) -> Result<(), String> {
+        *self.placement.lock().unwrap() = Some(placement);
         let (done, cancel, total) = (self.done.clone(), self.cancel.clone(), self.total);
         self.worker = Some(std::thread::spawn(move || {
             while !cancel.load(Ordering::SeqCst) && done.load(Ordering::SeqCst) < total {
@@ -79,6 +82,10 @@ plugins:
 "#;
 
 fn engine(job: Counter) -> Engine {
+    engine_in(job, None)
+}
+
+fn engine_in(job: Counter, partition: Option<(u64, u64)>) -> Engine {
     let loaded = loadr_config::load_str(PLAN, &loadr_config::LoadOptions::new()).expect("parse");
     Engine::new(
         loaded.plan,
@@ -86,10 +93,30 @@ fn engine(job: Counter) -> Engine {
         EngineOptions {
             jobs: vec![Box::new(job)],
             snapshot_interval: Duration::from_millis(50),
+            partition,
             ..Default::default()
         },
     )
     .expect("engine")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_learns_its_place_in_the_run() {
+    let job = Counter::new(10);
+    let placement = job.placement.clone();
+    engine(job).run().await.expect("run");
+    assert_eq!(*placement.lock().unwrap(), Some(JobPlacement::default()));
+
+    let job = Counter::new(10);
+    let placement = job.placement.clone();
+    engine_in(job, Some((2, 3))).run().await.expect("run");
+    assert_eq!(
+        *placement.lock().unwrap(),
+        Some(JobPlacement {
+            agent_index: 2,
+            agent_count: 3
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -157,7 +184,7 @@ async fn a_job_that_fails_to_start_aborts_the_run() {
         fn name(&self) -> &str {
             "broken"
         }
-        fn start(&mut self) -> Result<(), String> {
+        fn start(&mut self, _placement: JobPlacement) -> Result<(), String> {
             Err("no disk".to_string())
         }
         fn progress(&mut self) -> Result<JobProgress, String> {

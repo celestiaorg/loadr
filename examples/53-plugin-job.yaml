@@ -4,6 +4,9 @@
 # progress (console, and the web UI with --ui) and ends the run when it's
 # done. Stop in the UI or Ctrl-C stops the job early.
 #
+# Distributed, every agent runs the job with its `agent_index`/`agent_count`
+# and writes only its slice of the rows.
+#
 # Build and install the example plugin first:
 #   cargo build -p loadr-plugin-example-native-file-gen --release
 #   # stage plugin.toml + the platform library, then: loadr plugin install <dir>

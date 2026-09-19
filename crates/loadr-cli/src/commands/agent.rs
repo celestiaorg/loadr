@@ -93,7 +93,8 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
                     loadr_plugin_api::LoadedPlugin::Service {
                         data_source: Some(_),
                         ..
-                    } => {}
+                    }
+                    | loadr_plugin_api::LoadedPlugin::Service { job: Some(_), .. } => {}
                     other => tracing::warn!(
                         plugin = %plugin_ref.name,
                         kind = %other.kind(),
@@ -134,6 +135,24 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
             }
             Ok(sources)
         });
+        // Job plugins declared in the plan, resolved on this host like the
+        // data sources above. Each agent runs every job and learns its agent
+        // index/count at start.
+        let jobs: loadr_agent::JobFactory = Arc::new(|plugin_refs, _base_dir| {
+            let plugins_dir = loadr_plugin_api::default_plugins_dir();
+            let mut jobs: Vec<Box<dyn loadr_core::Job>> = Vec::new();
+            for plugin_ref in plugin_refs {
+                if !plugin_ref.enabled {
+                    continue;
+                }
+                let loaded = loadr_plugin_api::PluginRegistry::load_ref(plugin_ref, &plugins_dir)
+                    .map_err(|e| format!("plugin `{}`: {e}", plugin_ref.name))?;
+                if let loadr_plugin_api::LoadedPlugin::Service { job: Some(job), .. } = loaded {
+                    jobs.push(job);
+                }
+            }
+            Ok(jobs)
+        });
 
         let config = loadr_agent::AgentConfig {
             controller_addr: controller_addr.clone(),
@@ -151,6 +170,7 @@ pub fn execute(args: AgentArgs) -> anyhow::Result<i32> {
                 protocols,
                 script: Some(script),
                 data_sources: Some(data_sources),
+                jobs: Some(jobs),
             },
         };
 

@@ -518,7 +518,8 @@ impl FfiService for MyJob {
     fn name(&self) -> RString { RString::from("my-job") }
 
     /// Spawn the work and return promptly. `config_json` is the merged
-    /// manifest `[config]` + plan `plugins:` config.
+    /// manifest `[config]` + plan `plugins:` config, plus `agent_index` and
+    /// `agent_count` (see Distributed runs below).
     fn start(&mut self, config_json: RString) -> RResult<RString, RString> { /* ... */ }
 
     /// Cancel if still running, join the threads, flush. Called once, on
@@ -562,8 +563,22 @@ plus a throughput chart. The request panels are hidden when the run only
 drives jobs. The end-of-run summary (console, `--summary-export`, web UI)
 records each job's final state.
 
-Jobs run in `loadr run` only. Distributed agents ignore them: splitting a
-plugin's own work across agents isn't plumbed yet.
+### Distributed runs
+
+Every agent runs every job. To keep the fleet from doing the same work N
+times, loadr adds two keys to the config `start` receives:
+
+```jsonc
+{ "rows": 10000000, "threads": 8,   // the plugin's own config
+  "agent_index": 1,                 // this agent, 0-based
+  "agent_count": 4 }                // agents in the run (1 for `loadr run`)
+```
+
+The plugin takes its own share of the work from them. `native-file-gen`
+writes a contiguous slice of the row ids per agent. These two keys are
+reserved: the host overwrites any value the plan sets for them. The job
+plugin must be installed on every agent host, the same as data-source
+plugins.
 
 ### Testing
 

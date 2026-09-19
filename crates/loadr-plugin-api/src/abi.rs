@@ -73,7 +73,10 @@ pub trait FfiService: Send {
 
     /// Whether this service is a *job*: finite work the plugin runs on its own
     /// threads. Asked once, before `start`. A job's `start` must return
-    /// promptly and leave the work running; the host then polls `progress`
+    /// promptly and leave the work running. Its config carries the host's
+    /// `agent_index` (0-based) and `agent_count`: every agent of a
+    /// distributed run runs the job, so each takes its own share. The host
+    /// then polls `progress`
     /// once per snapshot interval, ends the run when every job is done, and
     /// calls `stop` on finish, failure or a user stop. A plan whose only
     /// workload is jobs needs no `scenarios:`.
