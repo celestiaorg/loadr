@@ -1,0 +1,20 @@
+[plugin]
+name = "file-gen"
+version = "0.1.0"
+kind = "service"
+type = "native"
+entry = "libnative_file_gen.so"
+description = "Generates a JSONL file on its own thread pool, reporting live progress as a job"
+capabilities = ["job"]
+
+[config]
+# Output file (relative paths resolve against the directory loadr runs in).
+path = "generated.jsonl"
+# Rows to write.
+rows = 1000000
+# Worker threads; 0 = one per CPU.
+threads = 0
+# Rows a worker generates before taking the file lock to write them.
+batch = 10000
+# Same seed, same rows.
+seed = 42

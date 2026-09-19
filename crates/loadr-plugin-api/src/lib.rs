@@ -22,6 +22,7 @@ pub mod abi;
 pub mod cabi;
 pub mod error;
 pub mod install;
+pub mod job;
 pub mod manifest;
 pub mod native;
 pub mod registry;
@@ -37,6 +38,7 @@ pub use install::{
     host_target, index_url, install_archive_bytes, install_resolved, remove, Fetcher,
     IndexArtifact, IndexEntry, IndexVersion, PluginIndex, Resolved, DEFAULT_INDEX_URL, INDEX_ENV,
 };
+pub use job::ServiceJob;
 pub use manifest::{merge_config, PluginAbi, PluginKind, PluginManifest, PluginType};
 pub use native::{
     FfiRequest, FfiResponse, NativeDataSourceAdapter, NativeOutputAdapter, NativePlugin,

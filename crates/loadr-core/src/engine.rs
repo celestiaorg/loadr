@@ -16,6 +16,7 @@ use crate::data::VuPlacement;
 use crate::error::EngineError;
 use crate::executor::{partition_spec, run_scenario, vu_capacity, ExecEnv, ScenarioRunSpec};
 use crate::flow::{FlowRunner, ScenarioProgram};
+use crate::job::{Job, JobDriver, JobStatus};
 use crate::metrics::{BuiltinMetrics, MetricRegistry, MetricsBus, Sample, Tags};
 use crate::output::Output;
 use crate::protocol::ProtocolRegistry;
@@ -48,6 +49,9 @@ pub struct EngineOptions {
     /// Loaded `data_source`-capable plugins, keyed by the `plugins:` name
     /// that `data.<name>.source` refers to.
     pub data_sources: HashMap<String, Box<dyn crate::data::DataSourcePlugin>>,
+    /// Jobs to run alongside the scenarios. A plan may have no scenarios when
+    /// it has at least one job; the run then lasts until every job is done.
+    pub jobs: Vec<Box<dyn Job>>,
 }
 
 impl Default for EngineOptions {
@@ -61,6 +65,7 @@ impl Default for EngineOptions {
             extra_tags: Tags::new(),
             snapshot_interval: Duration::from_secs(1),
             data_sources: HashMap::new(),
+            jobs: Vec::new(),
         }
     }
 }
@@ -83,6 +88,7 @@ pub struct RunHandle {
     snapshots: watch::Receiver<Arc<Snapshot>>,
     aggregates: watch::Receiver<Arc<Snapshot>>,
     thresholds: watch::Receiver<Arc<Vec<ThresholdStatus>>>,
+    jobs: watch::Receiver<Arc<Vec<JobStatus>>>,
     status: watch::Receiver<RunStatus>,
     soft_stop: CancellationToken,
     hard_stop: CancellationToken,
@@ -109,6 +115,11 @@ impl RunHandle {
 
     pub fn threshold_statuses(&self) -> Arc<Vec<ThresholdStatus>> {
         self.thresholds.borrow().clone()
+    }
+
+    /// Current status of every job; keeps the final values after the run.
+    pub fn job_statuses(&self) -> Arc<Vec<JobStatus>> {
+        self.jobs.borrow().clone()
     }
 
     pub fn status(&self) -> RunStatus {
@@ -184,8 +195,10 @@ pub struct Engine {
     snapshots_tx: watch::Sender<Arc<Snapshot>>,
     aggregates_tx: watch::Sender<Arc<Snapshot>>,
     thresholds_tx: watch::Sender<Arc<Vec<ThresholdStatus>>>,
+    jobs_tx: watch::Sender<Arc<Vec<JobStatus>>>,
     status_tx: watch::Sender<RunStatus>,
     external_targets: HashMap<String, watch::Receiver<u64>>,
+    jobs: Vec<Box<dyn Job>>,
 }
 
 impl Engine {
@@ -306,9 +319,9 @@ impl Engine {
                 program,
             });
         }
-        if scenarios.is_empty() {
+        if scenarios.is_empty() && opts.jobs.is_empty() {
             return Err(EngineError::Config(
-                "test has no scenarios to run".to_string(),
+                "test has no scenarios or jobs to run".to_string(),
             ));
         }
 
@@ -320,6 +333,7 @@ impl Engine {
         let (snapshots_tx, snapshots_rx) = watch::channel(Arc::new(Snapshot::default()));
         let (aggregates_tx, aggregates_rx) = watch::channel(Arc::new(Snapshot::default()));
         let (thresholds_tx, thresholds_rx) = watch::channel(Arc::new(Vec::new()));
+        let (jobs_tx, jobs_rx) = watch::channel(Arc::new(Vec::new()));
         let (status_tx, status_rx) = watch::channel(RunStatus::Pending);
         let (pause_tx, _pause_rx) = watch::channel(false);
         let handle = RunHandle {
@@ -327,6 +341,7 @@ impl Engine {
             snapshots: snapshots_rx,
             aggregates: aggregates_rx,
             thresholds: thresholds_rx,
+            jobs: jobs_rx,
             status: status_rx,
             soft_stop: CancellationToken::new(),
             hard_stop: CancellationToken::new(),
@@ -352,8 +367,10 @@ impl Engine {
             snapshots_tx,
             aggregates_tx,
             thresholds_tx,
+            jobs_tx,
             status_tx,
             external_targets,
+            jobs: opts.jobs,
         })
     }
 
@@ -557,11 +574,35 @@ impl Engine {
             };
             scenario_tasks.push(tokio::spawn(run_scenario(prepared.run_spec, env)));
         }
+
+        // Jobs run on their own threads; the driver polls them from a
+        // blocking thread and stops them on the run's graceful stop.
+        let jobs = std::mem::take(&mut self.jobs);
+        let job_task = if jobs.is_empty() {
+            None
+        } else {
+            let driver = JobDriver {
+                bus: bus.clone(),
+                tags: self.gauge_tags.clone(),
+                stop: self.handle.soft_stop.clone(),
+                abort_tx: abort_tx.clone(),
+                status_tx: self.jobs_tx.clone(),
+                interval: self.snapshot_interval,
+            };
+            Some(tokio::task::spawn_blocking(move || driver.run(jobs)))
+        };
         drop(abort_tx);
 
         // Wait for completion or abort.
         let mut aborted: Option<String> = None;
-        let all_done = futures::future::join_all(scenario_tasks);
+        let all_done = async move {
+            futures::future::join_all(scenario_tasks).await;
+            if let Some(task) = job_task {
+                if let Err(e) = task.await {
+                    tracing::error!(error = %e, "job driver panicked");
+                }
+            }
+        };
         tokio::pin!(all_done);
         tokio::select! {
             _ = &mut all_done => {}
@@ -633,7 +674,7 @@ impl Engine {
             .await
             .map_err(|e| EngineError::Other(format!("aggregator task panicked: {e}")))?;
 
-        let summary = Summary::build(
+        let mut summary = Summary::build(
             self.plan_name.clone(),
             self.run_id.to_string(),
             started_ms,
@@ -643,6 +684,7 @@ impl Engine {
             aborted.clone(),
             timeline,
         );
+        summary.jobs = self.jobs_tx.borrow().to_vec();
         for output in &mut outputs {
             output.finish(&summary).await;
         }

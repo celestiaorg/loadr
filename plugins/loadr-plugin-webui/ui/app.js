@@ -357,6 +357,16 @@
     const streamBanner = h('div', { class: 'banner banner-warn hidden' });
     const completenessBanner = h('div', { class: 'banner banner-warn hidden' });
     const contractLine = h('div', { class: 'muted mono data-rates' });
+    const jobsRoot = h('div', { class: 'jobs hidden' });
+    const jobCanvas = h('canvas', { class: 'chart chart-short' });
+    const jobChartCard = h(
+      'div',
+      { class: 'card hidden' },
+      h('h3', null, 'Job throughput — last interval'),
+      jobCanvas
+    );
+    let jobChart = null;
+    let jobChartKey = '';
     const cards = {
       attempts: null,
       successful: null,
@@ -465,19 +475,27 @@
       )
     );
 
+    // Request-centric panels, hidden when the run only drives jobs.
+    const requestNodes = [];
+    const req = (node) => {
+      requestNodes.push(node);
+      return node;
+    };
     root.append(
       liveBanner,
       streamBanner,
       completenessBanner,
-      cardRow,
+      jobsRoot,
+      req(cardRow),
       chartToolbar,
-      h(
+      jobChartCard,
+      req(h(
         'div',
         { class: 'chart-grid' },
         h('div', { class: 'card' }, h('h3', null, 'Throughput — last interval'), rpsCanvas),
         h('div', { class: 'card' }, h('h3', null, 'Latency percentiles — run-to-date'), latCanvas)
-      ),
-      h(
+      )),
+      req(h(
         'div',
         { class: 'chart-grid' },
         h('div', { class: 'card' }, h('h3', null, 'Error rate — last interval'), errCanvas),
@@ -490,8 +508,8 @@
           h('h3', { class: 'mt' }, 'Thresholds'),
           thresholdList
         )
-      ),
-      h(
+      )),
+      req(h(
         'div',
         { class: 'card' },
         h('h3', null, 'Scenarios'),
@@ -520,7 +538,7 @@
         ),
         dataRates,
         contractLine
-      ),
+      )),
       h(
         'div',
         { class: 'card agent-contributions hidden' },
@@ -543,7 +561,7 @@
           )
         )
       ),
-      failuresCard
+      req(failuresCard)
     );
 
     const rpsChart = new TimeChart(rpsCanvas, {
@@ -578,7 +596,7 @@
       } catch (_) {
         /* private mode / storage disabled — non-fatal */
       }
-      [rpsChart, latChart, errChart].forEach((c) => c.setType(t));
+      [rpsChart, latChart, errChart, jobChart].forEach((c) => c && c.setType(t));
       typeButtons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-type') === t));
     }
     typeButtons.forEach((b) =>
@@ -608,6 +626,7 @@
         rpsChart.clear();
         latChart.clear();
         errChart.clear();
+        if (jobChart) jobChart.clear();
       }
       currentRunId = m.run_id || currentRunId;
       lastReceivedMs = Date.now();
@@ -736,6 +755,39 @@
        )));
 
       updateFailures(m.failures);
+      updateJobs(m);
+    }
+
+    // Job cards and throughput chart; hides the request panels when the run
+    // has jobs but no request traffic.
+    function updateJobs(m) {
+      const jobs = m.jobs || [];
+      jobsRoot.classList.toggle('hidden', jobs.length === 0);
+      jobChartCard.classList.toggle('hidden', jobs.length === 0);
+      jobsRoot.replaceChildren(...jobs.map(jobCard));
+      const jobsOnly =
+        jobs.length > 0 &&
+        !(m.per_scenario && m.per_scenario.length) &&
+        !(m.request_reqs_total > 0);
+      requestNodes.forEach((node) => node.classList.toggle('hidden', jobsOnly));
+      if (!jobs.length) return;
+
+      const key = jobs.map((j) => j.name + '|' + (j.unit || '')).join('\n');
+      if (key !== jobChartKey) {
+        if (jobChart) jobChart.destroy();
+        const palette = [COLORS.blue, COLORS.green, COLORS.amber, COLORS.purple, COLORS.cyan];
+        jobChart = new TimeChart(jobCanvas, {
+          series: jobs.map((j, i) => ({
+            label: j.name + ' ' + (j.unit || 'units') + '/s',
+            color: palette[i % palette.length],
+            fill: i === 0,
+          })),
+          format: (v) => fmt.num(v, 1),
+          type: chartType,
+        });
+        jobChartKey = key;
+      }
+      jobChart.push(m.ts || Date.now(), jobs.map((j) => (j.state === 'running' ? j.rate : null)));
     }
 
     // Render the failure breakdown groups and refresh the download buttons.
@@ -798,6 +850,7 @@
       rpsChart.destroy();
       latChart.destroy();
       errChart.destroy();
+      if (jobChart) jobChart.destroy();
     }
 
     function setConnection(state) {
@@ -822,6 +875,71 @@
     }, 1000);
 
     return { update, destroy, setConnection };
+  }
+
+  // -------------------------------------------------------------------------
+  // Jobs: finite work a plugin runs on its own threads (see loadr_core::job)
+  // -------------------------------------------------------------------------
+  const JOB_PILL = {
+    pending: 'pending',
+    running: 'running',
+    finished: 'passed',
+    failed: 'failed',
+    stopped: 'aborted',
+  };
+
+  function jobCard(job) {
+    const unit = job.unit ? ' ' + job.unit : '';
+    const fraction = job.total > 0 ? Math.min(1, Math.max(0, job.done / job.total)) : null;
+    const running = job.state === 'running';
+    const parts = [
+      fraction != null
+        ? fmt.num(job.done, 0) + ' / ' + fmt.num(job.total, 0) + unit
+        : fmt.num(job.done, 0) + unit,
+    ];
+    if (fraction != null) parts.push((fraction * 100).toFixed(1) + '%');
+    if (running && job.rate != null) parts.push(fmt.num(job.rate, 1) + unit + '/s');
+    if (running && job.eta_secs != null) parts.push('ETA ' + fmt.duration(job.eta_secs));
+    parts.push('elapsed ' + fmt.duration(job.elapsed_secs));
+
+    // No total: an animated bar while running, full once finished.
+    const indeterminate = fraction == null && running;
+    const width = fraction != null ? fraction : job.state === 'finished' ? 1 : 0;
+    const fill = h('div', {
+      class:
+        'job-bar-fill' +
+        (indeterminate ? ' indeterminate' : '') +
+        (job.state === 'failed' ? ' bad' : job.state === 'stopped' ? ' warn' : ''),
+      style: indeterminate ? null : 'width:' + (width * 100).toFixed(2) + '%',
+    });
+    const metrics = Object.entries(job.metrics || {});
+    return h(
+      'div',
+      { class: 'card job-card' },
+      h(
+        'div',
+        { class: 'job-head' },
+        h('h3', null, job.name),
+        h('span', { class: 'pill pill-' + (JOB_PILL[job.state] || 'pending') }, job.state)
+      ),
+      h('div', { class: 'job-bar' }, fill),
+      h('div', { class: 'job-meta mono' }, parts.join('  ·  ')),
+      job.error ? h('div', { class: 'banner banner-warn job-error' }, job.error) : '',
+      metrics.length
+        ? h(
+            'div',
+            { class: 'job-metrics' },
+            ...metrics.map(([key, value]) =>
+              h(
+                'div',
+                { class: 'job-metric' },
+                h('span', { class: 'muted' }, key),
+                h('span', { class: 'mono' }, fmt.num(value))
+              )
+            )
+          )
+        : ''
+    );
   }
 
   function statCard(label, value, bad) {
@@ -906,6 +1024,9 @@
       return h('div', { class: 'card muted' }, 'Final metrics are unavailable for this run.');
     }
     const contract = final.metric_contract || {};
+    const jobs = final.jobs || [];
+    // A jobs-only run has no request numbers worth showing.
+    const requests = !(jobs.length && !(final.attempts > 0));
     return h(
       'div',
       null,
@@ -924,7 +1045,11 @@
             'Incomplete fleet result — these values only describe received data and are unsafe for a complete pass/fail decision.'
           )
         : '',
-      h(
+      jobs.length ? h('div', { class: 'jobs' }, ...jobs.map(jobCard)) : '',
+      !requests
+        ? h('div', { class: 'stat-grid' }, statCard('Duration', fmt.duration(final.duration_secs)))
+        : '',
+      !requests ? '' : h(
         'div',
         { class: 'stat-grid' },
         statCard('Duration', fmt.duration(final.duration_secs)),
@@ -937,7 +1062,7 @@
         statCard('Request error rate', fmt.pct(final.request_error_rate), final.request_error_rate > 0),
         statCard('p95 latency · run-to-date', fmt.ms(final.latency && final.latency.p95))
       ),
-      h(
+      !requests ? '' : h(
         'div',
         { class: 'card metric-contract' },
         h('strong', null, 'Metric contract'),
@@ -951,7 +1076,7 @@
             '.'
         )
       ),
-      finalFailureCard(final.failures, runLabel)
+      requests ? finalFailureCard(final.failures, runLabel) : ''
     );
   }
 

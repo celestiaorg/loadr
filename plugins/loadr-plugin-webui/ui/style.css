@@ -1042,3 +1042,87 @@ canvas.chart-short {
   font-weight: 600;
   color: var(--accent);
 }
+
+/* Jobs: plugin-driven finite work. */
+.jobs {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.job-card h3 {
+  margin: 0;
+}
+.job-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.job-bar {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin: 12px 0 8px;
+}
+.job-bar-fill {
+  height: 100%;
+  width: 0;
+  background: var(--ok);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+.job-bar-fill.bad {
+  background: var(--bad);
+}
+.job-bar-fill.warn {
+  background: var(--warn);
+}
+.job-bar-fill.indeterminate {
+  position: absolute;
+  width: 30%;
+  animation: job-indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes job-indeterminate {
+  from {
+    left: -30%;
+  }
+  to {
+    left: 100%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .job-bar-fill.indeterminate {
+    animation: none;
+    left: 0;
+    width: 100%;
+    opacity: 0.4;
+  }
+}
+.job-meta {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.job-error {
+  margin-top: 10px;
+}
+.job-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 6px 16px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+.job-metric {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.job-metric .muted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

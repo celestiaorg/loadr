@@ -29,6 +29,7 @@ fn summary(run_id: &str, ts: u64, p99: f64) -> Summary {
         aborted: None,
         snapshot: Snapshot::default(),
         timeline: vec![],
+        jobs: vec![],
     }
 }
 

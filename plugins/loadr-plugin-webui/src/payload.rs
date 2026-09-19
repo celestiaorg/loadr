@@ -426,7 +426,16 @@ pub(crate) fn final_payload(summary: &Summary, run: &RunInfo) -> Value {
         },
         "complete": run.complete,
         "failures": failures_breakdown(&summary.snapshot),
+        "jobs": summary.jobs,
     })
+}
+
+/// Add a run's job statuses to a live payload. Kept apart from
+/// `live_payload` because jobs come from the run handle, not a snapshot.
+pub(crate) fn attach_jobs(payload: &mut Value, jobs: &[loadr_core::JobStatus]) {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("jobs".to_string(), json!(jobs));
+    }
 }
 
 /// The aggregate overview: the most relevant run (live preferred, else most
@@ -451,7 +460,10 @@ pub(crate) fn overview_json(backend: &dyn UiBackend) -> Value {
                 let metrics = backend
                     .run_snapshot(&r.run_id)
                     .map(|snapshot| {
-                        live_payload(&snapshot, exact.as_deref(), &thresholds, r, &control)
+                        let mut payload =
+                            live_payload(&snapshot, exact.as_deref(), &thresholds, r, &control);
+                        attach_jobs(&mut payload, &backend.run_jobs(&r.run_id));
+                        payload
                     })
                     .unwrap_or(Value::Null);
                 (
@@ -841,6 +853,53 @@ mod tests {
         assert_eq!(scenarios[0]["scenario"], "rpc");
         assert!(scenarios[0]["rps"].as_f64().expect("scenario rps") > 0.0);
         assert!(scenarios[0]["p95"].as_f64().expect("scenario p95") > 0.0);
+    }
+
+    fn job_status(state: loadr_core::JobState) -> loadr_core::JobStatus {
+        loadr_core::JobStatus {
+            name: "gen".to_string(),
+            state,
+            done: 25.0,
+            total: Some(100.0),
+            unit: Some("rows".to_string()),
+            rate: Some(5.0),
+            eta_secs: Some(15.0),
+            elapsed_secs: 5.0,
+            error: None,
+            metrics: [("bytes".to_string(), 1024.0)].into(),
+        }
+    }
+
+    #[test]
+    fn live_and_final_payloads_carry_jobs() {
+        let mut agg = Aggregator::new();
+        let snap = agg.snapshot();
+        let mut live = live_payload(
+            &snap,
+            None,
+            &[],
+            &run_info("running"),
+            &RunControlView::default(),
+        );
+        attach_jobs(&mut live, &[job_status(loadr_core::JobState::Running)]);
+        assert_eq!(live["jobs"][0]["name"], "gen");
+        assert_eq!(live["jobs"][0]["state"], "running");
+        assert_eq!(live["jobs"][0]["total"], 100.0);
+        assert_eq!(live["jobs"][0]["metrics"]["bytes"], 1024.0);
+
+        let mut summary = Summary::build(
+            None,
+            "r".to_string(),
+            0,
+            Vec::new(),
+            &mut agg,
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        summary.jobs = vec![job_status(loadr_core::JobState::Finished)];
+        let final_metrics = final_payload(&summary, &run_info("finished"));
+        assert_eq!(final_metrics["jobs"][0]["state"], "finished");
     }
 
     #[test]

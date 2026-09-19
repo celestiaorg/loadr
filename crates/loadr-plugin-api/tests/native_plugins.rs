@@ -323,6 +323,7 @@ fn data_source_plugin_loads_via_registry_with_capability() {
         loadr_plugin_api::LoadedPlugin::Service {
             service,
             data_source,
+            ..
         } => {
             assert!(service.is_none(), "tx-signer has no service lifecycle");
             assert!(data_source.is_some(), "tx-signer provides data_source");
@@ -341,6 +342,7 @@ fn service_plugin_without_data_source_capability_still_loads() {
         loadr_plugin_api::LoadedPlugin::Service {
             service,
             data_source,
+            ..
         } => {
             assert!(
                 service.is_some(),

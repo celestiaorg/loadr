@@ -583,6 +583,7 @@ mod tests {
             aborted: None,
             snapshot: Snapshot::default(),
             timeline: Vec::new(),
+            jobs: Vec::new(),
         }
     }
 

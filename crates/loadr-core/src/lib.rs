@@ -16,6 +16,7 @@ pub mod error;
 pub mod executor;
 pub mod extract;
 pub mod flow;
+pub mod job;
 pub mod metrics;
 pub mod output;
 pub mod pacing;
@@ -31,6 +32,7 @@ pub use engine::{Engine, EngineOptions, RunHandle, RunResult, RunStatus};
 pub use error::{EngineError, ProtocolError, ScriptError};
 pub use executor::{partition_spec, vu_capacity};
 pub use flow::{FlowRunner, IterationOutcome, ScenarioProgram};
+pub use job::{Job, JobProgress, JobState, JobStatus, ReportedState};
 pub use metrics::{MetricKind, MetricRegistry, MetricsBus, Sample, Tags};
 pub use output::{ChannelOutput, Output};
 pub use protocol::{

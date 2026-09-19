@@ -489,3 +489,85 @@ VUs on the same ids without any error.
 - End-to-end, reference the built artifact from a plan's `plugins:` entry
   and a `data.<name>: { type: plugin, source: ... }` block, then run it
   through the real `loadr` binary.
+
+## Native job plugins
+
+A **job** is finite work a plugin runs on its own threads: generating a data
+file, seeding a store, exporting a dataset. loadr doesn't schedule the work.
+It starts the job, polls its progress once per snapshot interval for the
+console and the web UI, and stops it. Threads, batching and I/O are entirely
+up to the plugin. `plugins/examples/native-file-gen` is the reference
+implementation.
+
+A plan whose only workload is jobs needs no `scenarios:`. The run lasts until
+every job is done:
+
+```yaml
+plugins:
+  - name: file-gen
+    config: { path: out.jsonl, rows: 10000000, threads: 8 }
+```
+
+### The ABI
+
+A job is a `kind = "service"` plugin whose `FfiService` overrides two
+defaulted methods:
+
+```rust
+impl FfiService for MyJob {
+    fn name(&self) -> RString { RString::from("my-job") }
+
+    /// Spawn the work and return promptly. `config_json` is the merged
+    /// manifest `[config]` + plan `plugins:` config.
+    fn start(&mut self, config_json: RString) -> RResult<RString, RString> { /* ... */ }
+
+    /// Cancel if still running, join the threads, flush. Called once, on
+    /// finish, failure, or a user stop.
+    fn stop(&mut self) { /* ... */ }
+
+    fn is_job(&self) -> bool { true }
+
+    /// Polled about once a second from one thread. Read atomics; don't block.
+    fn progress(&self) -> RString { /* JSON below */ }
+}
+```
+
+`progress` returns:
+
+```jsonc
+{
+  "state": "running",          // "running" | "finished" | "failed"
+  "done": 7340000,             // units completed so far
+  "total": 10000000,           // optional: enables % and ETA
+  "unit": "rows",              // optional, for display
+  "error": null,               // why, when "failed"
+  "metrics": {                 // optional numbers, each a `job_<key>` gauge
+    "bytes_written": 1.2e9
+  }
+}
+```
+
+- `finished` ends the job. The host calls `stop`, then polls once more for
+  the final numbers.
+- `failed` (or a failed `start`, or progress JSON that doesn't parse) aborts
+  the run with `job \`<name>\` failed: <error>`.
+- A graceful stop (Ctrl-C, or **Stop** in the web UI) calls `stop` while the
+  job is still running. The job ends as `stopped`.
+- The host emits `job_done`, `job_progress` (0–1, with a `total`) and
+  `job_<key>` for each `metrics` entry, all tagged `job=<name>`. Thresholds
+  and outputs see them like any other gauge.
+
+The web UI shows each job as a progress card (bar, rate, ETA and metrics)
+plus a throughput chart. The request panels are hidden when the run only
+drives jobs. The end-of-run summary (console, `--summary-export`, web UI)
+records each job's final state.
+
+Jobs run in `loadr run` only. Distributed agents ignore them: splitting a
+plugin's own work across agents isn't plumbed yet.
+
+### Testing
+
+- Drive `start` / `progress` / `stop` directly in unit tests. The job doesn't
+  need a host. See the tests in `native-file-gen`.
+- End-to-end, reference the built artifact from a plan with no `scenarios:`
+  and run it through the real `loadr` binary. Add `--ui` to watch it.

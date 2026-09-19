@@ -64,8 +64,33 @@ pub trait FfiService: Send {
     /// Start the service; returns a plugin-defined string (e.g. bound addr).
     fn start(&mut self, config_json: RString) -> RResult<RString, RString>;
 
-    /// Stop the service (idempotent).
+    /// Stop the service (idempotent). For a job: cancel the work if it is
+    /// still running, join the plugin's threads and flush.
     fn stop(&mut self);
+
+    // Methods below were added after the first release; same rules as on
+    // `FfiDataSource`: keep the default bodies, append new ones after them.
+
+    /// Whether this service is a *job*: finite work the plugin runs on its own
+    /// threads. Asked once, before `start`. A job's `start` must return
+    /// promptly and leave the work running; the host then polls `progress`
+    /// once per snapshot interval, ends the run when every job is done, and
+    /// calls `stop` on finish, failure or a user stop. A plan whose only
+    /// workload is jobs needs no `scenarios:`.
+    fn is_job(&self) -> bool {
+        false
+    }
+
+    /// A job's progress. Must be cheap (read atomics, don't block):
+    /// `{"state": "running" | "finished" | "failed",
+    ///   "done": <units so far>, "total": <units>?, "unit": "rows"?,
+    ///   "error": "<why>"?, "metrics": {"<key>": <number>, ...}?}`
+    ///
+    /// `total` enables the percentage and ETA; each `metrics` entry becomes a
+    /// `job_<key>` gauge. Reporting `failed` aborts the run.
+    fn progress(&self) -> RString {
+        RString::new()
+    }
 }
 
 /// An on-demand data source (`data.<name>.type: plugin`). `next_row` is on

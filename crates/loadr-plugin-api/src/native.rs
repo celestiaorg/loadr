@@ -538,6 +538,14 @@ impl ServicePlugin for NativeServiceAdapter {
     fn stop(&mut self) {
         self.inner.stop();
     }
+
+    fn is_job(&self) -> bool {
+        self.inner.is_job()
+    }
+
+    fn progress(&self) -> String {
+        self.inner.progress().into_string()
+    }
 }
 
 /// JSON payload handed to [`crate::abi::FfiDataSource::init`].

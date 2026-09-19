@@ -793,6 +793,7 @@ mod tests {
             aborted: None,
             snapshot: Default::default(),
             timeline: vec![tp(0.0), tp(1.0), tp(2.0)],
+            jobs: vec![],
         };
         let series = vec![ObservedSeries {
             name: "system_cpu".into(),
@@ -1088,6 +1089,7 @@ mod tests {
             aborted: None,
             snapshot: Default::default(),
             timeline,
+            jobs: vec![],
         }
     }
 

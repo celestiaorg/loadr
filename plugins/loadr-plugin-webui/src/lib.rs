@@ -189,6 +189,14 @@ pub trait UiBackend: Send + Sync + 'static {
     /// Current threshold statuses for a run.
     fn run_thresholds(&self, run_id: &str) -> Vec<loadr_core::ThresholdStatus>;
 
+    /// Status of the jobs a run drives (empty when it has none, or when the
+    /// backend has no local handle for it, as in distributed runs).
+    fn run_jobs(&self, run_id: &str) -> Vec<loadr_core::JobStatus> {
+        self.run_handle(run_id)
+            .map(|handle| handle.job_statuses().to_vec())
+            .unwrap_or_default()
+    }
+
     /// End-of-run summary (None while the run is still live).
     fn run_summary(&self, run_id: &str) -> Option<loadr_core::Summary>;
 

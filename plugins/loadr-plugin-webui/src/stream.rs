@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::ApiError;
 use crate::backend::status_string;
-use crate::payload::{live_payload, overview_json};
+use crate::payload::{attach_jobs, live_payload, overview_json};
 use crate::server::AppState;
 use crate::UiBackend;
 
@@ -59,13 +59,14 @@ pub(crate) async fn run_stream(
                     if let Some(snap) = backend.run_snapshot(&id) {
                         let exact = backend.run_aggregate_snapshot(&id);
                         let control = backend.run_control_state(&id);
-                        let payload = live_payload(
+                        let mut payload = live_payload(
                             &snap,
                             exact.as_deref(),
                             &backend.run_thresholds(&id),
                             &run,
                             &control,
                         );
+                        attach_jobs(&mut payload, &backend.run_jobs(&id));
                         if tx.send(sse_event("snapshot", &payload)).await.is_err() {
                             break;
                         }
@@ -84,13 +85,14 @@ pub(crate) async fn run_stream(
             if let Some(snap) = state.backend.run_snapshot(&id) {
                 let exact = state.backend.run_aggregate_snapshot(&id);
                 let control = state.backend.run_control_state(&id);
-                let payload = live_payload(
+                let mut payload = live_payload(
                     &snap,
                     exact.as_deref(),
                     &state.backend.run_thresholds(&id),
                     &info,
                     &control,
                 );
+                attach_jobs(&mut payload, &state.backend.run_jobs(&id));
                 let _ = tx.try_send(sse_event("snapshot", &payload));
             }
             let _ = tx.try_send(sse_event(
@@ -119,13 +121,14 @@ async fn live_run_stream(
         };
         let exact = backend.run_aggregate_snapshot(&id);
         let control = backend.run_control_state(&id);
-        let payload = live_payload(
+        let mut payload = live_payload(
             &snap,
             exact.as_deref(),
             &handle.threshold_statuses(),
             &run,
             &control,
         );
+        attach_jobs(&mut payload, &backend.run_jobs(&id));
         tx.try_send(sse_event("snapshot", &payload)).is_ok()
     };
 
@@ -162,13 +165,14 @@ async fn live_run_stream(
                 };
                 let exact = backend.run_aggregate_snapshot(&id);
                 let control = backend.run_control_state(&id);
-                let payload = live_payload(
+                let mut payload = live_payload(
                     &snap,
                     exact.as_deref(),
                     &handle.threshold_statuses(),
                     &run,
                     &control,
                 );
+                attach_jobs(&mut payload, &backend.run_jobs(&id));
                 if tx.send(sse_event("snapshot", &payload)).await.is_err() {
                     return;
                 }

@@ -149,6 +149,7 @@ pub fn build_engine(
     let mut outputs = extra_outputs;
     let mut services: Vec<Box<dyn loadr_plugin_api::ServicePlugin>> = Vec::new();
     let mut data_sources: HashMap<String, Box<dyn loadr_core::DataSourcePlugin>> = HashMap::new();
+    let mut jobs: Vec<Box<dyn loadr_core::Job>> = Vec::new();
     for plugin_ref in &plan.plugins {
         if !plugin_ref.enabled {
             continue;
@@ -161,9 +162,13 @@ pub fn build_engine(
             loadr_plugin_api::LoadedPlugin::Service {
                 service,
                 data_source,
+                job,
             } => {
                 if let Some(service) = service {
                     services.push(service);
+                }
+                if let Some(job) = job {
+                    jobs.push(job);
                 }
                 if let Some(data_source) = data_source {
                     // Keyed by the plan's `plugins:` name, not the plugin's
@@ -212,6 +217,7 @@ pub fn build_engine(
             script,
             outputs,
             data_sources,
+            jobs,
             ..Default::default()
         },
     )?;

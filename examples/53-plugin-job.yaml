@@ -1,0 +1,22 @@
+# A plugin job: no scenarios, just a plugin and its parameters.
+#
+# `file-gen` writes rows on its own thread pool. loadr starts it, shows its
+# progress (console, and the web UI with --ui) and ends the run when it's
+# done. Stop in the UI or Ctrl-C stops the job early.
+#
+# Build and install the example plugin first:
+#   cargo build -p loadr-plugin-example-native-file-gen --release
+#   # stage plugin.toml + the platform library, then: loadr plugin install <dir>
+#
+#   loadr run --ui examples/53-plugin-job.yaml
+name: plugin-job
+description: Generate a JSONL dataset with live progress
+
+plugins:
+  - name: file-gen
+    config:
+      path: generated.jsonl
+      rows: 50000000
+      threads: 8        # the plugin's own knobs: tune freely
+      batch: 20000
+      seed: 42

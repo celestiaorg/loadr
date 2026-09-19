@@ -23,6 +23,7 @@ use loadr_core::ProtocolHandler;
 
 use crate::cabi::{is_c_abi_plugin, CAbiPlugin};
 use crate::error::PluginError;
+use crate::job::ServiceJob;
 use crate::manifest::{PluginAbi, PluginKind, PluginManifest, PluginType};
 use crate::native::NativePlugin;
 use crate::traits::{PluginAssertion, PluginExtractor, ServicePlugin};
@@ -92,7 +93,7 @@ fn load_native_service(
     config: serde_json::Value,
 ) -> Result<LoadedPlugin, PluginError> {
     let service = plugin.maybe_service();
-    let data_source = plugin.make_data_source(config);
+    let data_source = plugin.make_data_source(config.clone());
     if service.is_none() && data_source.is_none() {
         return Err(PluginError::KindMismatch {
             name: name.to_string(),
@@ -100,10 +101,19 @@ fn load_native_service(
             actual: plugin.info().kind.clone(),
         });
     }
+    // A job is driven by the engine, not by the service lifecycle.
+    let (service, job) = match service {
+        Some(s) if s.is_job() => (
+            None,
+            Some(Box::new(ServiceJob::new(Box::new(s), config)) as _),
+        ),
+        other => (other.map(|s| Box::new(s) as Box<dyn ServicePlugin>), None),
+    };
     Ok(LoadedPlugin::Service {
-        service: service.map(|s| Box::new(s) as Box<dyn ServicePlugin>),
+        service,
         data_source: data_source
             .map(|d| Box::new(d) as Box<dyn loadr_core::data::DataSourcePlugin>),
+        job,
     })
 }
 
@@ -135,6 +145,9 @@ pub enum LoadedPlugin {
     Service {
         service: Option<Box<dyn ServicePlugin>>,
         data_source: Option<Box<dyn loadr_core::data::DataSourcePlugin>>,
+        /// Set instead of `service` when the plugin reports `is_job`: the
+        /// engine starts, polls and stops it (see `loadr_core::job`).
+        job: Option<Box<dyn loadr_core::Job>>,
     },
 }
 

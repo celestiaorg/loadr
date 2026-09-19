@@ -728,6 +728,9 @@ fn prepare_engine(
             extra_tags,
             snapshot_interval: Duration::from_millis(500),
             data_sources,
+            // Jobs are local-run only: splitting a plugin's own work across
+            // agents is the plugin's business, and nothing plumbs that yet.
+            jobs: Vec::new(),
         },
     )
     .map_err(|e| format!("engine setup failed: {e}"))

@@ -77,8 +77,14 @@ pub fn validate(plan: &TestPlan, source: Option<&str>, opts: &ValidateOptions) -
         diags: &mut diags,
     };
 
-    if plan.scenarios.is_empty() {
-        ctx.error("scenarios", "a test needs at least one scenario");
+    // Without scenarios the run is driven by job plugins alone. Whether a
+    // plugin is a job is only known once it is loaded, so the engine makes
+    // the final call; here a plugin just has to be there.
+    if plan.scenarios.is_empty() && !plan.plugins.iter().any(|p| p.enabled) {
+        ctx.error(
+            "scenarios",
+            "a test needs at least one scenario (or a job plugin under `plugins:`)",
+        );
     }
 
     let needs_js = plan
@@ -1094,6 +1100,23 @@ mod tests {
     fn empty_plan_needs_scenarios() {
         let diags = errors("name: x");
         assert!(diags.iter().any(|d| d.path == "scenarios"));
+    }
+
+    #[test]
+    fn plugins_only_plan_is_valid() {
+        let yaml = r#"
+plugins:
+  - name: gen
+    config: { rows: 10 }
+"#;
+        assert!(errors(yaml).is_empty());
+        // A disabled plugin cannot drive the run.
+        let disabled = r#"
+plugins:
+  - name: gen
+    enabled: false
+"#;
+        assert!(errors(disabled).iter().any(|d| d.path == "scenarios"));
     }
 
     #[test]

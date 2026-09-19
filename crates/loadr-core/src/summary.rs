@@ -199,6 +199,9 @@ pub struct Summary {
     /// summaries produced before timeline capture existed.
     #[serde(default)]
     pub timeline: Vec<TimelinePoint>,
+    /// Final status of each job the run drove (see [`crate::job`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<crate::job::JobStatus>,
 }
 
 impl Summary {
@@ -340,6 +343,7 @@ impl Summary {
             aborted,
             snapshot,
             timeline,
+            jobs: Vec::new(),
         }
     }
 
@@ -359,6 +363,36 @@ impl Summary {
         ));
         if let Some(reason) = &self.aborted {
             out.push_str(&format!("  ! run aborted: {reason}\n\n"));
+        }
+
+        // Jobs: what the plugin-driven work amounted to.
+        for job in &self.jobs {
+            let label = format!("job {}", job.name);
+            let unit = job
+                .unit
+                .as_deref()
+                .map(|u| format!(" {u}"))
+                .unwrap_or_default();
+            let amount = match job.total {
+                Some(total) => format!("{}/{}{unit}", job.done, total),
+                None => format!("{}{unit}", job.done),
+            };
+            let rate = job
+                .rate
+                .map(|r| format!(", {r:.1}{unit}/s"))
+                .unwrap_or_default();
+            let state = format!("{:?}", job.state).to_lowercase();
+            out.push_str(&format!(
+                "  {label}{} {state}: {amount} in {:.1}s{rate}\n",
+                dots(&label),
+                job.elapsed_secs
+            ));
+            if let Some(error) = &job.error {
+                out.push_str(&format!("    ! {error}\n"));
+            }
+        }
+        if !self.jobs.is_empty() {
+            out.push('\n');
         }
 
         // Checks first.

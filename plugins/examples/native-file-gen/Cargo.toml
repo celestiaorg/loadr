@@ -1,0 +1,21 @@
+[package]
+name = "loadr-plugin-example-native-file-gen"
+description = "Example native job plugin: generates a JSONL file on its own thread pool, with live progress"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "native_file_gen"
+crate-type = ["cdylib"]
+
+[dependencies]
+loadr-plugin-api = { path = "../../../crates/loadr-plugin-api" }
+abi_stable = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

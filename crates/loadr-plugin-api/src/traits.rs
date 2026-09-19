@@ -44,4 +44,14 @@ pub trait ServicePlugin: Send {
 
     /// Stop the service. Must be idempotent.
     fn stop(&mut self);
+
+    /// Whether the service is a job (see `FfiService::is_job`). Default: no.
+    fn is_job(&self) -> bool {
+        false
+    }
+
+    /// A job's progress JSON (see `FfiService::progress`).
+    fn progress(&self) -> String {
+        String::new()
+    }
 }

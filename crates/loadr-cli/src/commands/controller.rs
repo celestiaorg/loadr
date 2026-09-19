@@ -1001,6 +1001,7 @@ mod prometheus_tests {
             aborted: None,
             snapshot: Snapshot::default(),
             timeline: Vec::new(),
+            jobs: Vec::new(),
         };
         let record = ControllerHistoryRecord {
             info,
