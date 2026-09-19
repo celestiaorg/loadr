@@ -653,6 +653,7 @@ impl Ctx<'_> {
                 spec.file.is_some(),
                 spec.form.is_some(),
                 spec.multipart.is_some(),
+                spec.binary_base64.is_some(),
             ]
             .iter()
             .filter(|b| **b)
@@ -660,7 +661,7 @@ impl Ctx<'_> {
             if set != 1 {
                 self.error(
                     format!("{rpath}.body"),
-                    "body must set exactly one of `json`, `file`, `form`, `multipart`",
+                    "body must set exactly one of `json`, `file`, `form`, `multipart`, `binary_base64`",
                 );
             }
             if let Some(f) = &spec.file {

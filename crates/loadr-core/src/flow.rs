@@ -479,6 +479,8 @@ pub enum CompiledBody {
     Json(serde_json::Value),
     /// File contents, loaded at compile time.
     Bytes(Bytes),
+    /// Base64 rendered per request, then decoded into the raw body bytes.
+    Base64(Template),
     Form(Vec<(String, Template)>),
     Multipart(Vec<CompiledPart>),
 }
@@ -666,6 +668,8 @@ fn compile_request(
                         .map(|(k, v)| Ok((k.clone(), parse_template(v, "form value")?)))
                         .collect::<Result<_, EngineError>>()?,
                 )
+            } else if let Some(b64) = &spec.binary_base64 {
+                CompiledBody::Base64(parse_template(b64, "body binary_base64")?)
             } else if let Some(parts) = &spec.multipart {
                 CompiledBody::Multipart(
                     parts
@@ -1687,6 +1691,18 @@ impl FlowRunner {
                     )
                 }
                 CompiledBody::Bytes(b) => b.clone(),
+                CompiledBody::Base64(t) => {
+                    use base64::Engine as _;
+                    content_type = Some("application/octet-stream".to_string());
+                    let rendered = render_template(self, t, vu, script)?;
+                    Bytes::from(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(rendered.trim())
+                            .map_err(|e| {
+                                PrepareError::Other(format!("invalid body binary_base64: {e}"))
+                            })?,
+                    )
+                }
                 CompiledBody::Form(fields) => {
                     content_type = Some("application/x-www-form-urlencoded".to_string());
                     let encoded = fields

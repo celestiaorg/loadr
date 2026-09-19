@@ -34,6 +34,7 @@ body: 'raw string with ${interpolation}'
 # or structured (exactly one key):
 body: { json: { sku: "W-1", qty: 2, note: "${vars.note}" } }   # sets Content-Type
 body: { file: ./payload.bin }                                  # loaded at start
+body: { binary_base64: "${data.tx.body}" }                     # raw bytes, decoded per request
 body: { form: { user: alice, pass: "${secrets.pw}" } }         # urlencoded
 body:
   multipart:

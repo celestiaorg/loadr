@@ -1157,6 +1157,10 @@ pub struct BodySpec {
     /// Multipart form data (sets `Content-Type: multipart/form-data`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multipart: Option<Vec<MultipartPart>>,
+    /// Binary body as standard base64 (supports `${...}`), decoded per request
+    /// (sets `Content-Type: application/octet-stream`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_base64: Option<String>,
 }
 
 /// One part of a multipart body.
