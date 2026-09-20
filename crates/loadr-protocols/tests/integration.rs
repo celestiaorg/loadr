@@ -123,6 +123,47 @@ async fn noop_accepts_rendered_body_and_reports_success() {
 // HTTP
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn http_does_not_replay_post_after_server_reads_it_and_disconnects() {
+    use tokio::io::AsyncReadExt as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/transfer", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "client must send its request body");
+            received.extend_from_slice(&buf[..n]);
+            if received.ends_with(b"one-transfer") {
+                break;
+            }
+        }
+        drop(stream); // Ambiguous outcome: request consumed, no response.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "HTTP must not silently open a second connection to replay the POST"
+        );
+    });
+    let handler = http_handler();
+    let mut context = vu();
+    let mut request = req(&url, "http");
+    request.method = "POST".into();
+    request.body = Bytes::from_static(b"one-transfer");
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.execute(&mut context, &request),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.error.is_some());
+    server.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_get_json_with_timings_and_connection_reuse() {
     let server = HttpTestServer::spawn().await.expect("server");

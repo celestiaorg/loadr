@@ -47,6 +47,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 loadr-testserver = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
