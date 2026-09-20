@@ -26,7 +26,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use url::Url;
 
-use crate::net::{host_port, ms_since, resolve, IoStream};
+use crate::http_dns::HttpDns;
+use crate::net::{connect_tcp, host_port, ms_since, IoStream};
 
 /// Default User-Agent header.
 pub const DEFAULT_USER_AGENT: &str = "loadr/0.1";
@@ -217,6 +218,7 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 /// HTTP/1.1 + HTTP/2 handler with hand-rolled connections for phase timings,
 /// per-VU keep-alive pooling, compression, redirects, cookies and proxies.
 pub struct HttpHandler {
+    dns: HttpDns,
     version: HttpVersionPref,
     compression: bool,
     keep_alive: bool,
@@ -252,6 +254,7 @@ impl HttpHandler {
             None => None,
         };
         Ok(HttpHandler {
+            dns: HttpDns::default(),
             version: defaults.version,
             compression: defaults.compression,
             keep_alive: defaults.keep_alive,
@@ -313,26 +316,30 @@ impl HttpHandler {
             .ok_or_else(|| format!("url `{dial_url}` has no port"))?;
 
         // `hosts` override: resolve to a fixed address, bypassing DNS.
-        let addr = match self.override_host(&dial_host.to_string(), dial_port) {
+        let addrs = match self.override_host(&dial_host.to_string(), dial_port) {
             Some(mapped) => {
-                let start = Instant::now();
-                let addr = tokio::net::lookup_host(&mapped)
-                    .await
-                    .map_err(|e| format!("hosts override `{mapped}` is invalid: {e}"))?
-                    .next()
-                    .ok_or_else(|| format!("hosts override `{mapped}` resolved to nothing"))?;
-                timings.dns_ms = ms_since(start);
-                addr
+                // A scheme without a default port preserves explicit :80.
+                let mapped_url = Url::parse(&format!("tcp://{mapped}"))
+                    .map_err(|e| format!("hosts override `{mapped}` is invalid: {e}"))?;
+                let mapped_host = mapped_url
+                    .host()
+                    .ok_or_else(|| format!("hosts override `{mapped}` has no host"))?;
+                self.dns
+                    .resolve(
+                        &mapped_host,
+                        mapped_url.port().unwrap_or(dial_port),
+                        timings,
+                    )
+                    .await?
             }
-            None => resolve(&dial_host, dial_port, timings).await?,
+            None => self.dns.resolve(&dial_host, dial_port, timings).await?,
         };
 
         let start = Instant::now();
-        let mut tcp = TcpStream::connect(addr)
-            .await
-            .map_err(|e| format!("connection to {addr} failed: {e}"))?;
-        let _ = tcp.set_nodelay(true);
+        let connected = connect_tcp(&addrs).await;
         timings.connect_ms = ms_since(start);
+        let mut tcp = connected?;
+        let _ = tcp.set_nodelay(true);
 
         if via_proxy && https {
             let start = Instant::now();
@@ -522,6 +529,7 @@ impl HttpHandler {
             None => match self.connect(url, &mut timings).await {
                 Ok(s) => s,
                 Err(msg) => {
+                    timings.blocked_ms = timings.dns_ms + timings.connect_ms + timings.tls_ms;
                     return Ok(transport_error_response(msg, timings, url));
                 }
             },
@@ -1054,6 +1062,37 @@ async fn proxy_tunnel(tcp: &mut TcpStream, host: &str, port: u16) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn http_connect_falls_back_from_ipv6_to_ipv4() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let working = listener.local_addr().unwrap();
+        let handler = HttpHandler::new(&HttpDefaults::default(), Path::new(".")).unwrap();
+        // No listener on IPv6 port zero: exercise the same address-family
+        // failure as an IPv4-only agent, without relying on external DNS.
+        handler
+            .dns
+            .prime_for_test(
+                "fallback.invalid",
+                working.port(),
+                vec!["[::1]:0".parse().unwrap(), working],
+            )
+            .await;
+        let url = Url::parse(&format!("http://fallback.invalid:{}", working.port())).unwrap();
+        let mut timings = Timings::default();
+        let connected =
+            tokio::time::timeout(Duration::from_secs(2), handler.connect(&url, &mut timings))
+                .await
+                .expect("fallback must not hang");
+        assert!(connected.is_ok(), "HTTP must try the working IPv4 address");
+        assert!(timings.connect_ms > 0.0);
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn decompress_gzip_round_trip() {

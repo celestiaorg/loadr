@@ -30,6 +30,34 @@ HTTP/2 connections are multiplexed; HTTP/1.1 connections are kept alive and
 reused **per VU** (a VU models one user agent: its own connections and cookie
 jar). `keep_alive: false` closes after each request.
 
+## DNS and connection recovery
+
+HTTP shares in-progress DNS lookups between VUs using the same handler and
+hostname/port. Successful results are cached for one second (a local reuse
+window, not the authoritative DNS TTL). Up to 1,024 host/port entries are
+retained. IP literals bypass DNS.
+
+A failed or empty lookup is retried up to twice, after 100 ms and 200 ms;
+each lookup has a two-second deadline. A failed lookup sequence is shared
+with waiting VUs, with a one-second cooldown to avoid a tight failure loop.
+The overall request timeout still bounds lookup waits, retries and connection
+setup. The operating system may finish a blocking DNS lookup after its caller
+times out.
+
+TCP connections try all resolved addresses, interleaving IPv6 and IPv4.
+Another address is attempted after 250 ms if a connection is still pending,
+or immediately after an attempt fails. This lets IPv4-only agents recover
+when DNS lists IPv6 first.
+
+These retries happen before sending HTTP request bytes. Transport failures
+after sending and HTTP error responses are returned to the caller, without
+automatic HTTP replay. DNS lookup, shared-lookup wait and backoff time are
+included in connection-blocked time, including returned DNS failures; returned
+TCP failures also retain connection time. `http_req_duration` still measures
+sending + waiting + receiving, so use iteration duration to assess the full
+cost of connection setup. Overall request timeouts retain the existing timeout
+timing behavior.
+
 ## TLS & mTLS
 
 ```yaml

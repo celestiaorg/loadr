@@ -26,6 +26,7 @@ mod graphql;
 mod grpc;
 mod grpc_transport;
 mod http;
+mod http_dns;
 mod net;
 mod noop;
 mod socket;
