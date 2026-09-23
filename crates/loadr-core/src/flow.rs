@@ -24,6 +24,8 @@ use crate::vu::{json_to_string, VuContext};
 /// Outcome of one iteration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IterationOutcome {
+    /// A data source has no work yet. No HTTP failure or completed iteration.
+    DataPending(Duration),
     /// Completed (possibly with failed requests — those are samples, not errors).
     Completed,
     /// A `stop`-mode data source ran out: retire this VU.
@@ -36,6 +38,8 @@ pub enum IterationOutcome {
 
 /// A compiled scenario: templates parsed, regexes compiled, files loaded.
 pub struct ScenarioProgram {
+    /// Arrival models release an arrival when data is unavailable.
+    pub arrival_model: bool,
     pub name: Arc<str>,
     pub steps: Vec<CompiledStep>,
     /// Exported JS function to call each iteration (after `steps`).
@@ -511,6 +515,11 @@ impl ScenarioProgram {
 
         let steps = compile_steps(&scenario.flow, base_dir)?;
         Ok(ScenarioProgram {
+            arrival_model: matches!(
+                scenario.executor,
+                loadr_config::ExecutorKind::ConstantArrivalRate
+                    | loadr_config::ExecutorKind::RampingArrivalRate
+            ),
             name: Arc::from(scenario_name),
             steps,
             exec: scenario.exec.clone(),
@@ -859,6 +868,10 @@ impl FlowRunner {
             }
         }
 
+        vu.data_state.clear_pending();
+        if matches!(outcome, IterationOutcome::DataPending(_)) {
+            return outcome;
+        }
         let tags = vu.cached_sample_tags(&[]);
         vu.metrics.emit_cached_values(
             &[
@@ -909,13 +922,25 @@ impl FlowRunner {
             for step in steps {
                 match step {
                     CompiledStep::Request(req) => {
-                        match self.run_request(req, vu, script).await {
-                            RequestFlow::Continue => {}
-                            RequestFlow::AbortIteration => return IterationOutcome::Completed,
-                            RequestFlow::StopVu => return IterationOutcome::StopVu,
-                            RequestFlow::AbortScenario => return IterationOutcome::AbortScenario,
-                            RequestFlow::AbortTest(reason) => {
-                                return IterationOutcome::AbortTest(reason)
+                        loop {
+                            match self.run_request(req, vu, script).await {
+                                RequestFlow::DataPending(delay) => {
+                                    if self.program.arrival_model {
+                                        return IterationOutcome::DataPending(delay);
+                                    }
+                                    // Closed models have no arrival clock. Retry this
+                                    // request only; never repeat earlier flow steps.
+                                    tokio::time::sleep(delay).await;
+                                }
+                                RequestFlow::Continue => break,
+                                RequestFlow::AbortIteration => return IterationOutcome::Completed,
+                                RequestFlow::StopVu => return IterationOutcome::StopVu,
+                                RequestFlow::AbortScenario => {
+                                    return IterationOutcome::AbortScenario
+                                }
+                                RequestFlow::AbortTest(reason) => {
+                                    return IterationOutcome::AbortTest(reason)
+                                }
                             }
                         }
                         if let Some(tt) = &self.program.think_time {
@@ -1201,6 +1226,9 @@ impl FlowRunner {
             match o {
                 IterationOutcome::AbortTest(r) => return IterationOutcome::AbortTest(r),
                 IterationOutcome::AbortScenario => return IterationOutcome::AbortScenario,
+                IterationOutcome::DataPending(delay) => {
+                    return IterationOutcome::DataPending(delay)
+                }
                 _ => {}
             }
         }
@@ -1317,6 +1345,10 @@ impl FlowRunner {
         vu.current_request = None;
         let mut prepared = match prepared_result {
             Ok(p) => p,
+            Err(PrepareError::DataPending(delay)) => {
+                vu.data_state.clear_pending();
+                return RequestFlow::DataPending(delay);
+            }
             Err(PrepareError::DataExhausted) => return RequestFlow::StopVu,
             Err(PrepareError::Other(e)) => {
                 tracing::error!(request = %req.display_name, error = %e, "failed to prepare request");
@@ -1951,6 +1983,7 @@ impl FlowRunner {
 }
 
 enum RequestFlow {
+    DataPending(Duration),
     Continue,
     AbortIteration,
     StopVu,
@@ -2258,6 +2291,8 @@ impl Drop for RequestMetricsGuard {
 
 #[derive(Debug, thiserror::Error)]
 enum PrepareError {
+    #[error("data source temporarily unavailable")]
+    DataPending(Duration),
     #[error("data source exhausted")]
     DataExhausted,
     #[error("{0}")]
@@ -2491,6 +2526,9 @@ fn render_template(
                             return Err(PrepareError::Other(format!(
                                 "unresolved template variable `{expr}`"
                             )))
+                        }
+                        Err(crate::data::NextRowError::Pending(delay)) => {
+                            return Err(PrepareError::DataPending(delay))
                         }
                         Err(crate::data::NextRowError::Exhausted(_)) => {
                             return Err(PrepareError::DataExhausted)

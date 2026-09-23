@@ -446,6 +446,7 @@ impl Engine {
 
         // A FlowRunner for setup/teardown host calls (plan-level defaults).
         let lifecycle_program = Arc::new(ScenarioProgram {
+            arrival_model: false,
             name: Arc::from("setup"),
             steps: Vec::new(),
             exec: None,

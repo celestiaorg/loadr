@@ -390,6 +390,7 @@ fn data_source_adapter_signs_rows_and_signature_verifies() {
     let row = match adapter.next_row(&ctx).expect("next_row") {
         PluginRowResult::Row(row) => row,
         PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+        PluginRowResult::Pending(_) => panic!("unexpected pending"),
     };
     assert_eq!(row.get("nonce").map(String::as_str), Some("3:5"));
 
@@ -502,6 +503,7 @@ fn data_source_concurrent_next_row_yields_unique_nonces() {
                         match adapter.next_row(&ctx).expect("row") {
                             PluginRowResult::Row(row) => row["nonce"].clone(),
                             PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+                            PluginRowResult::Pending(_) => panic!("unexpected pending"),
                         }
                     })
                     .collect::<Vec<_>>()
@@ -551,6 +553,7 @@ fn data_source_adapter_perf_smoke() {
         match adapter.next_row(&ctx).expect("row") {
             PluginRowResult::Row(_) => {}
             PluginRowResult::Exhausted => break,
+            PluginRowResult::Pending(_) => panic!("unexpected pending"),
         }
         seq += 1;
         rows += 1;
@@ -617,6 +620,7 @@ fn on_result_advances_nonce_only_on_success() {
     let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
         PluginRowResult::Row(row) => row,
         PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+        PluginRowResult::Pending(_) => panic!("unexpected pending"),
     };
     assert_eq!(row.get("nonce").map(String::as_str), Some("0"));
 
@@ -625,6 +629,7 @@ fn on_result_advances_nonce_only_on_success() {
     let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
         PluginRowResult::Row(row) => row,
         PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+        PluginRowResult::Pending(_) => panic!("unexpected pending"),
     };
     assert_eq!(row.get("nonce").map(String::as_str), Some("0"));
 
@@ -633,6 +638,7 @@ fn on_result_advances_nonce_only_on_success() {
     let row = match adapter.next_row(&nonce_ctx(1, 0)).expect("next_row") {
         PluginRowResult::Row(row) => row,
         PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+        PluginRowResult::Pending(_) => panic!("unexpected pending"),
     };
     assert_eq!(row.get("nonce").map(String::as_str), Some("1"));
 }
@@ -690,6 +696,7 @@ fn old_plugin_binary_still_loads_and_resolves() {
     let row = match adapter.next_row(&ctx).expect("next_row") {
         PluginRowResult::Row(row) => row,
         PluginRowResult::Exhausted => panic!("unexpected exhaustion"),
+        PluginRowResult::Pending(_) => panic!("unexpected pending"),
     };
     // Same value the current-tree build produces: the call landed on the
     // real `next_row`, not a shifted vtable slot.

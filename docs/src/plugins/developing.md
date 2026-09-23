@@ -427,18 +427,41 @@ the request's name as `next_row` saw it (unrendered, e.g. `submit ${vars.kind}`)
 so the two can be matched.
 
 Only declarative `request:` steps report results. A row a JS step pulls and
-sends with `http.*` gets no `on_result`, and is dropped when the iteration
-ends.
+sends with `http.*` gets no `on_result`, and is released through `on_discard`
+when the iteration ends.
 
-Results are best-effort by design: `on_result` returns nothing and a request
-cancelled mid-flight reports nothing at all. A plugin must tolerate a row whose
-result never arrives, and must not panic — it runs on a VU worker thread.
+A plugin that reserves work for a row can override the optional
+`on_discard(row_json)` callback. When a request never reports a result (failed
+preparation, cancellation, or unused rows), the host supplies
+`{"row": {...}, "seq": N}` exactly once for that acquired row. Normal results
+suppress discard. Both callbacks must be fast and must not panic. A discard
+may follow an in-flight cancellation, so it does not prove the remote request
+was never applied. Process crashes cannot deliver callbacks.
+
+### Temporarily unavailable rows
+
+A queue-backed source should return `{"pending_us": 1000}` when it has no work
+ready, rather than block, return an error, or report exhaustion. The native
+host advertises `capabilities: ["pending_rows", "discard_rows"]` during init;
+plugins that require this lifecycle should reject hosts missing either capability.
+
+For arrival-rate scenarios, `Pending` aborts the current iteration without an
+HTTP failure or completed-iteration sample and releases the VU immediately.
+The arrival counts as `dropped_iterations` with `reason=data_pending`. The next
+scheduled arrival polls again; no retry bypasses the rate budget. Closed-model
+scenarios sleep asynchronously and retry only the pending request, preserving
+earlier flow steps and the iteration budget. Their poll hint is clamped to
+100 µs–10 ms. This is polling on the executor's clock, not a notification API.
+
+Only return exhaustion when no future work can become ready. An empty queue
+with outstanding requests or delayed retries is pending, not exhausted.
 
 ### Init / row JSON contracts
 
 ```jsonc
 // init_json (host -> plugin, once before VUs start)
 {
+  "capabilities": ["pending_rows", "discard_rows"],
   "plugin_config": { "seed": 42 },              // merged [config] + PluginRef.config
   "sources": { "signed_tx": { "chain_id": "testnet-1" } }, // one entry per data.<name> backed by this plugin
   "vus": 250,                                   // most VU ids this instance allocates

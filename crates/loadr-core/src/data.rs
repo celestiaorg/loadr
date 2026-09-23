@@ -93,6 +93,8 @@ impl serde::Serialize for Headers<'_> {
 /// Outcome of one on-demand row generation.
 pub enum PluginRowResult {
     Row(Row),
+    /// Temporarily empty. No request was prepared; release execution capacity.
+    Pending(std::time::Duration),
     Exhausted,
 }
 
@@ -134,6 +136,10 @@ pub trait DataSourcePlugin: Send + Sync {
     /// move, not a copy. Errors are the plugin's problem: a load test must not
     /// fail on feedback.
     fn on_result(&self, _result_json: String) {}
+
+    /// Release a row whose request did not report a result, including cancellation.
+    /// Payload: {"row": {...}, "seq": N}. Delivery is at most once per row.
+    fn on_discard(&self, _row_json: String) {}
 }
 
 #[derive(Debug)]
@@ -206,6 +212,20 @@ struct PendingRow {
     row: Arc<Row>,
     plugin: Arc<dyn DataSourcePlugin>,
     blocking: bool,
+    reported: bool,
+}
+
+impl Drop for PendingRow {
+    fn drop(&mut self) {
+        if !self.reported {
+            let json = serde_json::json!({"row": &*self.row, "seq": self.seq}).to_string();
+            if bracket_plugin_fetch(self.blocking) {
+                tokio::task::block_in_place(|| self.plugin.on_discard(json));
+            } else {
+                self.plugin.on_discard(json);
+            }
+        }
+    }
 }
 
 impl VuFeedState {
@@ -227,7 +247,7 @@ impl VuFeedState {
         !self.pending.is_empty()
     }
 
-    /// Drop rows no request will report: a prepare that failed, or rows left
+    /// Release rows no request will report: a prepare that failed, or rows left
     /// over when an iteration ends.
     pub(crate) fn clear_pending(&mut self) {
         self.pending.clear();
@@ -482,7 +502,7 @@ impl DataFeeds {
         id: &RowIdentity<'_>,
         response: &crate::protocol::ProtocolResponse,
     ) {
-        for entry in state.pending.drain(..) {
+        for mut entry in state.pending.drain(..) {
             let payload = ResultPayload {
                 source: &entry.source,
                 vu: id.vu,
@@ -500,6 +520,7 @@ impl DataFeeds {
                     continue;
                 }
             };
+            entry.reported = true;
             if bracket_plugin_fetch(entry.blocking) {
                 tokio::task::block_in_place(|| entry.plugin.on_result(json));
             } else {
@@ -583,10 +604,15 @@ impl DataFeeds {
                                 row: row.clone(),
                                 plugin: plugin.clone(),
                                 blocking: *blocking,
+                                reported: false,
                             });
                         }
                         Ok(row)
                     }
+                    Ok(PluginRowResult::Pending(delay)) => Err(NextRowError::Pending(delay.clamp(
+                        std::time::Duration::from_micros(100),
+                        std::time::Duration::from_millis(10),
+                    ))),
                     Ok(PluginRowResult::Exhausted) => {
                         Err(NextRowError::Exhausted(EndOfData(source.to_string())))
                     }
@@ -650,6 +676,8 @@ fn make_feed(rows: Vec<Arc<Row>>, mode: DataMode, on_eof: OnEof, pick: PickStrat
 
 #[derive(Debug, thiserror::Error)]
 pub enum NextRowError {
+    #[error("data source temporarily unavailable")]
+    Pending(std::time::Duration),
     #[error("unknown data source `{0}`")]
     UnknownSource(String),
     #[error(transparent)]

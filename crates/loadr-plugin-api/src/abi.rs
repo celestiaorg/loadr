@@ -116,7 +116,7 @@ pub trait FfiDataSource: Send + Sync {
     fn init(&mut self, init_json: RString) -> RResult<(), RString>;
 
     /// `ctx_json`: `{"source","vu","iteration","seq","scenario","request"?,"ts_ms"}`.
-    /// Returns `{"row": {"col": <scalar>, ...}}` or `{"exhausted": true}`.
+    /// Returns `{"row": {"col": <scalar>, ...}}`, `{"pending_us": N}`, or `{"exhausted": true}`.
     fn next_row(&self, ctx_json: RString) -> RResult<RString, RString>;
 
     // Methods below were added after the first release. Each must keep its
@@ -140,6 +140,9 @@ pub trait FfiDataSource: Send + Sync {
     fn wants_results(&self) -> bool {
         false
     }
+    /// Release a row when its request is abandoned without an on_result call.
+    /// Payload: {"row": {...}, "seq": N}. Default preserves old plugins.
+    fn on_discard(&self, _row_json: RString) {}
 }
 
 /// Boxed trait objects as they cross the FFI boundary.

@@ -551,6 +551,7 @@ impl ServicePlugin for NativeServiceAdapter {
 /// JSON payload handed to [`crate::abi::FfiDataSource::init`].
 #[derive(Serialize)]
 struct FfiDataSourceInit<'a> {
+    capabilities: [&'static str; 2],
     plugin_config: &'a serde_json::Value,
     sources: &'a IndexMap<String, serde_json::Value>,
     vus: u64,
@@ -573,6 +574,8 @@ struct FfiRowCtx<'a> {
 /// JSON response from [`crate::abi::FfiDataSource::next_row`].
 #[derive(Default, Deserialize)]
 struct FfiRowResponse {
+    #[serde(default)]
+    pending_us: Option<u64>,
     #[serde(default)]
     row: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
@@ -618,6 +621,7 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
 
     fn init(&mut self, source_configs: &IndexMap<String, serde_json::Value>) -> Result<(), String> {
         let payload = FfiDataSourceInit {
+            capabilities: ["pending_rows", "discard_rows"],
             plugin_config: &self.config,
             sources: source_configs,
             vus: self.placement.vus,
@@ -649,12 +653,17 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
         };
         let response: FfiRowResponse = serde_json::from_str(response_json.as_str())
             .map_err(|e| format!("invalid row JSON: {e}"))?;
+        if let Some(us) = response.pending_us {
+            return Ok(PluginRowResult::Pending(std::time::Duration::from_micros(
+                us,
+            )));
+        }
         if response.exhausted {
             return Ok(PluginRowResult::Exhausted);
         }
-        let row_obj = response
-            .row
-            .ok_or_else(|| "plugin returned neither `row` nor `exhausted`".to_string())?;
+        let row_obj = response.row.ok_or_else(|| {
+            "plugin returned none of `row`, `pending_us`, or `exhausted`".to_string()
+        })?;
         let row: Row = row_obj
             .iter()
             .map(|(k, v)| (k.clone(), loadr_core::vu::json_to_string(v)))
@@ -664,6 +673,10 @@ impl DataSourcePlugin for NativeDataSourceAdapter {
 
     fn wants_results(&self) -> bool {
         self.inner.wants_results()
+    }
+
+    fn on_discard(&self, row_json: String) {
+        self.inner.on_discard(RString::from(row_json));
     }
 
     fn on_result(&self, result_json: String) {
@@ -984,7 +997,51 @@ mod tests {
         let init: serde_json::Value =
             serde_json::from_str(seen.lock().as_deref().expect("init called")).expect("json");
         assert_eq!(init["plugin_config"], serde_json::json!({"k": 1}));
+        assert_eq!(
+            init["capabilities"],
+            serde_json::json!(["pending_rows", "discard_rows"])
+        );
         assert_eq!(init["vus"], 25);
         assert_eq!(init["vu_offset"], 50);
+    }
+    struct QueueSource(Arc<parking_lot::Mutex<Vec<String>>>);
+    impl FfiDataSource for QueueSource {
+        fn name(&self) -> RString {
+            "queue".into()
+        }
+        fn init(&mut self, _: RString) -> RResult<(), RString> {
+            RResult::ROk(())
+        }
+        fn next_row(&self, _: RString) -> RResult<RString, RString> {
+            RResult::ROk(r#"{"pending_us":1234}"#.into())
+        }
+        fn on_discard(&self, raw: RString) {
+            self.0.lock().push(raw.into_string());
+        }
+    }
+
+    #[test]
+    fn native_adapter_carries_pending_and_discard() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let inner = FfiDataSource_TO::from_value(
+            QueueSource(seen.clone()),
+            abi_stable::erased_types::TD_Opaque,
+        );
+        let adapter = NativeDataSourceAdapter::new(inner, serde_json::json!({}));
+        let ctx = PluginRowCtx {
+            source: "tx",
+            vu: 1,
+            iteration: 0,
+            seq: 0,
+            scenario: "s",
+            request: None,
+            ts_ms: 0,
+        };
+        assert!(
+            matches!(adapter.next_row(&ctx).unwrap(), PluginRowResult::Pending(d) if d.as_micros() == 1234)
+        );
+        let raw = r#"{"row":{"lease":"7"},"seq":0}"#;
+        adapter.on_discard(raw.into());
+        assert_eq!(seen.lock().as_slice(), &[raw.to_string()]);
     }
 }

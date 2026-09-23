@@ -120,10 +120,22 @@ impl ExecEnv {
     async fn run_one(&self, worker: &mut VuWorker, scenario_cancel: &CancellationToken) -> bool {
         let outcome = tokio::select! {
             biased;
-            _ = scenario_cancel.cancelled() => return false,
+            _ = scenario_cancel.cancelled() => {
+                worker.ctx.data_state.clear_pending();
+                return false;
+            },
             o = self.runner.run_iteration(&mut worker.ctx, &mut worker.script) => o,
         };
+        worker.ctx.data_state.clear_pending();
         match outcome {
+            IterationOutcome::DataPending(_) => {
+                // No HTTP attempt was made. Release the VU immediately;
+                // retry only on a subsequent scheduled arrival.
+                let tags = worker.ctx.sample_tags(&[("reason", "data_pending")]);
+                self.metrics
+                    .counter(&self.builtins.dropped_iterations, 1.0, &tags);
+                true
+            }
             IterationOutcome::Completed => true,
             IterationOutcome::StopVu => false,
             IterationOutcome::AbortScenario => {
