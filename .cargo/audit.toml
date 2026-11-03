@@ -2,12 +2,6 @@
 # `cargo audit` CI step and `cargo deny check` agree.
 [advisories]
 ignore = [
-    # wasmtime-wasi (via loadr-plugin-api's WASM runtime) — WASI hard-link/rename
-    # FilePerms bypass. NOT REACHABLE in loadr: plugins get
-    # `WasiCtxBuilder::new().build()` — no preopened dirs, no fs access — so the
-    # bypass can't apply (crates/loadr-plugin-api/src/wasm.rs). No patched 45.x;
-    # revisit on the next wasmtime major bump. See deny.toml for the match.
-    "RUSTSEC-2026-0188",
     # rsa (transitive via sqlx-mysql) — Marvin timing side-channel. No safe
     # upgrade exists upstream yet. Only reachable for MySQL caching_sha2/sha256
     # password auth on a non-TLS connection; load-test targets are
