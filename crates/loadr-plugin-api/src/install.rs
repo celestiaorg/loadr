@@ -669,6 +669,52 @@ entry = "libloadr_plugin_demo.so"
     }
 
     #[test]
+    fn install_zip_archive_skips_traversal_and_symlinks() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zw.add_directory("demo-0.1.0/", opts).unwrap();
+        zw.start_file("demo-0.1.0/plugin.toml", opts).unwrap();
+        zw.write_all(
+            br#"[plugin]
+name = "demo"
+version = "0.1.0"
+kind = "output"
+type = "native"
+entry = "libloadr_plugin_demo.so"
+"#,
+        )
+        .unwrap();
+        zw.start_file("demo-0.1.0/libloadr_plugin_demo.so", opts)
+            .unwrap();
+        zw.write_all(b"\x7fELF-not-really").unwrap();
+        zw.start_file("../escape.txt", opts).unwrap();
+        zw.write_all(b"nope").unwrap();
+        zw.add_symlink("demo-0.1.0/link", "/etc/passwd", opts)
+            .unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("plugins");
+        let manifest = install_archive_bytes("demo.zip", &bytes, &plugins).expect("installs");
+        assert_eq!(manifest.name, "demo");
+        let pdir = plugins.join("demo");
+        assert_eq!(
+            std::fs::read(pdir.join("libloadr_plugin_demo.so")).unwrap(),
+            b"\x7fELF-not-really"
+        );
+        assert!(!dir.path().join("escape.txt").exists());
+        let link = std::fs::symlink_metadata(pdir.join("link"));
+        assert!(
+            link.map_or(true, |m| !m.file_type().is_symlink()),
+            "zip symlink entries must never be materialised as symlinks"
+        );
+    }
+
+    #[test]
     fn install_resolved_sha_mismatch_fails() {
         let bytes = build_tar_gz();
         let url = "https://example.test/demo.tar.gz".to_string();
