@@ -1,16 +1,6 @@
 [advisories]
 version = 2
 ignore = [
-    # wasmtime-wasi (via loadr-plugin-api's WASM component runtime) — WASI
-    # hard-link/rename bypass of FilePerms for the *destination* path.
-    # NOT REACHABLE in loadr: WASM plugins are built with
-    # `WasiCtxBuilder::new().build()` — no preopened directories, no network,
-    # no env, no inherited stdio (crates/loadr-plugin-api/src/wasm.rs), so the
-    # guest has no filesystem access at all for the bypass to apply. CVSS is
-    # AV:L and is conditioned on preopened dirs we never grant. No patched
-    # version exists in the compatible (45.x) range; revisit on the next
-    # wasmtime major bump.
-    "RUSTSEC-2026-0188", # wasmtime-wasi; unreachable (no WASI preopens)
     # Unmaintained transitive deps with no upgrade path yet. Advisory-only
     # (no known vulnerability); revisit when upstreams publish replacements.
     "RUSTSEC-2024-0014", # generational-arena (via the browser/chromiumoxide stack)
