@@ -34,14 +34,14 @@ scenarios:
           checks:
             - { type: status, equals: 200 }
 
-      # Server errors (500) — counts under "HTTP status".
+      # Server errors (500) — counts under "Response status".
       - request:
           name: server-error
           method: GET
           url: /status/500
 
       # Client errors (404) plus a check that fails on them — the check failure
-      # shows up under "Failed checks", the 404 under "HTTP status".
+      # shows up under "Failed checks", the 404 under "Response status".
       - request:
           name: not-found
           method: GET

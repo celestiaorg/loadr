@@ -14,6 +14,25 @@ pub struct CheckSummary {
     pub name: String,
     pub passes: u64,
     pub fails: u64,
+    /// Bounded semantic failure breakdown. Omitted for all existing checks
+    /// and for protobuf checks without an explicit `failure_groups` mapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_groups: Vec<CheckFailureGroupSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckFailureGroupSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i64>,
+    pub label: String,
+    pub count: u64,
+}
+
+#[derive(Default)]
+struct CheckAccumulator {
+    passes: u64,
+    fails: u64,
+    failure_groups: BTreeMap<(Option<i64>, String), u64>,
 }
 
 /// One metric in the summary, merged across all tag combinations.
@@ -29,10 +48,8 @@ pub struct MetricSummary {
 ///
 /// One point is emitted per snapshot interval. All values describe the run at
 /// `elapsed_secs`; throughput and `error_rate` cover the interval window, while
-/// latency percentiles and `active_vus` are point-in-time. This is the data the
-/// HTML report charts and is exact enough for visual analysis (latency
-/// percentiles come from the live, count-weighted merge — the aggregate table
-/// remains the source of exact end-of-run figures).
+/// latency percentiles are exact run-to-date aggregates and `active_vus` is
+/// point-in-time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimelinePoint {
     /// Seconds since the run started.
@@ -66,6 +83,15 @@ pub struct TimelinePoint {
 impl TimelinePoint {
     /// Derive a timeline point from a live snapshot.
     pub fn from_snapshot(snap: &crate::aggregate::Snapshot) -> TimelinePoint {
+        Self::from_snapshots(snap, None)
+    }
+
+    /// Derive a timeline point using an exact aggregate snapshot for
+    /// cross-tag and cross-protocol latency rollups.
+    pub fn from_snapshots(
+        snap: &crate::aggregate::Snapshot,
+        exact: Option<&crate::aggregate::Snapshot>,
+    ) -> TimelinePoint {
         let interval = if snap.interval_secs > 0.0 {
             snap.interval_secs
         } else {
@@ -81,14 +107,14 @@ impl TimelinePoint {
                 .sum::<u64>() as f64
         };
 
-        // Pass/fail merged exactly across tag sets: a "failed" rate metric.
+        // Failed fraction over this snapshot interval.
         let error_rate = {
             let (passes, total) = snap
                 .series
                 .iter()
                 .filter(|s| s.metric == "http_req_failed")
                 .fold((0.0_f64, 0_u64), |(p, t), s| {
-                    (p + s.agg.sum, t + s.agg.count)
+                    (p + s.interval_sum, t + s.interval_count)
                 });
             if total > 0 {
                 passes / total as f64
@@ -97,14 +123,25 @@ impl TimelinePoint {
             }
         };
 
-        // Latency: count-weighted merge of the trend statistic across tag sets.
+        // Exact run-to-date request latency when the aggregator projection is
+        // available. The weighted fallback is retained for old callers.
         let latency = |pick: fn(&AggValues) -> Option<f64>| -> Option<f64> {
+            if let Some(value) = exact
+                .and_then(|snapshot| {
+                    snapshot.series.iter().find(|series| {
+                        series.metric == "request_duration" && series.tags.is_empty()
+                    })
+                })
+                .and_then(|series| pick(&series.agg))
+            {
+                return Some(value);
+            }
             let mut acc = 0.0_f64;
             let mut total = 0_u64;
             for s in snap
                 .series
                 .iter()
-                .filter(|s| s.metric.ends_with("_req_duration"))
+                .filter(|s| crate::metrics::is_request_duration_metric(&s.metric))
             {
                 if s.agg.count == 0 {
                     continue;
@@ -186,7 +223,7 @@ impl Summary {
             }
             seen.into_iter().collect()
         };
-        let metrics: Vec<MetricSummary> = metric_names
+        let mut metrics: Vec<MetricSummary> = metric_names
             .iter()
             .filter_map(|(m, _)| {
                 agg.aggregate_selector(m, &[])
@@ -197,26 +234,93 @@ impl Summary {
                     })
             })
             .collect();
+        let request_rollups = agg.aggregate_snapshot(&[]);
+        metrics.retain(|metric| {
+            !matches!(metric.metric.as_str(), "request_reqs" | "request_duration")
+        });
+        for metric in request_rollups.series.iter().filter(|series| {
+            series.tags.is_empty()
+                && matches!(series.metric.as_str(), "request_reqs" | "request_duration")
+        }) {
+            metrics.push(MetricSummary {
+                metric: metric.metric.clone(),
+                kind: metric.kind,
+                agg: metric.agg.clone(),
+            });
+        }
+
+        // Derived successful-throughput counter, sorted next to `request_reqs`.
+        // `http_req_failed` is recorded by every protocol as a Rate where a "true"
+        // sample means the request failed, so its `count` is the total request
+        // count and `sum` the failure count. The difference is the number of
+        // requests that got a non-error protocol response (transport ok and gRPC
+        // status 0 / HTTP < 400) — this is NOT the count of application-accepted
+        // requests. It gives users success-rate throughput without hand math.
+        let request_reqs_ok = metrics
+            .iter()
+            .find(|m| m.metric == "http_req_failed")
+            .filter(|m| m.agg.count > 0)
+            .map(|m| {
+                let ok = m.agg.count - m.agg.sum as u64;
+                let per_second = if snapshot.elapsed_secs > 0.0 {
+                    Some(ok as f64 / snapshot.elapsed_secs)
+                } else {
+                    None
+                };
+                MetricSummary {
+                    metric: "request_reqs_ok".to_string(),
+                    kind: MetricKind::Counter,
+                    agg: AggValues {
+                        count: ok,
+                        sum: ok as f64,
+                        per_second,
+                        ..Default::default()
+                    },
+                }
+            });
+        if let Some(series) = request_reqs_ok {
+            metrics.push(series);
+        }
+
+        metrics.sort_by(|a, b| a.metric.cmp(&b.metric));
 
         // Check summaries from `checks` series tagged with `check`.
-        let mut checks: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        let mut checks: BTreeMap<String, CheckAccumulator> = BTreeMap::new();
         for s in snapshot.series.iter().filter(|s| s.metric == "checks") {
             let name = s
                 .tags
                 .get("check")
                 .cloned()
                 .unwrap_or_else(|| "unnamed".to_string());
-            let entry = checks.entry(name).or_insert((0, 0));
+            let entry = checks.entry(name).or_default();
             let passes = s.agg.sum as u64;
-            entry.0 += passes;
-            entry.1 += s.agg.count - passes;
+            entry.passes += passes;
+            let fails = s.agg.count - passes;
+            entry.fails += fails;
+            if fails > 0 {
+                if let Some(label) = s.tags.get("failure_group") {
+                    let code = s
+                        .tags
+                        .get("failure_code")
+                        .and_then(|value| value.parse::<i64>().ok());
+                    *entry
+                        .failure_groups
+                        .entry((code, label.clone()))
+                        .or_default() += fails;
+                }
+            }
         }
         let checks: Vec<CheckSummary> = checks
             .into_iter()
-            .map(|(name, (passes, fails))| CheckSummary {
+            .map(|(name, check)| CheckSummary {
                 name,
-                passes,
-                fails,
+                passes: check.passes,
+                fails: check.fails,
+                failure_groups: check
+                    .failure_groups
+                    .into_iter()
+                    .map(|((code, label), count)| CheckFailureGroupSummary { code, label, count })
+                    .collect(),
             })
             .collect();
 
@@ -281,6 +385,16 @@ impl Summary {
                     c.passes,
                     c.passes + c.fails
                 ));
+                for group in &c.failure_groups {
+                    let code = group
+                        .code
+                        .map(|code| format!(" [code {code}]"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "        {}{}: {}\n",
+                        group.label, code, group.count
+                    ));
+                }
             }
             out.push('\n');
         }
@@ -305,6 +419,21 @@ impl Summary {
                     fmt_num(m.agg.sum),
                     fmt_num(m.agg.per_second.unwrap_or(0.0))
                 ),
+                // Failure-polarity rate (e.g. `http_req_failed`): a "true" sample
+                // means the request FAILED, so `sum` is the failure count and the
+                // rate is the failure rate. Put ✓ on the good (non-failed) outcome
+                // and ✗ on failures, and label the percentage, so the glyphs keep
+                // the ✓=good meaning they carry on the `checks` line.
+                MetricKind::Rate if m.metric.ends_with("_failed") => {
+                    let failed = m.agg.sum as u64;
+                    let ok = m.agg.count.saturating_sub(failed);
+                    format!(
+                        "{:.2}% failed — ✓ {} ✗ {}",
+                        m.agg.rate.unwrap_or(0.0) * 100.0,
+                        ok,
+                        failed
+                    )
+                }
                 MetricKind::Rate => format!(
                     "{:.2}% — ✓ {} ✗ {}",
                     m.agg.rate.unwrap_or(0.0) * 100.0,
@@ -387,7 +516,23 @@ impl Summary {
                 ));
             } else {
                 check_failures += 1;
-                let msg = format!("{} of {} checks failed", c.fails, total);
+                let groups = if c.failure_groups.is_empty() {
+                    String::new()
+                } else {
+                    let values = c
+                        .failure_groups
+                        .iter()
+                        .map(|group| match group.code {
+                            Some(code) => {
+                                format!("{} (code {}): {}", group.label, code, group.count)
+                            }
+                            None => format!("{}: {}", group.label, group.count),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("; failure groups: {values}")
+                };
+                let msg = format!("{} of {} checks failed{}", c.fails, total, groups);
                 check_cases.push_str(&format!(
                     "    <testcase name=\"{}\" classname=\"check\">\n      <failure message=\"{}\"/>\n    </testcase>\n",
                     xml_escape(&c.name),
@@ -540,6 +685,57 @@ mod tests {
     }
 
     #[test]
+    fn distributed_merge_preserves_bounded_failure_groups() {
+        fn record_failures(agg: &mut Aggregator, code: i64, label: &str, count: usize) {
+            let mut tags = Tags::new();
+            tags.insert("check".into(), "admission_accepted".into());
+            tags.insert("failure_code".into(), code.to_string());
+            tags.insert("failure_group".into(), label.to_string());
+            let tags = Arc::new(tags);
+            for _ in 0..count {
+                agg.record(&Sample {
+                    metric: Arc::from("checks"),
+                    kind: MetricKind::Rate,
+                    value: 0.0,
+                    tags: tags.clone(),
+                    timestamp_ms: now_millis(),
+                });
+            }
+        }
+
+        let mut agent_a = Aggregator::new();
+        let mut agent_b = Aggregator::new();
+        record_failures(&mut agent_a, 18, "WrongShard", 2);
+        record_failures(&mut agent_b, 18, "WrongShard", 3);
+        record_failures(&mut agent_b, 20, "PoolAtCapacity", 4);
+        let mut controller = Aggregator::new();
+        controller.merge_delta(&agent_a.take_delta());
+        controller.merge_delta(&agent_b.take_delta());
+
+        let summary = Summary::build(
+            Some("distributed".into()),
+            "run-groups".into(),
+            now_millis(),
+            vec!["default".into()],
+            &mut controller,
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        let check = &summary.checks[0];
+        assert_eq!(check.fails, 9);
+        assert_eq!(check.failure_groups.len(), 2);
+        assert!(check.failure_groups.iter().any(|group| {
+            group.code == Some(18) && group.label == "WrongShard" && group.count == 5
+        }));
+        assert!(check.failure_groups.iter().any(|group| {
+            group.code == Some(20) && group.label == "PoolAtCapacity" && group.count == 4
+        }));
+        assert!(summary.render_console().contains("WrongShard [code 18]: 5"));
+        assert!(summary.render_junit().contains("WrongShard (code 18): 5"));
+    }
+
+    #[test]
     fn console_render_contains_key_lines() {
         let s = build_summary();
         let text = s.render_console();
@@ -548,6 +744,79 @@ mod tests {
         assert!(text.contains("http_req_duration"));
         assert!(text.contains("p(95)<400"));
         assert!(text.contains("✓ http_req_duration"));
+    }
+
+    /// Build a summary from `n` requests of which `failed` reported a failure via
+    /// the `http_req_failed` rate (as every protocol records it).
+    fn build_request_summary(n: usize, failed: usize) -> Summary {
+        let mut agg = Aggregator::new();
+        let tags = Arc::new(Tags::new());
+        for i in 0..n {
+            agg.record(&Sample {
+                metric: Arc::from("http_req_failed"),
+                kind: MetricKind::Rate,
+                value: if i < failed { 1.0 } else { 0.0 },
+                tags: tags.clone(),
+                timestamp_ms: now_millis(),
+            });
+            agg.record(&Sample {
+                metric: Arc::from("grpc_reqs"),
+                kind: MetricKind::Counter,
+                value: 1.0,
+                tags: tags.clone(),
+                timestamp_ms: now_millis(),
+            });
+        }
+        Summary::build(
+            Some("grpc".into()),
+            "run-req".into(),
+            now_millis(),
+            vec!["default".into()],
+            &mut agg,
+            Vec::new(),
+            None,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn http_req_failed_marks_ok_with_check_and_failed_with_cross() {
+        // 8 of 10 requests failed -> 80% failure rate.
+        let s = build_request_summary(10, 8);
+        let text = s.render_console();
+        // ✓ counts the 2 successful requests, ✗ the 8 failures, and the
+        // percentage is labelled as the failure rate.
+        assert!(
+            text.contains("80.00% failed — ✓ 2 ✗ 8"),
+            "unexpected http_req_failed line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn request_reqs_ok_counts_non_failed_requests() {
+        let s = build_request_summary(10, 8);
+        let ok = s
+            .metrics
+            .iter()
+            .find(|m| m.metric == "request_reqs_ok")
+            .expect("request_reqs_ok should be synthesized when requests exist");
+        assert_eq!(ok.kind, MetricKind::Counter);
+        assert_eq!(ok.agg.count, 2);
+        assert_eq!(ok.agg.sum as u64, 2);
+        // request_reqs_ok == total requests - failed requests.
+        let failed = s
+            .metrics
+            .iter()
+            .find(|m| m.metric == "http_req_failed")
+            .expect("http_req_failed present");
+        assert_eq!(ok.agg.count, failed.agg.count - failed.agg.sum as u64);
+    }
+
+    #[test]
+    fn request_reqs_ok_absent_without_requests() {
+        // The demo summary records checks and durations but no http_req_failed.
+        let s = build_summary();
+        assert!(s.metrics.iter().all(|m| m.metric != "request_reqs_ok"));
     }
 
     #[test]
@@ -613,6 +882,7 @@ mod tests {
     fn json_round_trip() {
         let s = build_summary();
         let json = s.to_json();
+        assert!(json["checks"][0].get("failure_groups").is_none());
         let back: Summary = serde_json::from_value(json).expect("round trip");
         assert_eq!(back.run_id, "run-1");
         assert_eq!(back.checks.len(), 1);

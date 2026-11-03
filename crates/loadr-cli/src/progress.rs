@@ -40,7 +40,7 @@ pub async fn show_progress(handle: RunHandle) {
         let p95 = snap
             .series
             .iter()
-            .filter(|s| s.metric.ends_with("_req_duration"))
+            .filter(|s| loadr_core::metrics::is_request_duration_metric(&s.metric))
             .filter_map(|s| s.agg.p95)
             .fold(f64::NAN, f64::max);
         let failed: u64 = snap

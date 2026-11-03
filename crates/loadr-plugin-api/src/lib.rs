@@ -39,8 +39,8 @@ pub use install::{
 };
 pub use manifest::{merge_config, PluginAbi, PluginKind, PluginManifest, PluginType};
 pub use native::{
-    FfiRequest, FfiResponse, NativeOutputAdapter, NativePlugin, NativeProtocolAdapter,
-    NativeServiceAdapter,
+    FfiRequest, FfiResponse, NativeDataSourceAdapter, NativeOutputAdapter, NativePlugin,
+    NativeProtocolAdapter, NativeServiceAdapter,
 };
 pub use registry::{default_plugins_dir, LoadedPlugin, PluginRegistry, DISABLED_MARKER};
 pub use traits::{PluginAssertion, PluginExtractor, ServicePlugin};

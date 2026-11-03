@@ -37,6 +37,7 @@ pub struct PrometheusOutput {
     listen: Option<String>,
     remote_write_url: Option<String>,
     interval: Duration,
+    final_scrape_grace: Duration,
     latest: Shared,
     bound_addr: Option<SocketAddr>,
     server_task: Option<tokio::task::JoinHandle<()>>,
@@ -56,6 +57,7 @@ impl PrometheusOutput {
             listen,
             remote_write_url,
             interval,
+            final_scrape_grace: Duration::ZERO,
             latest: Arc::new(RwLock::new(None)),
             bound_addr: None,
             server_task: None,
@@ -69,13 +71,30 @@ impl PrometheusOutput {
         self.bound_addr
     }
 
-    fn abort_tasks(&mut self) {
+    /// Configure how long a standalone scrape listener remains available
+    /// after the final snapshot is published, delaying `finish` by as much.
+    /// Disabled (zero) by default: set it when a Prometheus server scrapes
+    /// short-lived runs and must observe the terminal snapshot.
+    pub fn with_final_scrape_grace(mut self, grace: Duration) -> Self {
+        self.final_scrape_grace = grace;
+        self
+    }
+
+    fn abort_server_task(&mut self) {
         if let Some(task) = self.server_task.take() {
             task.abort();
         }
+    }
+
+    fn abort_push_task(&mut self) {
         if let Some(task) = self.push_task.take() {
             task.abort();
         }
+    }
+
+    fn abort_tasks(&mut self) {
+        self.abort_server_task();
+        self.abort_push_task();
     }
 }
 
@@ -89,6 +108,10 @@ impl Drop for PrometheusOutput {
 impl Output for PrometheusOutput {
     fn name(&self) -> &str {
         "prometheus"
+    }
+
+    fn wants_samples(&self) -> bool {
+        false
     }
 
     async fn start(&mut self) -> Result<(), EngineError> {
@@ -125,7 +148,7 @@ impl Output for PrometheusOutput {
 
     async fn finish(&mut self, summary: &Summary) {
         *self.latest.write() = Some(summary.snapshot.clone());
-        self.abort_tasks();
+        self.abort_push_task();
         // One final push so short runs still export data.
         if let Some(url) = &self.remote_write_url {
             if let Ok(uri) = url.parse::<Uri>() {
@@ -133,6 +156,17 @@ impl Output for PrometheusOutput {
                 push_once(&client, &uri, &self.latest).await;
             }
         }
+        // A listen-mode exporter belongs to this process, so when a grace is
+        // configured leave the final snapshot scrapeable before shutting the
+        // listener down.
+        if self.server_task.is_some() && !self.final_scrape_grace.is_zero() {
+            tracing::info!(
+                grace = ?self.final_scrape_grace,
+                "keeping prometheus /metrics scrapeable (final_scrape_grace)"
+            );
+            tokio::time::sleep(self.final_scrape_grace).await;
+        }
+        self.abort_server_task();
     }
 }
 
@@ -508,6 +542,44 @@ mod tests {
         assert!(text.contains("loadr_vus 7"), "{text}");
 
         out.finish(&fixture_summary()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_snapshot_remains_scrapeable_during_grace() {
+        let grace = Duration::from_millis(120);
+        let mut out = PrometheusOutput::new(
+            Some("127.0.0.1:0".to_string()),
+            None,
+            Duration::from_secs(5),
+        )
+        .with_final_scrape_grace(grace);
+        out.start().await.expect("start");
+        let addr = out.bound_addr().expect("bound addr");
+        out.on_snapshot(&fixture_snapshot()).await;
+
+        let started = tokio::time::Instant::now();
+        let finish = tokio::spawn(async move {
+            out.finish(&fixture_summary()).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = http_client::client();
+        let request = http::Request::builder()
+            .uri(format!("http://{addr}/metrics"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = client.request(request).await.expect("final scrape");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("loadr_vus"));
+
+        finish.await.expect("finish task");
+        assert!(started.elapsed() >= grace);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

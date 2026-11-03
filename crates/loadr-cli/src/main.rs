@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "loadr",
-    version,
+    version = loadr_core::build_info::VERSION_WITH_REVISION,
     about = "A modern load testing platform: k6 + JMeter in one binary",
     long_about = "loadr runs declarative YAML load tests with embedded JavaScript, six built-in \
                   protocols, plugins, distributed agents and a live web UI.\n\
@@ -124,7 +124,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
         Command::Version => {
-            println!("loadr {}", env!("CARGO_PKG_VERSION"));
+            println!("loadr {}", loadr_core::build_info::VERSION_WITH_REVISION);
             println!(
                 "  protocols: http/1.1, http/2, websocket, sse, grpc, graphql, tcp, udp, browser"
             );

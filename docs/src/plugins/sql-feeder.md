@@ -1,23 +1,22 @@
 # SQL feeder plugin
 
 > **Status:** planned — not yet in the signed [plugin index](installing.md). This
-> page documents the intended shape; the config keys and metric names may still
+> page documents the intended service-to-file shape; the config keys may still
 > change before the first release.
 
 `loadr-plugin-sql-feeder` is a **service** plugin in the *data sources &
-feeders* role. Instead of driving a target, it acts as a **data source**: at the
-start of a run it opens one connection, runs a single `SELECT` via
-[`sqlx`](https://github.com/launchbadge/sqlx), materialises the result set in
-memory, and hands each VU the next row through the usual feeder interpolation.
-It turns a query against a live database into a `data:` feeder — the same shape
-as a local `type: csv` file, but sourced from a table so the fixture stays next
-to the system under test rather than being exported to the repo.
+feeders* role. Instead of driving a target, it prepares a feeder fixture: when
+the service starts it opens one connection, runs a single `SELECT` via
+[`sqlx`](https://github.com/launchbadge/sqlx), and writes the result set as a
+JSON array of row objects. A normal `type: json` data source then hands those
+rows to VUs through the usual feeder interpolation. The plugin does **not**
+provide the `data_source` capability, so do not configure it as
+`data.<name>.type: plugin`.
 
 Reach for it when the data that drives a run already lives in a table — real
 user IDs, order numbers, API keys, tenant slugs — and you would otherwise export
-it to a CSV first. The feeder does that export for you, at run start, against the
-live schema. The database is touched **once, at startup**; it is not on the
-request hot path.
+it to a CSV first. The service does that export for you, at startup, against the
+live schema. The database is touched **once**; it is not on the request hot path.
 
 Like the [PostgreSQL](postgres.md) and [MySQL](mysql.md) protocol plugins, it is
 near-pure Rust: `sqlx` built with **rustls** for TLS (no OpenSSL, no `libpq`),
@@ -25,8 +24,8 @@ gating only the driver features for the backends it serves — modelled on those
 drivers, with the same connection-string handling and per-backend feature
 gating.
 
-The contract it uses is documented in
-[Developing a plugin](developing.md#services).
+The service ABI it uses is documented in
+[Native plugins](native.md#the-interface).
 
 ## Install
 
@@ -67,27 +66,27 @@ plugins:
 
 ## Use it in a test
 
-List the plugin under `plugins:`, then declare a `data:` feeder whose
-`service:` names it. The plugin's `config:` block carries the connection `url`
-and the `query`; each row column the query returns binds a value the VUs
-reference through the usual `${data.<name>.<column>}` interpolation — exactly
-like a CSV feeder, but the rows come from a database. So a
-`select id, email from users` exposes `${data.users.id}` and
-`${data.users.email}`:
+List the plugin under `plugins:` with the connection `url`, `query`, and
+`output` file. The service writes that file as JSON; the plan's `data:` block
+reads it with the built-in `type: json` feeder. Each row column the query
+returns binds a value the VUs reference through the usual
+`${data.<name>.<column>}` interpolation. So a `select id, email from users`
+exposes `${data.users.id}` and `${data.users.email}`:
 
 ```yaml
 plugins:
-  - name: sql-feeder          # or: { name: sql-feeder, path: target/release/libloadr_plugin_sql_feeder.so }
-
-data:
-  users:
-    service: sql-feeder       # this feeder is backed by the service plugin
+  - name: sql-feeder          # or add: path: target/release/libloadr_plugin_sql_feeder.so
     config:
       url: postgres://loadr:loadr@db.example.com:5432/loadr
       query: select id, email from users
-    mode: shared              # all VUs share one cursor (per_vu: each VU gets its own)
-    pick: sequential          # sequential | random | shuffle
-    on_eof: recycle           # wrap around (stop: retire the VU at end of set)
+      output: data/users-from-db.json
+
+data:
+  users:
+    type: json
+    path: data/users-from-db.json
+    mode: shared
+    pick: sequential
 
 scenarios:
   signup_replay:
@@ -104,58 +103,47 @@ scenarios:
             - { type: status, equals: 200 }
 ```
 
-The query runs **once**, before any VU starts; the request loop only reads from
-the cached rows, so no per-VU database traffic happens during the test.
+The query runs **once**, when the service starts; the request loop only reads
+from the generated JSON feeder file, so no per-VU database traffic happens
+during the test.
 
 ## Config reference
 
-The feeder's behaviour is set through the plugin `config:` block:
+The plugin export is set through the `plugins[].config` block:
 
-| Key     | Required | Default | Meaning |
-|---------|----------|---------|---------|
-| `url`   | yes      | —       | Connection URI, e.g. `postgres://…` / `mysql://…`; passed straight to `sqlx` (any URL it accepts, including `?sslmode=require` for TLS). |
-| `query` | yes      | —       | The `SELECT` to run once at startup; its column names become the feeder's field names. |
+| Key      | Required | Default | Meaning |
+|----------|----------|---------|---------|
+| `url`    | yes      | —       | Connection URI, e.g. `postgres://…` / `mysql://…`; passed straight to `sqlx` (any URL it accepts, including `?sslmode=require` for TLS). |
+| `query`  | yes      | —       | The `SELECT` to run once at startup; its column names become the feeder's field names. |
+| `output` | yes      | —       | JSON file path to write; point a `data.<name>.type: json` feeder at the same path. |
 
 `${...}` interpolation works in `url` and `query`, so an environment variable or
 `--env` value can supply the DSN (`url: "${env.DATABASE_URL}"`) without
 hard-coding credentials in the plan.
 
 Only row-producing statements make sense here: the query must return a result
-set, and an empty `query` is rejected. Column values are carried as text into
-the feeder, matching how CSV/JSON feeders present fields.
+set, and an empty `query` is rejected. The generated file uses the same JSON
+array-of-objects shape as any local `type: json` feeder.
 
-Standard feeder controls apply on top of `config:` — `mode` (shared / per-VU),
-`pick` (`sequential` | `random` | `shuffle`) and `on_eof` (`recycle` | `stop`)
-behave exactly as they do for a local CSV/JSON source. See
-[Feeder strategies](../yaml/feeders.md).
+The normal JSON feeder controls apply to the `data.<name>` block:
+`mode`, `pick`, and `on_eof` behave exactly as they do for a local JSON file.
+See [Data parameterization](../yaml/data.md).
 
 ## Metrics
 
 Because the query runs once at startup rather than per request, the feeder does
-not emit a per-request metric family. It records a single counter for the rows
-it loaded:
-
-| Metric | Kind | Meaning |
-|--------|------|---------|
-| `sql_feeder_rows` | counter | Rows fetched by the startup `SELECT` and loaded into the feeder. |
-
-A load-time failure — an unreachable database, a bad DSN, or a query that
-errors — fails the run at startup (before VUs begin) rather than surfacing as a
-per-request failure, so there is no `sql_feeder_reqs` / `_req_duration` family.
-Use `sql_feeder_rows` as a sanity check that the feeder was actually populated —
-a `count>0` catches an empty or misparsed result set before the run leans on it:
-
-```yaml
-thresholds:
-  sql_feeder_rows: [ "count>0" ]
-```
+not emit a per-request metric family. A startup failure — an unreachable
+database, a bad DSN, a query error, or a file write error — fails before VUs
+begin rather than surfacing as a request failure, so there is no
+`sql_feeder_reqs` / `_req_duration` family.
 
 ## Notes
 
-- **Fetched once, then in memory.** The whole result set is read at run start and
-  cached, and the connection is closed before the load phase begins. The size of
-  the set is bounded by available memory — scope the query with a `WHERE`/`LIMIT`
-  rather than selecting an unbounded table.
+- **Fetched once, then written.** The whole result set is read at startup,
+  written to `output`, and the connection is closed before the load phase
+  begins. The size of the set is bounded by available memory while the file is
+  generated — scope the query with a `WHERE`/`LIMIT` rather than selecting an
+  unbounded table.
 - **Feeder, not a target.** This plugin *sources data*; it does not send load to
   the database. To put a database itself under test, use the
   [PostgreSQL](postgres.md) or [MySQL](mysql.md) protocol plugin, which run one

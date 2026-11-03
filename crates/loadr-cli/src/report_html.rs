@@ -48,10 +48,25 @@ pub fn render(summary: &Summary) -> String {
             100.0
         };
         let class = if c.fails == 0 { "ok" } else { "bad" };
+        let groups = c
+            .failure_groups
+            .iter()
+            .map(|group| match group.code {
+                Some(code) => format!("{} (code {}): {}", group.label, code, group.count),
+                None => format!("{}: {}", group.label, group.count),
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let groups = if groups.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div class="muted">{}</div>"#, esc(&groups))
+        };
         check_rows.push_str(&format!(
-            r#"<tr><td class="{class}">{}</td><td>{}</td><td>{}</td><td>{}</td><td><div class="bar"><div style="width:{pct:.1}%"></div></div> {pct:.2}%</td></tr>"#,
+            r#"<tr><td class="{class}">{}</td><td>{}{}</td><td>{}</td><td>{}</td><td><div class="bar"><div style="width:{pct:.1}%"></div></div> {pct:.2}%</td></tr>"#,
             if c.fails == 0 { "✓" } else { "✗" },
             esc(&c.name),
+            groups,
             c.passes,
             c.fails,
         ));
@@ -447,7 +462,8 @@ mod tests {
                           "med": 9.0, "p90": 18.0, "p95": 19.0, "p99": 20.0, "p999": 20.0,
                           "rate": null, "last": null, "per_second": 10.0}}
             ],
-            "checks": [{"name": "ok", "passes": 9u64, "fails": 1u64}],
+            "checks": [{"name": "ok", "passes": 9u64, "fails": 1u64,
+                         "failure_groups": [{"code": 18, "label": "WrongShard", "count": 1u64}]}],
             "thresholds": [{"metric": "http_req_duration", "expression": "p(95)<400",
                              "observed": 19.0, "passed": true, "abort_on_fail": false}],
             "thresholds_passed": true, "aborted": null,
@@ -464,6 +480,7 @@ mod tests {
         assert!(html.contains("PASSED"));
         assert!(html.contains("http_req_duration"));
         assert!(html.contains("p(95)&lt;400"));
+        assert!(html.contains("WrongShard (code 18): 1"));
         assert!(html.contains("<title>loadr report — demo</title>"));
         // Time-series section present with embedded data and inline chart script.
         assert!(html.contains("Over time"));

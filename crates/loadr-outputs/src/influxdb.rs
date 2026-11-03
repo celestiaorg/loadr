@@ -108,6 +108,10 @@ impl Output for InfluxdbOutput {
         "influxdb"
     }
 
+    fn wants_samples(&self) -> bool {
+        false
+    }
+
     async fn start(&mut self) -> Result<(), EngineError> {
         let target = self.build_target()?;
         self.target = Some(target.clone());

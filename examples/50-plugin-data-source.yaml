@@ -1,0 +1,45 @@
+# Plugin-backed on-demand data source: a native plugin signs a fresh,
+# time-sensitive payload per request instead of loading it from a CSV/JSON
+# fixture. See docs/src/yaml/data.md#plugin-backed-on-demand-sources for the
+# syntax.
+#
+# Build and install the example plugin first, then point `url:` at a real gRPC
+# target implementing `mempool.Submitter/Submit`:
+#   cargo build -p loadr-plugin-example-native-data-source --release
+#   # stage plugin.toml + the platform library, then: loadr plugin install <dir>
+name: plugin-data-source
+description: gRPC submit with an Ed25519-signed tx generated per request
+
+plugins:
+  - name: tx-signer
+    config:
+      seed: 42
+
+data:
+  signed_tx:
+    type: plugin
+    source: tx-signer
+    config:
+      chain_id: testnet-1
+
+scenarios:
+  submit:
+    executor: constant-vus
+    vus: 100
+    duration: 5m
+    flow:
+      - request:
+          name: submit tx
+          protocol: grpc
+          url: grpc://node:50051
+          grpc:
+            reflection: true
+            service: mempool.Submitter
+            method: Submit
+            message:
+              tx: "${data.signed_tx.tx_b64}"   # bytes field <- base64 string
+          checks:
+            - { type: status, equals: 0 }
+
+thresholds:
+  grpc_req_duration: [ "p(95)<150" ]

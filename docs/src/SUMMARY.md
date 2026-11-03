@@ -39,6 +39,7 @@
 - [GraphQL](protocols/graphql.md)
 - [Browser](protocols/browser.md)
 - [TCP & UDP](protocols/sockets.md)
+- [No-op self-test](protocols/noop.md)
 
 # Distributed testing
 

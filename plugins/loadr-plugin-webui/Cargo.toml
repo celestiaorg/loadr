@@ -10,6 +10,7 @@ repository.workspace = true
 loadr-core = { workspace = true }
 loadr-config = { workspace = true }
 axum = { workspace = true }
+http = { workspace = true }
 rust-embed = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -27,7 +28,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 tempfile = { workspace = true }

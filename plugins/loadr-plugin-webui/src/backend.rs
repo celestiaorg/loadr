@@ -40,6 +40,7 @@ struct RunEntry {
     handle: Option<RunHandle>,
     thresholds: Vec<ThresholdStatus>,
     last_snapshot: Option<Arc<Snapshot>>,
+    last_aggregate: Option<Arc<Snapshot>>,
     summary: Option<Summary>,
 }
 
@@ -48,6 +49,8 @@ struct RunEntry {
 struct HistoryRecord {
     info: RunInfo,
     summary: Option<Summary>,
+    #[serde(default)]
+    aggregate: Option<Snapshot>,
 }
 
 /// In-process [`UiBackend`] for standalone mode.
@@ -87,6 +90,7 @@ impl LocalBackend {
                     handle: None,
                     thresholds,
                     last_snapshot,
+                    last_aggregate: record.aggregate.map(Arc::new),
                     summary: record.summary,
                 },
             );
@@ -159,8 +163,13 @@ impl UiBackend for LocalBackend {
             passed: None,
             started_ms: now_ms(),
             ended_ms: None,
+            observed_ms: now_ms(),
             scenarios,
             agents: Vec::new(),
+            contributing_agents: Vec::new(),
+            lost_agents: Vec::new(),
+            complete: None,
+            on_agent_loss: None,
         };
         self.runs.write().insert(
             run_id.clone(),
@@ -169,6 +178,7 @@ impl UiBackend for LocalBackend {
                 handle: Some(handle),
                 thresholds: Vec::new(),
                 last_snapshot: None,
+                last_aggregate: None,
                 summary: None,
             },
         );
@@ -186,12 +196,20 @@ impl UiBackend for LocalBackend {
                 let Some(entry) = map.get_mut(&id) else {
                     return;
                 };
+                entry.last_aggregate = entry
+                    .handle
+                    .as_ref()
+                    .map(|handle| handle.aggregate_snapshot());
                 entry.handle = None;
                 entry.info.ended_ms = Some(now_ms());
                 match outcome {
                     Ok(Ok(result)) => {
                         let passed = result.passed && result.aborted.is_none();
-                        entry.info.state = "finished".to_string();
+                        entry.info.state = if result.aborted.is_some() {
+                            "aborted".to_string()
+                        } else {
+                            "finished".to_string()
+                        };
                         entry.info.passed = Some(passed);
                         entry.info.ended_ms = Some(result.summary.ended_ms);
                         entry.thresholds = result.summary.thresholds.clone();
@@ -239,6 +257,7 @@ impl UiBackend for LocalBackend {
                 HistoryRecord {
                     info: entry.info.clone(),
                     summary: entry.summary.clone(),
+                    aggregate: entry.last_aggregate.as_deref().cloned(),
                 }
             };
             if let Err(e) = persist_history(&history_dir, &record) {
@@ -269,6 +288,19 @@ impl UiBackend for LocalBackend {
                         info.passed = Some(passed);
                     }
                 }
+                let thresholds = match &entry.handle {
+                    Some(handle) => handle.threshold_statuses().as_ref().clone(),
+                    None => entry.thresholds.clone(),
+                };
+                if info.state == "finished"
+                    && (thresholds.is_empty()
+                        || thresholds
+                            .iter()
+                            .any(|threshold| threshold.observed.is_none()))
+                {
+                    info.passed = None;
+                }
+                info.observed_ms = now_ms();
                 info
             })
             .collect();
@@ -290,6 +322,15 @@ impl UiBackend for LocalBackend {
         match &entry.handle {
             Some(h) => Some(h.snapshot()),
             None => entry.last_snapshot.clone(),
+        }
+    }
+
+    fn run_aggregate_snapshot(&self, run_id: &str) -> Option<Arc<Snapshot>> {
+        let map = self.runs.read();
+        let entry = map.get(run_id)?;
+        match &entry.handle {
+            Some(handle) => Some(handle.aggregate_snapshot()),
+            None => entry.last_aggregate.clone(),
         }
     }
 
@@ -469,8 +510,10 @@ fn load_history(dir: &Path) -> Vec<HistoryRecord> {
 
 fn persist_history(dir: &Path, record: &HistoryRecord) -> Result<(), String> {
     let path = dir.join(format!("{}.json", record.info.run_id));
+    let temp = dir.join(format!("{}.json.tmp", record.info.run_id));
     let json = serde_json::to_string(record).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, &path).map_err(|e| e.to_string())
 }
 
 fn validate_test_name(name: &str) -> Result<(), String> {
@@ -603,5 +646,42 @@ mod tests {
         assert_eq!(line.level, "warn");
         assert!(line.message.contains("something happened"));
         assert!(line.message.contains("code=7"));
+    }
+
+    #[test]
+    fn exact_aggregate_survives_history_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = dir.path().join("history");
+        std::fs::create_dir_all(&history).expect("history directory");
+        let record = HistoryRecord {
+            info: RunInfo {
+                run_id: "persisted".into(),
+                name: None,
+                state: "finished".into(),
+                passed: None,
+                started_ms: 1,
+                ended_ms: Some(2),
+                observed_ms: 2,
+                scenarios: Vec::new(),
+                agents: Vec::new(),
+                contributing_agents: Vec::new(),
+                lost_agents: Vec::new(),
+                complete: None,
+                on_agent_loss: None,
+            },
+            summary: None,
+            aggregate: Some(Snapshot {
+                timestamp_ms: 42,
+                ..Snapshot::default()
+            }),
+        };
+        persist_history(&history, &record).expect("persist history");
+
+        let backend =
+            LocalBackend::new(dir.path().to_path_buf(), noop_launcher()).expect("reload backend");
+        let aggregate = backend
+            .run_aggregate_snapshot("persisted")
+            .expect("persisted exact aggregate");
+        assert_eq!(aggregate.timestamp_ms, 42);
     }
 }

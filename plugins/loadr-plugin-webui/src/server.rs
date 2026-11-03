@@ -123,6 +123,7 @@ pub(crate) struct AppState {
 
 fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
+        .route("/capabilities", get(crate::api::capabilities))
         .route("/overview", get(crate::api::overview))
         .route(
             "/runs",
@@ -152,6 +153,7 @@ fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/version", get(crate::api::version))
         .nest("/api", api)
         .fallback(get(static_handler))
         .with_state(state)

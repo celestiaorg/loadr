@@ -72,7 +72,6 @@ data:
   users:
     type: plugin                       # feeder backed by a service plugin
     source: faker-gen                  # the plugin that produces rows
-    pick: sequential                   # walk the generated stream in order
 
 scenarios:
   signups:
@@ -147,9 +146,11 @@ thresholds:
 - **No external dependency.** Everything is generated in-process with the
   `fake` and `rand` crates; there is no generator server to run and no fixture
   to ship, unlike a CSV/JSON feeder that reads a `path:`.
-- **Feeder semantics.** Rows are consumed exactly like any other feeder, so the
-  usual `pick:` (`sequential` / `random` / `shuffle`) and per-VU vs. shared
-  modes apply. A `random` pick never exhausts because rows are minted on demand.
+- **Feeder semantics.** Rows are read through the same `${data.<name>.<field>}`
+  interpolation as any other feeder, but `mode`/`pick`/`on_eof` do not apply —
+  those describe iterating a stored row set, and this feeder mints a fresh row
+  on every request instead (see
+  [Plugin-backed sources](../yaml/data.md#plugin-backed-on-demand-sources)).
 - **In-process service.** Native service plugins run in-process with full
   privileges (see [Native plugins](native.md#safety-notes)); the generator does
   no I/O beyond producing rows.

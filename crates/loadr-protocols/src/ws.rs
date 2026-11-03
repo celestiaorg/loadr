@@ -328,6 +328,7 @@ impl WsHandler {
                 "msgs_received": msgs_received,
                 "last_message": last_text,
             }),
+            grpc_protobuf_outcomes: Vec::new(),
         })
     }
 }

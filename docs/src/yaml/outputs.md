@@ -11,6 +11,7 @@ outputs:
     listen: 127.0.0.1:9091                          # scrape endpoint (GET /metrics)
     remote_write_url: http://prom:9090/api/v1/write # and/or push
     interval: 5s
+    final_scrape_grace: 10s                       # opt-in: hold /metrics open at exit
   - type: influxdb
     url: http://influxdb:8086
     database: loadr                                  # bucket (v2) / db (v1)
@@ -35,6 +36,15 @@ Or ad hoc from the CLI: `loadr run --output json=results.jsonl test.yaml`.
 | `otlp` | interval aggregates | OpenTelemetry metrics over gRPC or HTTP/protobuf |
 | `statsd` | every sample | DogStatsD-style tags |
 | `plugin` | both | any installed output plugin |
+
+For a listen-mode Prometheus output, `final_scrape_grace` keeps `/metrics`
+available for that long after a run completes so the terminal snapshot,
+including `loadr_vus 0`, can be scraped — at the cost of delaying the run's
+exit by the same amount. It is disabled by default; set it to at least one
+scrape interval when Prometheus scrapes short-lived runs (also available ad
+hoc: `--output prometheus=127.0.0.1:9091,final_scrape_grace=15s`).
+Remote-write-only outputs send their final snapshot immediately and never
+wait.
 
 The Grafana dashboard in
 `deploy/grafana/dashboards/`
